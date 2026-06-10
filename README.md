@@ -4,6 +4,10 @@ Linux desktop workbench for Codex, Claude Code, and Gemini CLI sessions. It
 keeps the conversation readable while putting commands, file changes, tools,
 plans, and progress in a separate work log.
 
+The built-in Terminal tab provides a persistent PTY shell in the selected
+project. It loads the user's normal interactive shell configuration and
+supports command history, interactive line input, `Ctrl+C`, and shell restart.
+
 ![Agent Workbench icon](assets/agent-workbench.png)
 
 ## Requirements
@@ -41,6 +45,10 @@ This prototype starts agent CLIs in their unrestricted automation modes:
 
 Agents can execute commands and modify files without confirmation. Run the app
 only in directories and environments where that level of access is acceptable.
+
+The Terminal tab has the same operating-system access as the user running Agent
+Workbench. Full-screen terminal interfaces are not yet emulated; line-oriented
+interactive commands and agent CLI subcommands are supported.
 
 ## Privacy
 

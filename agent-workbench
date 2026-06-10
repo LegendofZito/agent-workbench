@@ -4,11 +4,16 @@
 import fcntl
 import json
 import os
+import pty
 import queue
+import re
 import shlex
+import signal
+import struct
 import shutil
 import subprocess
 import sys
+import termios
 import threading
 import time
 import uuid
@@ -42,6 +47,9 @@ GEMINI = "#8ab4ff"
 WORK = "#f59e0b"
 USER = "#79c0ff"
 ACCENT = "#2f81f7"
+ANSI_ESCAPE = re.compile(
+    r"(?:\x1B[@-_][0-?]*[ -/]*[@-~])|(?:\x1B\][^\x07]*(?:\x07|\x1B\\))"
+)
 
 
 def now_iso():
@@ -934,6 +942,130 @@ class StreamCliBackend(BaseBackend):
         self.interrupt()
 
 
+class TerminalShell:
+    def __init__(self, events):
+        self.events = events
+        self.proc = None
+        self.master_fd = None
+        self.cwd = None
+        self.lock = threading.Lock()
+        self.generation = 0
+
+    def emit(self, kind, **payload):
+        self.events.put({"kind": kind, **payload})
+
+    def start(self, cwd):
+        cwd = cwd if os.path.isdir(cwd) else os.path.expanduser("~")
+        self.close()
+        master_fd, slave_fd = pty.openpty()
+        try:
+            fcntl.ioctl(
+                slave_fd,
+                termios.TIOCSWINSZ,
+                struct.pack("HHHH", 32, 140, 0, 0),
+            )
+        except OSError:
+            pass
+        env = os.environ.copy()
+        env["TERM"] = env.get("TERM") or "xterm-256color"
+        env["AGENT_WORKBENCH"] = "1"
+        shell = env.get("SHELL") or "/bin/bash"
+        with self.lock:
+            self.generation += 1
+            generation = self.generation
+            self.cwd = cwd
+            self.master_fd = master_fd
+            self.proc = subprocess.Popen(
+                [shell, "-i"],
+                cwd=cwd,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=env,
+                preexec_fn=os.setsid,
+                close_fds=True,
+            )
+        os.close(slave_fd)
+        threading.Thread(target=self._read, args=(generation,), daemon=True).start()
+
+    def _read(self, generation):
+        while True:
+            with self.lock:
+                if generation != self.generation:
+                    return
+                fd = self.master_fd
+                proc = self.proc
+            if fd is None or proc is None:
+                return
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            text = data.decode("utf-8", errors="replace").replace("\r", "")
+            clear_screen = "\x1b[2J" in text or "\x1b[3J" in text
+            text = ANSI_ESCAPE.sub("", text)
+            text = text.replace("\\[", "").replace("\\]", "")
+            if clear_screen:
+                self.emit("terminal_clear")
+            if text:
+                with self.lock:
+                    if generation != self.generation:
+                        return
+                self.emit("terminal_output", text=text)
+        with self.lock:
+            if generation != self.generation:
+                return
+            proc = self.proc
+        if proc is not None:
+            self.emit("terminal_exit", status=proc.poll())
+
+    def send(self, text):
+        with self.lock:
+            fd = self.master_fd
+        if fd is None:
+            return False
+        try:
+            os.write(fd, text.encode("utf-8"))
+            return True
+        except OSError:
+            return False
+
+    def interrupt(self):
+        with self.lock:
+            proc = self.proc
+            fd = self.master_fd
+        if proc and proc.poll() is None:
+            try:
+                foreground_pgid = os.tcgetpgrp(fd) if fd is not None else proc.pid
+                os.killpg(foreground_pgid, signal.SIGINT)
+            except OSError:
+                pass
+
+    def close(self):
+        with self.lock:
+            self.generation += 1
+            proc = self.proc
+            fd = self.master_fd
+            self.proc = None
+            self.master_fd = None
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGHUP)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 class ClaudeBackend(StreamCliBackend):
     def __init__(self, events):
         super().__init__(events, "claude")
@@ -1207,6 +1339,8 @@ class App:
         self.current_session = None
         self.current_turn = None
         self.session_backend_id = None
+        self.terminal_history = []
+        self.terminal_history_index = 0
 
         self._build_style()
         self._build_ui()
@@ -1216,7 +1350,9 @@ class App:
             "claude": ClaudeBackend(self.events),
             "gemini": GeminiBackend(self.events),
         }
+        self.terminal_shell = TerminalShell(self.events)
         self.backends["codex"].start(self.cwd.get())
+        self.terminal_shell.start(self.cwd.get())
 
         self.refresh_sessions()
         self._restore_last_session()
@@ -1289,9 +1425,11 @@ class App:
         self.chat_tab = tk.Frame(self.notebook, bg=BG)
         self.work_tab = tk.Frame(self.notebook, bg=BG)
         self.artifacts_tab = tk.Frame(self.notebook, bg=BG)
+        self.terminal_tab = tk.Frame(self.notebook, bg=BG)
         self.notebook.add(self.chat_tab, text="Conversation")
         self.notebook.add(self.work_tab, text="Work Log")
         self.notebook.add(self.artifacts_tab, text="Artifacts")
+        self.notebook.add(self.terminal_tab, text="Terminal")
 
         self.chat = ScrolledText(
             self.chat_tab,
@@ -1378,7 +1516,63 @@ class App:
         artifact_scroll.pack(side="right", fill="y")
         self.artifact_list.configure(yscrollcommand=artifact_scroll.set)
 
+        self.terminal = ScrolledText(
+            self.terminal_tab,
+            wrap="char",
+            bg="#090d12",
+            fg="#d6e2ee",
+            insertbackground=TEXT,
+            relief="flat",
+            borderwidth=0,
+            padx=12,
+            pady=10,
+            font=("Monospace", 10),
+        )
+        self.terminal.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        self.terminal.configure(state="disabled")
+
+        terminal_bar = tk.Frame(self.terminal_tab, bg=BG)
+        terminal_bar.pack(fill="x", padx=8, pady=(0, 8))
+        self.terminal_input = tk.Entry(
+            terminal_bar,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            font=("Monospace", 10),
+        )
+        self.terminal_input.pack(side="left", fill="x", expand=True, ipady=7)
+        self.terminal_input.bind("<Return>", self.submit_terminal_command)
+        self.terminal_input.bind("<Up>", lambda _e: self.recall_terminal_history(-1))
+        self.terminal_input.bind("<Down>", lambda _e: self.recall_terminal_history(1))
+        self.terminal_input.bind("<Control-c>", lambda _e: self.interrupt_terminal())
+        tk.Button(
+            terminal_bar,
+            text="Run",
+            command=self.submit_terminal_command,
+            bg=ACCENT,
+            fg="white",
+            relief="flat",
+        ).pack(side="left", padx=(6, 0))
+        tk.Button(
+            terminal_bar,
+            text="Ctrl+C",
+            command=self.interrupt_terminal,
+            bg=PANEL,
+            fg=TEXT,
+            relief="flat",
+        ).pack(side="left", padx=(6, 0))
+        tk.Button(
+            terminal_bar,
+            text="Restart",
+            command=self.restart_terminal,
+            bg=PANEL,
+            fg=TEXT,
+            relief="flat",
+        ).pack(side="left", padx=(6, 0))
+
         composer = tk.Frame(content, bg=BG)
+        self.composer = composer
         composer.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         self.input = ScrolledText(
             composer,
@@ -1406,6 +1600,15 @@ class App:
         self.stop_btn = tk.Button(bar, text="Stop", command=self.stop, bg="#9f2d2d", fg="white", relief="flat")
         self.send_btn = tk.Button(bar, text="Send", command=self.send, bg=ACCENT, fg="white", relief="flat")
         self.send_btn.pack(side="right")
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_notebook_tab_changed)
+
+    def on_notebook_tab_changed(self, _event=None):
+        selected = self.notebook.select()
+        if selected == str(self.terminal_tab):
+            self.composer.grid_remove()
+            self.terminal_input.focus_set()
+        else:
+            self.composer.grid()
 
     def scroll_chat_to_latest(self):
         self.chat.see("end")
@@ -1436,6 +1639,65 @@ class App:
             subprocess.Popen(["xdg-open", path])
         except Exception as exc:
             messagebox.showerror("Open artifact", str(exc))
+
+    def append_terminal(self, text):
+        if not text:
+            return
+        at_bottom = self.terminal.yview()[1] >= 0.995
+        self.terminal.configure(state="normal")
+        self.terminal.insert("end", text)
+        self.terminal.configure(state="disabled")
+        if at_bottom:
+            self.terminal.see("end")
+
+    def clear_terminal(self):
+        self.terminal.configure(state="normal")
+        self.terminal.delete("1.0", "end")
+        self.terminal.configure(state="disabled")
+
+    def submit_terminal_command(self, _event=None):
+        command = self.terminal_input.get()
+        self.terminal_input.delete(0, "end")
+        if not command.strip():
+            self.terminal_shell.send("\n")
+            return "break"
+        if command.strip() in {"clear", "reset"}:
+            self.clear_terminal()
+        self.terminal_history.append(command)
+        self.terminal_history = self.terminal_history[-200:]
+        self.terminal_history_index = len(self.terminal_history)
+        if not self.terminal_shell.send(command + "\n"):
+            self.restart_terminal()
+            self.terminal_shell.send(command + "\n")
+        return "break"
+
+    def recall_terminal_history(self, direction):
+        if not self.terminal_history:
+            return "break"
+        self.terminal_history_index = max(
+            0,
+            min(
+                len(self.terminal_history),
+                self.terminal_history_index + direction,
+            ),
+        )
+        text = (
+            self.terminal_history[self.terminal_history_index]
+            if self.terminal_history_index < len(self.terminal_history)
+            else ""
+        )
+        self.terminal_input.delete(0, "end")
+        self.terminal_input.insert(0, text)
+        self.terminal_input.icursor("end")
+        return "break"
+
+    def interrupt_terminal(self):
+        self.terminal_shell.interrupt()
+        return "break"
+
+    def restart_terminal(self):
+        self.append_terminal("\n[Restarting shell]\n")
+        self.terminal_shell.start(self.cwd.get())
 
     def _build_sidebar(self, parent):
         sidebar = tk.Frame(
@@ -1712,6 +1974,8 @@ class App:
     def refresh_sessions(self):
         self.status.set("Loading sessions…")
         self._remember_project(self.cwd.get())
+        if getattr(self, "terminal_shell", None) and self.terminal_shell.cwd != self.cwd.get():
+            self.restart_terminal()
         self.local_sessions = self.store.list_for(self.cwd.get(), self.active_agent.get())
         self.external_sessions = discover_external_sessions(self.cwd.get(), self.active_agent.get())
         self.sessions = list(self.local_sessions) + list(self.external_sessions)
@@ -2126,6 +2390,13 @@ class App:
             self._render_session_list()
         elif kind == "backend_exit":
             self.status.set(event.get("text", "Backend stopped"))
+        elif kind == "terminal_output":
+            self.append_terminal(event.get("text", ""))
+        elif kind == "terminal_clear":
+            self.clear_terminal()
+        elif kind == "terminal_exit":
+            status = event.get("status")
+            self.append_terminal(f"\n[Shell exited{'' if status is None else f' with status {status}'}]\n")
 
     def drain_events(self):
         try:
@@ -2155,6 +2426,7 @@ class App:
                 backend.close()
             except Exception:
                 pass
+        self.terminal_shell.close()
         self.win.destroy()
 
 if __name__ == "__main__":
