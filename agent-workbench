@@ -214,6 +214,59 @@ def codex_history_prompts():
     return prompts
 
 
+def codex_rollout_turns(path):
+    if not path or not os.path.isfile(path):
+        return []
+    turns = []
+    current = None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if obj.get("type") != "event_msg":
+                    continue
+                payload = obj.get("payload") or {}
+                event_type = payload.get("type")
+                text = ""
+                item = None
+                if event_type == "user_message":
+                    text = clean_text(payload.get("message"))
+                    if not text:
+                        continue
+                    current = {
+                        "id": str(uuid.uuid4()),
+                        "created_at": clean_text(obj.get("timestamp")) or now_iso(),
+                        "status": "completed",
+                        "items": [],
+                    }
+                    turns.append(current)
+                    item = {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": text}],
+                    }
+                elif event_type == "agent_message":
+                    text = clean_text(payload.get("message"))
+                    if not text:
+                        continue
+                    if current is None:
+                        current = {
+                            "id": str(uuid.uuid4()),
+                            "created_at": clean_text(obj.get("timestamp")) or now_iso(),
+                            "status": "completed",
+                            "items": [],
+                        }
+                        turns.append(current)
+                    item = {"type": "agentMessage", "text": text}
+                if item is not None:
+                    current["items"].append(item)
+    except OSError:
+        return []
+    return [turn for turn in turns if turn.get("items")]
+
+
 def rename_codex_thread_title(thread_id, title):
     db = os.path.expanduser("~/.codex/state_5.sqlite")
     if not thread_id or not os.path.exists(db):
@@ -369,7 +422,7 @@ def codex_sessions_for_cwd(cwd):
         con = sqlite3.connect(db)
         con.row_factory = sqlite3.Row
         rows = con.execute(
-            "select id, cwd, title, preview, created_at, updated_at, source, archived "
+            "select id, rollout_path, cwd, title, preview, created_at, updated_at, source, archived "
             "from threads where cwd = ? and archived = 0 order by updated_at desc limit 100",
             (cwd,),
         ).fetchall()
@@ -379,9 +432,10 @@ def codex_sessions_for_cwd(cwd):
     sessions = []
     for row in rows:
         sid = row["id"]
+        turns = codex_rollout_turns(row["rollout_path"])
         prompts = history.get(sid) or []
-        transcript = []
-        if prompts:
+        if not turns and prompts:
+            transcript = []
             for _, text in prompts[:8]:
                 transcript.append(
                     {
@@ -389,6 +443,14 @@ def codex_sessions_for_cwd(cwd):
                         "content": [{"type": "text", "text": text}],
                     }
                 )
+            turns = [
+                {
+                    "id": sid,
+                    "created_at": iso_from_unix(row["created_at"]),
+                    "status": "completed",
+                    "items": transcript,
+                }
+            ]
         preview = clean_text(row["preview"] or row["title"] or "")
         if not preview and prompts:
             preview = prompts[0][1]
@@ -404,7 +466,7 @@ def codex_sessions_for_cwd(cwd):
                 "created_at": iso_from_unix(row["created_at"]),
                 "updated_at": iso_from_unix(row["updated_at"]),
                 "backend": {"thread_id": sid},
-                "turns": [{"id": sid, "created_at": iso_from_unix(row["created_at"]), "status": "completed", "items": transcript}] if transcript else [],
+                "turns": turns,
             }
         )
     return sessions
