@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Agent Workbench
+Comment=Unified desktop workbench for Codex, Claude Code, and Gemini
+Exec=agent-workbench
+Icon=agent-workbench
+Terminal=false
+Categories=Development;
+StartupWMClass=AgentWorkbench

@@ -1,10 +1,10 @@
-# Codex Workbench
+# Agent Workbench
 
 Linux desktop workbench for Codex, Claude Code, and Gemini CLI sessions. It
 keeps the conversation readable while putting commands, file changes, tools,
 plans, and progress in a separate work log.
 
-![Codex Workbench icon](assets/codex-workbench.png)
+![Agent Workbench icon](assets/agent-workbench.png)
 
 ## Requirements
 
@@ -17,7 +17,7 @@ plans, and progress in a separate work log.
 ## Run
 
 ```bash
-./codex-conversation-viewer
+./agent-workbench
 ```
 
 Send prompts with `Ctrl+Enter`.
@@ -44,10 +44,11 @@ only in directories and environments where that level of access is acceptable.
 
 ## Privacy
 
-Session data remains local under
-`~/.config/codex-conversation-viewer/sessions`. The app also reads local session
-metadata from supported agent tools to populate its session list. It does not
-include analytics or telemetry of its own.
+Session data remains local under `~/.config/agent-workbench/sessions`. Existing
+data under `~/.config/codex-conversation-viewer` is copied automatically on the
+first launch after upgrading. The app also reads local session metadata from
+supported agent tools to populate its session list. It does not include
+analytics or telemetry of its own.
 
 ## License
 

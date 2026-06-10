@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -20,12 +21,12 @@ from tkinter.scrolledtext import ScrolledText
 from pathlib import Path
 
 
-APP_ID = "codex-conversation-viewer"
-APP_NAME = "Codex Workbench"
-ICON_NAME = "codex-workbench.png"
-CONFIG_DIR = os.path.join(
-    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), APP_ID
-)
+APP_ID = "agent-workbench"
+APP_NAME = "Agent Workbench"
+ICON_NAME = "agent-workbench.png"
+CONFIG_ROOT = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+CONFIG_DIR = os.path.join(CONFIG_ROOT, APP_ID)
+LEGACY_CONFIG_DIR = os.path.join(CONFIG_ROOT, "codex-conversation-viewer")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 SESSIONS_DIR = os.path.join(CONFIG_DIR, "sessions")
 
@@ -52,6 +53,15 @@ def clean_text(value):
 
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
+
+
+def migrate_legacy_config():
+    if os.path.exists(CONFIG_DIR) or not os.path.isdir(LEGACY_CONFIG_DIR):
+        return
+    try:
+        shutil.copytree(LEGACY_CONFIG_DIR, CONFIG_DIR)
+    except OSError:
+        pass
 
 
 def set_window_icon(window):
@@ -1086,6 +1096,7 @@ class GeminiBackend(StreamCliBackend):
 
 class App:
     def __init__(self):
+        migrate_legacy_config()
         self.config = load_json(CONFIG_FILE, {})
         ensure_dir(CONFIG_DIR)
         ensure_dir(SESSIONS_DIR)
