@@ -33,6 +33,7 @@ CONFIG_ROOT = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
 CONFIG_DIR = os.path.join(CONFIG_ROOT, APP_ID)
 LEGACY_CONFIG_DIR = os.path.join(CONFIG_ROOT, "codex-conversation-viewer")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+INSTALL_INFO_FILE = os.path.join(CONFIG_DIR, "install.json")
 SESSIONS_DIR = os.path.join(CONFIG_DIR, "sessions")
 
 BG = "#0d1117"
@@ -47,6 +48,7 @@ GEMINI = "#8ab4ff"
 WORK = "#f59e0b"
 USER = "#79c0ff"
 ACCENT = "#2f81f7"
+BORDER = "#22c55e"
 ANSI_ESCAPE = re.compile(
     r"(?:\x1B[@-_][0-?]*[ -/]*[@-~])|(?:\x1B\][^\x07]*(?:\x07|\x1B\\))"
 )
@@ -234,13 +236,14 @@ def codex_rollout_turns(path):
                     obj = json.loads(line)
                 except ValueError:
                     continue
-                if obj.get("type") != "event_msg":
+                record_type = obj.get("type")
+                if record_type not in {"event_msg", "response_item"}:
                     continue
                 payload = obj.get("payload") or {}
                 event_type = payload.get("type")
                 text = ""
                 item = None
-                if event_type == "user_message":
+                if record_type == "event_msg" and event_type == "user_message":
                     text = clean_text(payload.get("message"))
                     if not text:
                         continue
@@ -255,7 +258,7 @@ def codex_rollout_turns(path):
                         "type": "userMessage",
                         "content": [{"type": "text", "text": text}],
                     }
-                elif event_type == "agent_message":
+                elif record_type == "event_msg" and event_type == "agent_message":
                     text = clean_text(payload.get("message"))
                     if not text:
                         continue
@@ -267,7 +270,55 @@ def codex_rollout_turns(path):
                             "items": [],
                         }
                         turns.append(current)
-                    item = {"type": "agentMessage", "text": text}
+                    if payload.get("phase") == "commentary":
+                        item = {"type": "system", "text": text, "tag": "progress"}
+                    else:
+                        item = {"type": "agentMessage", "text": text}
+                elif record_type == "response_item":
+                    if current is None:
+                        continue
+                    if event_type == "function_call":
+                        name = clean_text(payload.get("name"))
+                        arguments = payload.get("arguments")
+                        command = ""
+                        if name == "exec_command" and isinstance(arguments, str):
+                            try:
+                                command = clean_text(json.loads(arguments).get("cmd"))
+                            except (ValueError, AttributeError):
+                                command = clean_text(arguments)
+                        if command:
+                            item = {"type": "commandExecution", "command": command}
+                        elif name:
+                            item = {
+                                "type": "system",
+                                "text": f"Tool: {name}",
+                                "tag": "tool",
+                            }
+                    elif event_type == "custom_tool_call":
+                        name = clean_text(payload.get("name"))
+                        item = {
+                            "type": "system",
+                            "text": f"Tool: {name or 'custom tool'}",
+                            "tag": "tool",
+                        }
+                    elif event_type in {"function_call_output", "custom_tool_call_output"}:
+                        output = payload.get("output")
+                        if isinstance(output, dict):
+                            output = output.get("content") or output.get("output")
+                        text = clean_text(output)
+                        if text:
+                            item = {"type": "system", "text": text, "tag": "system"}
+                    elif event_type == "reasoning":
+                        summary = payload.get("summary") or []
+                        parts = []
+                        for value in summary:
+                            if isinstance(value, dict):
+                                parts.append(value.get("text", ""))
+                            else:
+                                parts.append(str(value))
+                        text = clean_text(" ".join(parts))
+                        if text:
+                            item = {"type": "reasoning", "summary": [text]}
                 if item is not None:
                     current["items"].append(item)
     except OSError:
@@ -473,6 +524,7 @@ def codex_sessions_for_cwd(cwd):
                 "preview": preview or "Codex session",
                 "created_at": iso_from_unix(row["created_at"]),
                 "updated_at": iso_from_unix(row["updated_at"]),
+                "source_path": row["rollout_path"],
                 "backend": {"thread_id": sid},
                 "turns": turns,
             }
@@ -556,9 +608,16 @@ class SessionStore:
             path = os.path.join(SESSIONS_DIR, name)
             data = load_json(path, None)
             if isinstance(data, dict) and data.get("id"):
+                changed = False
+                for turn in data.get("turns") or []:
+                    if turn.get("status") == "running":
+                        turn["status"] = "interrupted"
+                        changed = True
                 if not data.get("origin"):
                     data["origin"] = "local"
                 self.sessions[data["id"]] = data
+                if changed:
+                    save_json(path, data)
 
     def save(self, session):
         if session.get("origin", "local") != "local":
@@ -702,6 +761,7 @@ class CodexBackend(BaseBackend):
         self.pending = {}
         self.lock = threading.Lock()
         self.ready = threading.Event()
+        self.active_threads = set()
 
     def start(self, cwd):
         self.cwd = cwd
@@ -728,17 +788,24 @@ class CodexBackend(BaseBackend):
         )
 
     def _on_initialized(self, _result):
+        self.notify("initialized", {})
         self.ready.set()
 
-    def request(self, method, params, callback=None):
+    def request(self, method, params, callback=None, error_callback=None):
         with self.lock:
             req_id = self.next_id
             self.next_id += 1
-            if callback:
-                self.pending[req_id] = callback
+            if callback or error_callback:
+                self.pending[req_id] = (callback, error_callback)
         message = {"method": method, "id": req_id, "params": params}
         self._send(message)
         return req_id
+
+    def notify(self, method, params):
+        self._send({"method": method, "params": params})
+
+    def respond(self, req_id, result):
+        self._send({"id": req_id, "result": result})
 
     def _send(self, message):
         try:
@@ -758,17 +825,36 @@ class CodexBackend(BaseBackend):
                 continue
 
             req_id = message.get("id")
+            if req_id is not None and message.get("method"):
+                self._handle_server_request(message)
+                continue
             if req_id is not None:
-                callback = self.pending.pop(req_id, None)
+                callbacks = self.pending.pop(req_id, (None, None))
+                callback, error_callback = callbacks
                 if "error" in message:
                     err = message["error"]
-                    self.emit("error", text=err.get("message", "Codex error"))
+                    text = err.get("message", "Codex error")
+                    if error_callback:
+                        error_callback(text)
+                    else:
+                        self.emit("error", text=text)
                 elif callback:
                     callback(message.get("result") or {})
                 continue
 
             self._handle_notification(message)
         self.emit("backend_exit", text="Codex app server stopped")
+
+    def _handle_server_request(self, message):
+        method = message.get("method", "")
+        if method == "item/tool/requestUserInput":
+            self.emit(
+                "user_input_request",
+                request_id=message.get("id"),
+                params=message.get("params") or {},
+            )
+            return
+        self.respond(message.get("id"), {})
 
     def _read_stderr(self):
         for line in self.proc.stderr:
@@ -801,7 +887,10 @@ class CodexBackend(BaseBackend):
                             content.append(bit.get("text", ""))
                     text = " ".join(content)
                 if text:
-                    self.emit("assistant", text=text)
+                    if item.get("phase") == "commentary":
+                        self.emit("work", text=text, tag="progress")
+                    else:
+                        self.emit("assistant_message", text=text, speaker="CODEX")
             elif typ == "userMessage":
                 self.emit("user", text=self._extract_text(item))
             elif typ == "commandExecution":
@@ -858,35 +947,53 @@ class CodexBackend(BaseBackend):
     def ensure_session(self, session):
         backend = session.setdefault("backend", {})
         backend.setdefault("kind", "codex")
-        if backend.get("thread_id"):
-            self.thread_id = backend["thread_id"]
+        existing_thread_id = backend.get("thread_id")
+        if existing_thread_id and existing_thread_id in self.active_threads:
+            self.thread_id = existing_thread_id
             return
 
         result_holder = {}
+        error_holder = {}
         done = threading.Event()
 
-        def on_started(result):
+        def on_ready(result):
             result_holder.update(result)
             done.set()
 
-        self.request(
-            "thread/start",
-            {
-                "cwd": session["cwd"],
-                "approvalPolicy": "never",
-                "sandbox": "danger-full-access",
-                "personality": "pragmatic",
-            },
-            on_started,
-        )
-        done.wait(timeout=30)
+        def on_error(text):
+            error_holder["text"] = text
+            done.set()
+
+        params = {
+            "cwd": session["cwd"],
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "personality": "pragmatic",
+        }
+        method = "thread/start"
+        if existing_thread_id:
+            method = "thread/resume"
+            params["threadId"] = existing_thread_id
+        self.request(method, params, on_ready, on_error)
+        if not done.wait(timeout=30):
+            raise RuntimeError(f"Timed out while trying to {method.replace('/', ' ')}")
+        if error_holder:
+            raise RuntimeError(error_holder["text"])
         thread = result_holder.get("thread") or {}
-        backend["thread_id"] = thread.get("id")
-        self.thread_id = backend["thread_id"]
+        thread_id = thread.get("id") or existing_thread_id
+        if not thread_id:
+            raise RuntimeError("Codex did not return a thread ID")
+        backend["thread_id"] = thread_id
+        self.thread_id = thread_id
+        self.active_threads.add(thread_id)
         session["backend"] = backend
 
     def start_turn(self, session, turn, prompt, context_text=""):
-        self.ensure_session(session)
+        try:
+            self.ensure_session(session)
+        except Exception as exc:
+            self.emit("error", text=str(exc))
+            return
         self.turn_id = None
         payload_text = prompt
         if context_text:
@@ -901,6 +1008,10 @@ class CodexBackend(BaseBackend):
             backend["turn_id"] = self.turn_id
             done.set()
 
+        def on_error(text):
+            self.emit("error", text=text)
+            done.set()
+
         self.request(
             "turn/start",
             {
@@ -909,8 +1020,18 @@ class CodexBackend(BaseBackend):
                 "input": [{"type": "text", "text": payload_text}],
             },
             on_turn,
+            on_error,
         )
-        done.wait(timeout=30)
+        if not done.wait(timeout=30):
+            self.emit("error", text="Codex timed out while starting the turn")
+
+    def answer_user_input(self, request_id, questions, text):
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        answers = {}
+        for index, question in enumerate(questions):
+            answer = lines[index] if index < len(lines) else (text.strip() if index == 0 else "")
+            answers[question.get("id", str(index))] = {"answers": [answer]}
+        self.respond(request_id, {"answers": answers})
 
     def interrupt(self):
         if self.thread_id and self.turn_id:
@@ -1292,6 +1413,7 @@ class App:
     def __init__(self):
         migrate_legacy_config()
         self.config = load_json(CONFIG_FILE, {})
+        self.install_info = load_json(INSTALL_INFO_FILE, {})
         ensure_dir(CONFIG_DIR)
         ensure_dir(SESSIONS_DIR)
         self.store = SessionStore()
@@ -1300,12 +1422,16 @@ class App:
         self.live_speaker = None
         self.live_turn = None
         self.transfer_source_session_id = None
+        self.pending_user_input = None
+        self.activity_state = "starting"
+        self.activity_frame = 0
+        self.live_source_signature = None
 
         self.win = tk.Tk(className="AgentWorkbench")
         self.win.title(APP_NAME)
         set_window_icon(self.win)
         self.win.geometry(self.config.get("geometry", "1380x920+80+80"))
-        self.win.configure(bg=ACCENT)
+        self.win.configure(bg=BORDER)
         self.win.minsize(1140, 720)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -1326,6 +1452,7 @@ class App:
         if self.active_agent.get() not in self.agent_map:
             self.active_agent.set("codex")
         self.status = tk.StringVar(master=self.win, value="Starting…")
+        self.activity_text = tk.StringVar(master=self.win, value="Starting")
         self.session_title = tk.StringVar(master=self.win, value=APP_NAME)
         self.session_label = tk.StringVar(master=self.win, value="No session")
         self.sessions = []
@@ -1357,6 +1484,7 @@ class App:
         self.refresh_sessions()
         self._restore_last_session()
         self.win.after(50, self.drain_events)
+        self.win.after(500, self.poll_external_session)
 
     def _build_style(self):
         style = ttk.Style(self.win)
@@ -1389,12 +1517,12 @@ class App:
         )
 
     def _build_ui(self):
-        outer = tk.Frame(self.win, bg=ACCENT)
+        outer = tk.Frame(self.win, bg=BORDER)
         outer.pack(fill="both", expand=True, padx=3, pady=3)
 
         self._build_sidebar(outer)
 
-        right = tk.Frame(outer, bg=ACCENT)
+        right = tk.Frame(outer, bg=BORDER)
         right.pack(side="right", fill="both", expand=True, padx=(3, 0))
 
         topbar = tk.Frame(right, bg=BG)
@@ -1414,8 +1542,18 @@ class App:
             fg=MUTED,
             anchor="e",
         ).pack(side="right", padx=12)
+        self.activity_badge = tk.Label(
+            topbar,
+            textvariable=self.activity_text,
+            bg="#24303c",
+            fg="#cbd5e1",
+            padx=10,
+            pady=4,
+            font=("Sans", 9, "bold"),
+        )
+        self.activity_badge.pack(side="right", padx=(0, 4))
 
-        content = tk.Frame(right, bg=ACCENT)
+        content = tk.Frame(right, bg=BORDER)
         content.pack(fill="both", expand=True)
         content.grid_rowconfigure(1, weight=1)
         content.grid_columnconfigure(0, weight=1)
@@ -1452,6 +1590,30 @@ class App:
         self.chat.tag_config("gemini_head", foreground=GEMINI, font=("Sans", 10, "bold"))
         self.chat.tag_config("user", foreground="#dbeafe")
         self.chat.tag_config("assistant", foreground=TEXT)
+        self.chat.tag_config(
+            "chat_h1",
+            foreground="#f8fafc",
+            font=("Sans", 14, "bold"),
+            spacing1=8,
+            spacing3=4,
+        )
+        self.chat.tag_config(
+            "chat_h2",
+            foreground="#93c5fd",
+            font=("Sans", 12, "bold"),
+            spacing1=7,
+            spacing3=3,
+        )
+        self.chat.tag_config("chat_bullet", foreground="#7dd3fc", lmargin1=10, lmargin2=28)
+        self.chat.tag_config("chat_check_done", foreground="#86efac", lmargin1=10, lmargin2=28)
+        self.chat.tag_config("chat_check_open", foreground="#facc15", lmargin1=10, lmargin2=28)
+        self.chat.tag_config(
+            "chat_code",
+            foreground="#a7f3d0",
+            background="#0b1118",
+            font=("Monospace", 10),
+        )
+        self.chat.tag_config("chat_bold", foreground="#f8fafc", font=("Sans", 11, "bold"))
         self.chat.configure(state="disabled")
 
         self.work = ScrolledText(
@@ -1471,6 +1633,7 @@ class App:
             ("command", "#67e08a"),
             ("fileChange", "#f0c24a"),
             ("reasoning", "#b48cff"),
+            ("progress", "#8ab4ff"),
             ("tool", "#43c0d6"),
             ("plan", "#79c0ff"),
             ("system", MUTED),
@@ -1588,10 +1751,10 @@ class App:
             font=("Sans", 11),
         )
         self.input.pack(fill="x", padx=8)
-        self.input.bind("<Return>", lambda _e: (self.send(), "break")[1])
-        self.input.bind("<KP_Enter>", lambda _e: (self.send(), "break")[1])
-        self.input.bind("<Control-Return>", lambda _e: (self.send(), "break")[1])
-        self.input.bind("<Command-Return>", lambda _e: (self.send(), "break")[1])
+        self.input.bind("<Return>", self.handle_prompt_return)
+        self.input.bind("<KP_Enter>", self.handle_prompt_return)
+        self.input.bind("<Control-Return>", lambda _e: self.send() or "break")
+        self.input.bind("<Command-Return>", lambda _e: self.send() or "break")
 
         bar = tk.Frame(composer, bg=BG)
         bar.pack(fill="x", padx=8, pady=(6, 8))
@@ -1601,6 +1764,40 @@ class App:
         self.send_btn = tk.Button(bar, text="Send", command=self.send, bg=ACCENT, fg="white", relief="flat")
         self.send_btn.pack(side="right")
         self.notebook.bind("<<NotebookTabChanged>>", self.on_notebook_tab_changed)
+        self.win.after(250, self.animate_activity)
+
+    def handle_prompt_return(self, event):
+        if event.state & 0x0001:
+            return None
+        self.send()
+        return "break"
+
+    def set_activity(self, state, text=None):
+        self.activity_state = state
+        colors = {
+            "idle": ("#16351f", "#86efac"),
+            "working": ("#3b2c0b", "#facc15"),
+            "input": ("#3b1d4a", "#e9a8ff"),
+            "error": ("#4a1d1d", "#fca5a5"),
+            "starting": ("#24303c", "#cbd5e1"),
+        }
+        bg, fg = colors.get(state, colors["starting"])
+        self.activity_badge.configure(bg=bg, fg=fg)
+        if text is not None:
+            self.activity_text.set(text)
+        elif state == "idle":
+            self.activity_text.set("Ready")
+        elif state == "input":
+            self.activity_text.set("Needs input")
+        elif state == "error":
+            self.activity_text.set("Error")
+
+    def animate_activity(self):
+        if self.activity_state == "working":
+            dots = "." * ((self.activity_frame % 3) + 1)
+            self.activity_text.set(f"Working{dots}")
+            self.activity_frame += 1
+        self.win.after(350, self.animate_activity)
 
     def on_notebook_tab_changed(self, _event=None):
         selected = self.notebook.select()
@@ -1704,8 +1901,8 @@ class App:
             parent,
             bg=SIDEBAR,
             width=286,
-            highlightbackground=ACCENT,
-            highlightcolor=ACCENT,
+            highlightbackground=BORDER,
+            highlightcolor=BORDER,
             highlightthickness=1,
         )
         sidebar.pack(side="left", fill="y")
@@ -2085,6 +2282,9 @@ class App:
         if remember and self.current_session and self.current_session.get("id") != session_id:
             self.transfer_source_session_id = self.current_session.get("id")
         self.current_session = deepcopy(session)
+        self.live_source_signature = self._source_signature(
+            self.current_session.get("source_path")
+        )
         self.current_turn = None
         self.session_backend_id = session.get("backend", {}).get("thread_id") or session.get("backend", {}).get("session_id")
         origin = session.get("origin", "local")
@@ -2102,8 +2302,47 @@ class App:
         if origin == "local":
             self.status.set("Ready. Send a prompt to continue this session.")
         else:
-            self.status.set("Imported session. Send a prompt to create a continuation.")
+            self.status.set("Live terminal mirror. Send a prompt to create a continuation.")
+        self.set_activity("idle", "Live mirror" if origin == "codex-terminal" else None)
         self._persist_current()
+
+    def _source_signature(self, path):
+        if not path:
+            return None
+        try:
+            stat = os.stat(path)
+            return (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return None
+
+    def poll_external_session(self):
+        try:
+            session = self.current_session
+            if session and session.get("origin") == "codex-terminal":
+                path = session.get("source_path")
+                signature = self._source_signature(path)
+                if signature and signature != self.live_source_signature:
+                    self.live_source_signature = signature
+                    chat_at_bottom = self.chat.yview()[1] >= 0.995
+                    work_at_bottom = self.work.yview()[1] >= 0.995
+                    chat_position = self.chat.yview()[0]
+                    work_position = self.work.yview()[0]
+                    session["turns"] = codex_rollout_turns(path)
+                    session["updated_at"] = now_iso()
+                    self._clear_views()
+                    self._render_session(session)
+                    if chat_at_bottom:
+                        self.chat.see("end")
+                    else:
+                        self.chat.yview_moveto(chat_position)
+                    if work_at_bottom:
+                        self.work.see("end")
+                    else:
+                        self.work.yview_moveto(work_position)
+                    self.status.set("Live terminal mirror updated.")
+                    self.set_activity("idle", "Live mirror")
+        finally:
+            self.win.after(500, self.poll_external_session)
 
     def _clear_views(self):
         for widget in (self.chat, self.work):
@@ -2160,7 +2399,7 @@ class App:
         elif typ == "system":
             text = clean_text(item.get("text") or item.get("message"))
             if text:
-                self.append_work(text, "system")
+                self.append_work(text, item.get("tag") or "system")
         elif typ == "note":
             text = clean_text(item.get("text"))
             if text:
@@ -2198,10 +2437,70 @@ class App:
         elif speaker == "GEMINI":
             head_tag = "gemini_head"
         widget.insert("end", speaker + "\n", head_tag)
-        widget.insert("end", text.rstrip() + "\n\n", tag)
+        if tag == "assistant":
+            self._insert_formatted_chat(text)
+        else:
+            widget.insert("end", text.rstrip() + "\n\n", tag)
         widget.configure(state="disabled")
         if at_bottom:
             widget.see("end")
+
+    def _insert_inline_chat(self, text, base_tag="assistant"):
+        cursor = 0
+        pattern = re.compile(r"(`[^`\n]+`|\*\*[^*\n]+\*\*)")
+        for match in pattern.finditer(text):
+            if match.start() > cursor:
+                self.chat.insert("end", text[cursor:match.start()], base_tag)
+            token = match.group(0)
+            if token.startswith("`"):
+                self.chat.insert("end", token[1:-1], "chat_code")
+            else:
+                self.chat.insert("end", token[2:-2], "chat_bold")
+            cursor = match.end()
+        if cursor < len(text):
+            self.chat.insert("end", text[cursor:], base_tag)
+
+    def _insert_formatted_chat(self, text):
+        lines = text.rstrip().splitlines()
+        in_code_block = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_code_block = not in_code_block
+                continue
+            if in_code_block:
+                self.chat.insert("end", line + "\n", "chat_code")
+                continue
+            if stripped.startswith("### "):
+                self.chat.insert("end", stripped[4:] + "\n", "chat_h2")
+            elif stripped.startswith("## "):
+                self.chat.insert("end", stripped[3:] + "\n", "chat_h2")
+            elif stripped.startswith("# "):
+                self.chat.insert("end", stripped[2:] + "\n", "chat_h1")
+            elif re.match(r"^[-*]\s+\[[xX]\]\s+", stripped):
+                label = re.sub(r"^[-*]\s+\[[xX]\]\s+", "", stripped)
+                self.chat.insert("end", "✓ ", "chat_check_done")
+                self._insert_inline_chat(label, "chat_check_done")
+                self.chat.insert("end", "\n", "chat_check_done")
+            elif re.match(r"^[-*]\s+\[\s\]\s+", stripped):
+                label = re.sub(r"^[-*]\s+\[\s\]\s+", "", stripped)
+                self.chat.insert("end", "□ ", "chat_check_open")
+                self._insert_inline_chat(label, "chat_check_open")
+                self.chat.insert("end", "\n", "chat_check_open")
+            elif re.match(r"^[-*]\s+", stripped):
+                label = re.sub(r"^[-*]\s+", "", stripped)
+                self.chat.insert("end", "• ", "chat_bullet")
+                self._insert_inline_chat(label, "assistant")
+                self.chat.insert("end", "\n", "assistant")
+            elif re.match(r"^\d+\.\s+", stripped):
+                marker, label = stripped.split(" ", 1)
+                self.chat.insert("end", marker + " ", "chat_bullet")
+                self._insert_inline_chat(label, "assistant")
+                self.chat.insert("end", "\n", "assistant")
+            else:
+                self._insert_inline_chat(line, "assistant")
+                self.chat.insert("end", "\n", "assistant")
+        self.chat.insert("end", "\n", "assistant")
 
     def append_work(self, text, tag="system"):
         if not text:
@@ -2236,6 +2535,25 @@ class App:
     def _current_agent_label(self):
         return self._agent_spec(self.active_agent.get())["label"]
 
+    def _self_project_context(self, prompt):
+        if not re.search(
+            r"\b(agent workbench|this app|the app|itself|yourself|self)\b",
+            prompt,
+            flags=re.IGNORECASE,
+        ):
+            return ""
+        source_dir = clean_text(self.install_info.get("source_dir"))
+        if not source_dir or not os.path.isdir(source_dir):
+            return ""
+        return (
+            "Agent Workbench self-maintenance context:\n"
+            f"- Editable source project: {source_dir}\n"
+            f"- Running installed executable: {os.path.abspath(__file__)}\n"
+            "- Make changes in the editable source project, test them, then run its installer.\n"
+            "- Do not terminate or restart the current Agent Workbench process during this turn; "
+            "finish the response first and state when a restart is required."
+        )
+
     def _make_turn(self, prompt):
         turn = self.store.ensure_turn(self.current_session, prompt=prompt)
         self.current_turn = turn
@@ -2244,10 +2562,30 @@ class App:
         return turn
 
     def send(self):
-        if self.busy:
-            return
         prompt = clean_text(self.input.get("1.0", "end"))
         if not prompt:
+            return
+        if self.pending_user_input:
+            pending = self.pending_user_input
+            self.pending_user_input = None
+            self.input.delete("1.0", "end")
+            self.append_chat("YOU", prompt, "user")
+            if self.current_turn is not None:
+                self.store.add_item(
+                    self.current_session,
+                    self.current_turn,
+                    {"type": "userMessage", "content": [{"type": "text", "text": prompt}]},
+                )
+            self.backends["codex"].answer_user_input(
+                pending["request_id"], pending["questions"], prompt
+            )
+            self.send_btn.configure(text="Send", state="disabled")
+            self.stop_btn.configure(state="normal")
+            self.status.set("Codex received your reply and is continuing…")
+            self.set_activity("working")
+            return
+        if self.busy:
+            self.status.set("The agent is still working. Use Stop if you need to interrupt it.")
             return
         if prompt.startswith("/resume"):
             self.input.delete("1.0", "end")
@@ -2271,7 +2609,7 @@ class App:
         self._remember_project(self.cwd.get())
         self.input.delete("1.0", "end")
         self.busy = True
-        self.send_btn.configure(state="disabled")
+        self.send_btn.configure(text="Send", state="disabled")
         self.stop_btn.configure(state="normal")
         self.stop_btn.pack(side="right", padx=(0, 6))
 
@@ -2283,6 +2621,9 @@ class App:
                 context_text = ""
         else:
             context_text = ""
+        self_context = self._self_project_context(prompt)
+        if self_context:
+            context_text = "\n\n".join(part for part in (context_text, self_context) if part)
 
         turn = self._make_turn(prompt)
         user_item = {"type": "userMessage", "content": [{"type": "text", "text": prompt}]}
@@ -2290,6 +2631,7 @@ class App:
         self.append_chat("YOU", prompt, "user")
         self.append_work("--- New turn ---", "system")
         self.status.set(f"{self._current_agent_label()} is working…")
+        self.set_activity("working")
         self._persist_current()
 
         backend = self._current_backend()
@@ -2346,7 +2688,7 @@ class App:
                     {"type": "system", "text": event.get("text", ""), "tag": event.get("tag", "system")},
                 )
         elif kind == "assistant_begin":
-            self.live_speaker = event.get("speaker") or self._current_agent_label().upper()
+            pass
         elif kind == "assistant_delta":
             speaker = event.get("speaker") or self._current_agent_label().upper()
             self._append_assistant_chunk(event.get("text", ""), speaker)
@@ -2354,6 +2696,17 @@ class App:
             speaker = event.get("speaker") or self._current_agent_label().upper()
             text = event.get("text", "")
             self._append_assistant_chunk(text, speaker)
+        elif kind == "assistant_message":
+            speaker = event.get("speaker") or self._current_agent_label().upper()
+            text = clean_text(event.get("text"))
+            if text:
+                self.append_chat(speaker, text, "assistant")
+                if self.current_turn is not None:
+                    self.store.add_item(
+                        self.current_session,
+                        self.current_turn,
+                        {"type": "agentMessage", "text": text},
+                    )
         elif kind == "assistant_done":
             if self.live_speaker:
                 widget = self.chat
@@ -2363,14 +2716,47 @@ class App:
                 widget.see("end")
             self.live_speaker = None
             self._persist_current()
+        elif kind == "user_input_request":
+            params = event.get("params") or {}
+            questions = params.get("questions") or []
+            lines = []
+            for index, question in enumerate(questions, start=1):
+                prefix = f"{index}. " if len(questions) > 1 else ""
+                lines.append(prefix + clean_text(question.get("question")))
+                options = question.get("options") or []
+                if options:
+                    labels = [clean_text(option.get("label")) for option in options]
+                    lines.append("Options: " + " | ".join(label for label in labels if label))
+            if len(questions) > 1:
+                lines.append("Reply with one answer per line.")
+            text = "\n".join(line for line in lines if line)
+            self.pending_user_input = {
+                "request_id": event.get("request_id"),
+                "questions": questions,
+            }
+            self.append_chat("CODEX NEEDS INPUT", text, "assistant")
+            if self.current_turn is not None:
+                self.store.add_item(
+                    self.current_session,
+                    self.current_turn,
+                    {"type": "agentMessage", "text": text},
+                )
+            self.send_btn.configure(text="Reply", state="normal")
+            self.stop_btn.pack_forget()
+            self.status.set("Codex is waiting for your answer.")
+            self.set_activity("input")
+            self.notebook.select(self.chat_tab)
+            self.input.focus_set()
         elif kind == "turn_done":
             status = event.get("status", "completed")
             if self.current_turn is not None:
                 self.store.finish_turn(self.current_session, self.current_turn, status=status)
             self.busy = False
-            self.send_btn.configure(state="normal")
+            self.pending_user_input = None
+            self.send_btn.configure(text="Send", state="normal")
             self.stop_btn.pack_forget()
             self.status.set("Ready" if status == "completed" else f"Turn {status}")
+            self.set_activity("idle")
             self._persist_current()
             self.refresh_artifacts_view(self.current_session)
             self.scroll_chat_to_latest()
@@ -2383,13 +2769,21 @@ class App:
                 self.store.add_item(self.current_session, self.current_turn, {"type": "note", "text": "ERROR: " + text})
                 self.store.finish_turn(self.current_session, self.current_turn, status="error")
             self.busy = False
-            self.send_btn.configure(state="normal")
+            self.pending_user_input = None
+            self.send_btn.configure(text="Send", state="normal")
             self.stop_btn.pack_forget()
+            self.set_activity("error")
             self._persist_current()
             self.refresh_artifacts_view(self.current_session)
             self._render_session_list()
         elif kind == "backend_exit":
             self.status.set(event.get("text", "Backend stopped"))
+            if self.busy:
+                self.busy = False
+                self.pending_user_input = None
+                self.send_btn.configure(text="Send", state="normal")
+                self.stop_btn.pack_forget()
+                self.set_activity("error")
         elif kind == "terminal_output":
             self.append_terminal(event.get("text", ""))
         elif kind == "terminal_clear":

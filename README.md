@@ -4,6 +4,10 @@ Linux desktop workbench for Codex, Claude Code, and Gemini CLI sessions. It
 keeps the conversation readable while putting commands, file changes, tools,
 plans, and progress in a separate work log.
 
+Selected Codex terminal sessions are mirrored live. Conversation messages keep
+readable headings, lists, checklists, emphasis, and inline code while
+implementation output stays in Work Log.
+
 The built-in Terminal tab provides a persistent PTY shell in the selected
 project. It loads the user's normal interactive shell configuration and
 supports command history, interactive line input, `Ctrl+C`, and shell restart.
