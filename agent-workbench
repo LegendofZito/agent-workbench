@@ -1139,6 +1139,9 @@ class App:
         self.external_sessions = []
         self.visible_sessions = []
         self.session_filter = tk.StringVar(master=self.win, value="")
+        self.session_tooltip = None
+        self.session_tooltip_after = None
+        self.session_tooltip_index = None
         self.current_session = None
         self.current_turn = None
         self.session_backend_id = None
@@ -1475,6 +1478,12 @@ class App:
         self.session_list.pack(side="left", fill="both", expand=True)
         self.session_list.bind("<<ListboxSelect>>", lambda _e: self.select_session())
         self.session_list.bind("<Double-Button-1>", lambda _e: self.input.focus_set())
+        self.session_list.bind("<Motion>", self._schedule_session_tooltip)
+        self.session_list.bind("<Leave>", lambda _e: self._hide_session_tooltip())
+        self.session_list.bind("<Button>", lambda _e: self._hide_session_tooltip())
+        self.session_list.bind("<MouseWheel>", lambda _e: self._hide_session_tooltip())
+        self.session_list.bind("<Button-4>", lambda _e: self._hide_session_tooltip())
+        self.session_list.bind("<Button-5>", lambda _e: self._hide_session_tooltip())
         sess_scroll = tk.Scrollbar(sess_frame, command=self.session_list.yview)
         sess_scroll.pack(side="right", fill="y")
         self.session_list.configure(yscrollcommand=sess_scroll.set)
@@ -1492,6 +1501,86 @@ class App:
         if alias:
             return alias
         return clean_text(session.get("title") or session.get("preview") or "Untitled")
+
+    def _session_source_label(self, session):
+        origin = session.get("origin", "local")
+        if origin == "local":
+            return "Agent Workbench session"
+        agent = self._agent_spec(session.get("agent"))["label"]
+        return f"Imported from {agent}"
+
+    def _schedule_session_tooltip(self, event):
+        if not self.visible_sessions:
+            self._hide_session_tooltip()
+            return
+        index = self.session_list.nearest(event.y)
+        bounds = self.session_list.bbox(index)
+        if not bounds or not (bounds[1] <= event.y < bounds[1] + bounds[3]):
+            self._hide_session_tooltip()
+            return
+        if index == self.session_tooltip_index:
+            return
+        self._hide_session_tooltip()
+        self.session_tooltip_index = index
+        self.session_tooltip_after = self.win.after(
+            1000, lambda: self._show_session_tooltip(index)
+        )
+
+    def _show_session_tooltip(self, index):
+        self.session_tooltip_after = None
+        if index != self.session_tooltip_index or index >= len(self.visible_sessions):
+            return
+        bounds = self.session_list.bbox(index)
+        if not bounds:
+            return
+        session = self.visible_sessions[index]
+        tooltip = tk.Toplevel(self.win)
+        tooltip.overrideredirect(True)
+        tooltip.attributes("-topmost", True)
+        frame = tk.Frame(
+            tooltip,
+            bg="#202833",
+            highlightbackground="#4b5b6b",
+            highlightthickness=1,
+            padx=12,
+            pady=10,
+        )
+        frame.pack()
+        tk.Label(
+            frame,
+            text=self._display_session_title(session),
+            bg="#202833",
+            fg=TEXT,
+            justify="left",
+            anchor="w",
+            wraplength=560,
+            font=("Sans", 10, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            frame,
+            text=self._session_source_label(session),
+            bg="#202833",
+            fg=MUTED,
+            justify="left",
+            anchor="w",
+        ).pack(anchor="w", pady=(4, 0))
+        x = self.session_list.winfo_rootx() + self.session_list.winfo_width() + 8
+        y = self.session_list.winfo_rooty() + bounds[1]
+        screen_width = self.win.winfo_screenwidth()
+        tooltip.update_idletasks()
+        if x + tooltip.winfo_reqwidth() > screen_width - 12:
+            x = max(12, self.session_list.winfo_rootx() - tooltip.winfo_reqwidth() - 8)
+        tooltip.geometry(f"+{x}+{y}")
+        self.session_tooltip = tooltip
+
+    def _hide_session_tooltip(self):
+        if self.session_tooltip_after is not None:
+            self.win.after_cancel(self.session_tooltip_after)
+            self.session_tooltip_after = None
+        if self.session_tooltip is not None:
+            self.session_tooltip.destroy()
+            self.session_tooltip = None
+        self.session_tooltip_index = None
 
     def _collect_artifact_paths(self, value, out):
         if isinstance(value, dict):
@@ -1574,6 +1663,7 @@ class App:
         self.open_session(self.sessions[0]["id"], remember=False)
 
     def _render_session_list(self):
+        self._hide_session_tooltip()
         selected_id = self.current_session.get("id") if self.current_session else None
         self.session_list.delete(0, "end")
         query = clean_text(self.session_filter.get()).lower()
@@ -1587,8 +1677,6 @@ class App:
             ]
         for session in self.visible_sessions:
             title = self._display_session_title(session)
-            if session.get("origin", "local") != "local":
-                title = "[Imported] " + title
             self.session_list.insert("end", title)
         if self.visible_sessions:
             self.session_list.selection_clear(0, "end")
@@ -1987,6 +2075,7 @@ class App:
         self.win.after(50, self.drain_events)
 
     def close(self):
+        self._hide_session_tooltip()
         self.config.update(
             {
                 "cwd": self.cwd.get(),
