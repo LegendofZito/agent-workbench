@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Codex Conversation Viewer
+Comment=Codex conversation and workload in separate windows
+Exec=codex-conversation-viewer
+Icon=codex-workbench
+Terminal=false
+Categories=Development;
+StartupWMClass=AgentWorkbench

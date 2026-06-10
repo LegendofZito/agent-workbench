@@ -1,0 +1,2207 @@
+#!/usr/bin/env python3
+"""Agent Workbench for Codex, Claude, and Gemini."""
+
+import fcntl
+import json
+import os
+import queue
+import shlex
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from copy import deepcopy
+from datetime import datetime, timezone
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter.scrolledtext import ScrolledText
+from pathlib import Path
+
+
+APP_ID = "codex-conversation-viewer"
+APP_NAME = "Codex Workbench"
+ICON_NAME = "codex-workbench.png"
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), APP_ID
+)
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+SESSIONS_DIR = os.path.join(CONFIG_DIR, "sessions")
+
+BG = "#0d1117"
+PANEL = "#151b23"
+TEXT = "#e6edf3"
+MUTED = "#8b949e"
+SIDEBAR = "#11161d"
+SIDEBAR_SEL = "#22303d"
+CODEX = "#dc2626"
+CLAUDE = "#ffb86b"
+GEMINI = "#8ab4ff"
+WORK = "#f59e0b"
+USER = "#79c0ff"
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def clean_text(value):
+    return str(value or "").replace("\r", "").strip()
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def set_window_icon(window):
+    data_home = os.environ.get(
+        "XDG_DATA_HOME", os.path.expanduser("~/.local/share")
+    )
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", ICON_NAME),
+        os.path.join(data_home, "icons", ICON_NAME),
+    ]
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            window._app_icon = tk.PhotoImage(file=path)
+            window.iconphoto(True, window._app_icon)
+            return
+        except tk.TclError:
+            pass
+
+
+def acquire_lock():
+    runtime = os.environ.get("XDG_RUNTIME_DIR", os.path.expanduser("~/.cache"))
+    ensure_dir(runtime)
+    handle = open(os.path.join(runtime, APP_ID + ".lock"), "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"{APP_NAME} is already running.")
+        sys.exit(0)
+    return handle
+
+
+INSTANCE_LOCK = acquire_lock()
+
+
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+            return data if data is not None else default
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, value):
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def shorten(text, limit=72):
+    text = clean_text(text).replace("\n", " ")
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def project_label(cwd):
+    cwd = clean_text(cwd).rstrip(os.sep)
+    base = os.path.basename(cwd)
+    return base or cwd or "~"
+
+
+def project_key(cwd):
+    return clean_text(cwd).replace("/", "-") or "-home"
+
+
+def session_alias_key(session):
+    return clean_text(session.get("id"))
+
+
+def session_search_blob(session, alias=""):
+    parts = [
+        clean_text(alias),
+        clean_text(session.get("title")),
+        clean_text(session.get("preview")),
+        clean_text(session.get("agent")),
+        clean_text(session.get("origin")),
+        clean_text(session.get("source_session_id")),
+        clean_text(session.get("id")),
+    ]
+    backend = session.get("backend") or {}
+    parts.append(clean_text(backend.get("thread_id")))
+    parts.append(clean_text(backend.get("session_id")))
+    return " ".join(part for part in parts if part).lower()
+
+
+def iso_from_unix(ts):
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except Exception:
+        return now_iso()
+
+
+def read_jsonl_lines(path, limit=6):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for _ in range(limit):
+                line = handle.readline()
+                if not line:
+                    break
+                yield json.loads(line)
+    except (OSError, ValueError):
+        return
+
+
+def first_text_from_claude_jsonl(path):
+    for obj in read_jsonl_lines(path, limit=40):
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "user":
+            continue
+        message = obj.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            text = clean_text(content)
+            if text:
+                return text
+        if isinstance(content, list):
+            parts = []
+            for bit in content:
+                if isinstance(bit, dict) and bit.get("type") == "text":
+                    parts.append(bit.get("text", ""))
+            text = clean_text(" ".join(parts))
+            if text:
+                return text
+    return ""
+
+
+def codex_history_prompts():
+    path = os.path.expanduser("~/.codex/history.jsonl")
+    prompts = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                session_id = obj.get("session_id")
+                text = clean_text(obj.get("text"))
+                if not session_id or not text:
+                    continue
+                prompts.setdefault(session_id, []).append((obj.get("ts") or 0, text))
+    except OSError:
+        return {}
+    return prompts
+
+
+def rename_codex_thread_title(thread_id, title):
+    db = os.path.expanduser("~/.codex/state_5.sqlite")
+    if not thread_id or not os.path.exists(db):
+        return False
+    title = clean_text(title)
+    if not title:
+        return False
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(db)
+        con.execute(
+            "update threads set title = ?, preview = ?, updated_at = ?, updated_at_ms = ? where id = ?",
+            (
+                title,
+                title,
+                int(time.time()),
+                int(time.time() * 1000),
+                thread_id,
+            ),
+        )
+        con.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def gemini_sessions_for_cwd(cwd):
+    cmd = [
+        "gemini",
+        "--list-sessions",
+        "--skip-trust",
+        "--yolo",
+        "--include-directories",
+        cwd,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=12,
+            check=False,
+        )
+    except Exception:
+        return []
+    sessions = []
+    for line in (result.stdout or "").splitlines():
+        line = clean_text(line)
+        if not line:
+            continue
+        if line.startswith("Available sessions for this project"):
+            continue
+        if line.startswith("YOLO mode is enabled"):
+            continue
+        if line.startswith("[SessionSummary]"):
+            continue
+        if "]" not in line or "(" not in line:
+            continue
+        try:
+            left, sid = line.rsplit("[", 1)
+            sid = sid.rstrip("]")
+            title = left.split(".", 1)[1].rsplit("(", 1)[0].strip()
+            age = left.rsplit("(", 1)[1].split(")", 1)[0].strip()
+        except Exception:
+            continue
+        sessions.append(
+            {
+                "id": f"gemini-terminal:{sid}",
+                "source_session_id": sid,
+                "agent": "gemini",
+                "origin": "gemini-terminal",
+                "cwd": cwd,
+                "title": title or "Gemini session",
+                "preview": title or "Gemini session",
+                "created_at": now_iso(),
+                "updated_at": now_iso(),
+                "age": age,
+                "backend": {"session_id": sid},
+                "turns": [
+                    {
+                        "id": sid,
+                        "created_at": now_iso(),
+                        "status": "completed",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": title or "Gemini session"}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    return sessions
+
+
+def claude_sessions_for_cwd(cwd):
+    root = os.path.expanduser("~/.claude/projects/" + project_key(cwd))
+    sessions = []
+    if not os.path.isdir(root):
+        return sessions
+    for path in sorted(Path(root).glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
+        sid = path.stem
+        preview = first_text_from_claude_jsonl(str(path))
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = time.time()
+        sessions.append(
+            {
+                "id": f"claude-terminal:{sid}",
+                "source_session_id": sid,
+                "agent": "claude",
+                "origin": "claude-terminal",
+                "cwd": cwd,
+                "title": preview or path.stem,
+                "preview": preview or path.stem,
+                "created_at": iso_from_unix(mtime),
+                "updated_at": iso_from_unix(mtime),
+                "backend": {"session_id": sid},
+                "turns": [
+                    {
+                        "id": sid,
+                        "created_at": iso_from_unix(mtime),
+                        "status": "completed",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": preview or path.stem}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    return sessions
+
+
+def codex_sessions_for_cwd(cwd):
+    db = os.path.expanduser("~/.codex/state_5.sqlite")
+    if not os.path.exists(db):
+        return []
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "select id, cwd, title, preview, created_at, updated_at, source, archived "
+            "from threads where cwd = ? and archived = 0 order by updated_at desc limit 100",
+            (cwd,),
+        ).fetchall()
+    except Exception:
+        return []
+    history = codex_history_prompts()
+    sessions = []
+    for row in rows:
+        sid = row["id"]
+        prompts = history.get(sid) or []
+        transcript = []
+        if prompts:
+            for _, text in prompts[:8]:
+                transcript.append(
+                    {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": text}],
+                    }
+                )
+        preview = clean_text(row["preview"] or row["title"] or "")
+        if not preview and prompts:
+            preview = prompts[0][1]
+        sessions.append(
+            {
+                "id": f"codex-terminal:{sid}",
+                "source_session_id": sid,
+                "agent": "codex",
+                "origin": "codex-terminal",
+                "cwd": row["cwd"],
+                "title": row["title"] or preview or "Codex session",
+                "preview": preview or "Codex session",
+                "created_at": iso_from_unix(row["created_at"]),
+                "updated_at": iso_from_unix(row["updated_at"]),
+                "backend": {"thread_id": sid},
+                "turns": [{"id": sid, "created_at": iso_from_unix(row["created_at"]), "status": "completed", "items": transcript}] if transcript else [],
+            }
+        )
+    return sessions
+
+
+def discover_external_sessions(cwd, agent_key):
+    if agent_key == "codex":
+        return codex_sessions_for_cwd(cwd)
+    if agent_key == "claude":
+        return claude_sessions_for_cwd(cwd)
+    if agent_key == "gemini":
+        return gemini_sessions_for_cwd(cwd)
+    return []
+
+
+def summarize_turn_items(turns, max_chars=7000):
+    lines = []
+    remaining = max_chars
+    for turn in turns[-12:]:
+        for item in turn.get("items") or []:
+            typ = item.get("type", "")
+            text = ""
+            if typ == "userMessage":
+                parts = []
+                for bit in item.get("content") or []:
+                    if isinstance(bit, dict) and bit.get("type") == "text":
+                        parts.append(bit.get("text", ""))
+                text = " ".join(parts)
+                prefix = "USER"
+            elif typ == "agentMessage":
+                text = item.get("text") or item.get("content") or ""
+                prefix = "AGENT"
+            elif typ == "commandExecution":
+                text = item.get("command") or ""
+                prefix = "COMMAND"
+            elif typ == "fileChange":
+                paths = []
+                for change in item.get("changes") or []:
+                    path = change.get("path") or change.get("filePath")
+                    if path:
+                        paths.append(str(path))
+                text = ", ".join(paths)
+                prefix = "FILES"
+            elif typ == "reasoning":
+                text = " ".join(item.get("summary") or [])
+                prefix = "REASONING"
+            elif typ == "plan":
+                text = item.get("text") or ""
+                prefix = "PLAN"
+            else:
+                text = item.get("text") or item.get("summary") or ""
+                prefix = typ.upper() or "NOTE"
+            text = clean_text(text)
+            if not text:
+                continue
+            line = f"{prefix}: {text}"
+            if len(line) > remaining:
+                lines.append(line[: max(0, remaining - 1)] + "…")
+                return "\n".join(lines)
+            lines.append(line)
+            remaining -= len(line) + 1
+            if remaining <= 0:
+                return "\n".join(lines)
+    return "\n".join(lines)
+
+
+class SessionStore:
+    def __init__(self):
+        ensure_dir(CONFIG_DIR)
+        ensure_dir(SESSIONS_DIR)
+        self.sessions = {}
+        self.load()
+
+    def load(self):
+        self.sessions = {}
+        for name in sorted(os.listdir(SESSIONS_DIR)):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(SESSIONS_DIR, name)
+            data = load_json(path, None)
+            if isinstance(data, dict) and data.get("id"):
+                if not data.get("origin"):
+                    data["origin"] = "local"
+                self.sessions[data["id"]] = data
+
+    def save(self, session):
+        if session.get("origin", "local") != "local":
+            return
+        session["updated_at"] = now_iso()
+        if not session.get("created_at"):
+            session["created_at"] = session["updated_at"]
+        self.sessions[session["id"]] = session
+        save_json(os.path.join(SESSIONS_DIR, session["id"] + ".json"), session)
+
+    def delete(self, session_id):
+        self.sessions.pop(session_id, None)
+        path = os.path.join(SESSIONS_DIR, session_id + ".json")
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def new_session(self, agent_key, cwd):
+        session = self._make_session(
+            agent_key=agent_key,
+            cwd=cwd,
+            title=f"New {agent_key} session",
+            backend={},
+            turns=[],
+            origin="local",
+        )
+        self.save(session)
+        return session
+
+    def _make_session(self, agent_key, cwd, title, backend, turns, origin="local", source_session_id=None):
+        session = {
+            "id": str(uuid.uuid4()),
+            "agent": agent_key,
+            "cwd": cwd,
+            "title": title,
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+            "backend": backend or {},
+            "turns": turns or [],
+            "origin": origin,
+        }
+        if source_session_id:
+            session["source_session_id"] = source_session_id
+        return session
+
+    def clone_for_continuation(self, source):
+        backend = {}
+        if source.get("agent") in {"claude", "gemini"}:
+            backend = deepcopy(source.get("backend") or {})
+        turns = deepcopy(source.get("turns") or [])
+        title = source.get("title") or source.get("preview") or f"New {source.get('agent', 'agent')} session"
+        session = self._make_session(
+            agent_key=source.get("agent", "codex"),
+            cwd=source.get("cwd") or os.path.expanduser("~"),
+            title=title,
+            backend=backend,
+            turns=turns,
+            origin="local",
+            source_session_id=source.get("source_session_id") or source.get("id"),
+        )
+        self.save(session)
+        return session
+
+    def list_for(self, cwd, agent_key):
+        items = [
+            s
+            for s in self.sessions.values()
+            if s.get("cwd") == cwd and s.get("agent") == agent_key and (s.get("turns") or [])
+        ]
+        items.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
+        unique = []
+        seen = set()
+        for session in items:
+            key = session.get("source_session_id") or session.get("id")
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(session)
+        return unique
+
+    def get(self, session_id):
+        return self.sessions.get(session_id)
+
+    def set_title_from_prompt(self, session, prompt):
+        title = shorten(prompt, 60)
+        if title:
+            session["title"] = title
+            self.save(session)
+
+    def ensure_turn(self, session, prompt=None):
+        turns = session.setdefault("turns", [])
+        turn = {
+            "id": str(uuid.uuid4()),
+            "created_at": now_iso(),
+            "status": "running",
+            "items": [],
+        }
+        if prompt:
+            turn["prompt"] = prompt
+        turns.append(turn)
+        self.save(session)
+        return turn
+
+    def add_item(self, session, turn, item):
+        turn.setdefault("items", []).append(item)
+        self.save(session)
+
+    def finish_turn(self, session, turn, status="completed"):
+        turn["status"] = status
+        turn["completed_at"] = now_iso()
+        self.save(session)
+
+    def summary_for_handoff(self, session, max_chars=7000):
+        header = f"Previous {session.get('agent', 'agent')} session for {project_label(session.get('cwd'))}:\n"
+        body = summarize_turn_items(session.get("turns") or [], max_chars=max_chars)
+        return header + body if body else header + "No prior details available."
+
+
+class BaseBackend:
+    def __init__(self, events):
+        self.events = events
+        self.stop_flag = threading.Event()
+        self.active = False
+
+    def emit(self, kind, **payload):
+        self.events.put({"kind": kind, **payload})
+
+    def stop(self):
+        self.stop_flag.set()
+
+
+class CodexBackend(BaseBackend):
+    def __init__(self, events):
+        super().__init__(events)
+        self.proc = None
+        self.cwd = None
+        self.thread_id = None
+        self.turn_id = None
+        self.next_id = 1
+        self.pending = {}
+        self.lock = threading.Lock()
+        self.ready = threading.Event()
+
+    def start(self, cwd):
+        self.cwd = cwd
+        self.proc = subprocess.Popen(
+            ["codex", "app-server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+        self.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "agent_workbench",
+                    "title": APP_NAME,
+                    "version": "0.2.0",
+                }
+            },
+            self._on_initialized,
+        )
+
+    def _on_initialized(self, _result):
+        self.ready.set()
+        self.emit("status", text="Codex app server ready")
+
+    def request(self, method, params, callback=None):
+        with self.lock:
+            req_id = self.next_id
+            self.next_id += 1
+            if callback:
+                self.pending[req_id] = callback
+        message = {"method": method, "id": req_id, "params": params}
+        self._send(message)
+        return req_id
+
+    def _send(self, message):
+        try:
+            self.proc.stdin.write(json.dumps(message) + "\n")
+            self.proc.stdin.flush()
+        except Exception as exc:
+            self.emit("error", text=str(exc))
+
+    def _read_stdout(self):
+        for line in self.proc.stdout:
+            if self.stop_flag.is_set():
+                break
+            try:
+                message = json.loads(line)
+            except ValueError:
+                self.emit("work", text=line.rstrip(), tag="system")
+                continue
+
+            req_id = message.get("id")
+            if req_id is not None:
+                callback = self.pending.pop(req_id, None)
+                if "error" in message:
+                    err = message["error"]
+                    self.emit("error", text=err.get("message", "Codex error"))
+                elif callback:
+                    callback(message.get("result") or {})
+                continue
+
+            self._handle_notification(message)
+        self.emit("backend_exit", text="Codex app server stopped")
+
+    def _read_stderr(self):
+        for line in self.proc.stderr:
+            if self.stop_flag.is_set():
+                break
+            line = line.strip()
+            if line:
+                self.emit("work", text=line, tag="system")
+
+    def _handle_notification(self, message):
+        method = message.get("method", "")
+        params = message.get("params") or {}
+        item = params.get("item") or {}
+        typ = item.get("type", "")
+
+        if method == "turn/started":
+            turn = params.get("turn") or {}
+            self.turn_id = turn.get("id") or self.turn_id
+            self.emit("work", text="--- New turn ---", tag="system")
+        elif method == "item/started":
+            if typ and typ != "agentMessage":
+                self.emit("work", text="▶ " + typ, tag="tool")
+        elif method == "item/completed":
+            if typ == "agentMessage":
+                text = item.get("text") or item.get("content") or ""
+                if not text:
+                    content = []
+                    for bit in item.get("content") or []:
+                        if isinstance(bit, dict) and bit.get("type") == "text":
+                            content.append(bit.get("text", ""))
+                    text = " ".join(content)
+                if text:
+                    self.emit("assistant", text=text)
+            elif typ == "userMessage":
+                self.emit("user", text=self._extract_text(item))
+            elif typ == "commandExecution":
+                command = clean_text(item.get("command"))
+                if command:
+                    self.emit("work", text=f"$ {command}", tag="command")
+                output = clean_text(item.get("aggregatedOutput"))
+                if output:
+                    self.emit("work", text=output, tag="system")
+            elif typ == "fileChange":
+                paths = []
+                for change in item.get("changes") or []:
+                    path = change.get("path") or change.get("filePath")
+                    if path:
+                        paths.append(str(path))
+                if paths:
+                    self.emit("work", text="files: " + ", ".join(paths), tag="fileChange")
+            elif typ == "reasoning":
+                summary = " ".join(item.get("summary") or [])
+                if summary:
+                    self.emit("work", text=summary, tag="reasoning")
+            elif typ == "plan":
+                text = clean_text(item.get("text"))
+                if text:
+                    self.emit("work", text=text, tag="plan")
+            elif typ == "mcpToolCall":
+                self.emit(
+                    "work",
+                    text=f"{clean_text(item.get('server'))}.{clean_text(item.get('tool'))}",
+                    tag="tool",
+                )
+        elif method == "item/commandExecution/outputDelta":
+            delta = clean_text(params.get("delta"))
+            if delta:
+                self.emit("work", text=delta, tag="system")
+        elif method == "item/fileChange/outputDelta":
+            delta = clean_text(params.get("delta"))
+            if delta:
+                self.emit("work", text=delta, tag="fileChange")
+        elif method == "turn/completed":
+            turn = params.get("turn") or {}
+            self.emit("turn_done", status=(turn.get("status") or "completed"))
+        elif method == "thread/created" or method == "thread/resumed":
+            thread = params.get("thread") or {}
+            self.thread_id = thread.get("id") or self.thread_id
+
+    def _extract_text(self, item):
+        parts = []
+        for bit in item.get("content") or []:
+            if isinstance(bit, dict) and bit.get("type") == "text":
+                parts.append(bit.get("text", ""))
+        return clean_text(" ".join(parts))
+
+    def ensure_session(self, session):
+        backend = session.setdefault("backend", {})
+        backend.setdefault("kind", "codex")
+        if backend.get("thread_id"):
+            self.thread_id = backend["thread_id"]
+            return
+
+        result_holder = {}
+        done = threading.Event()
+
+        def on_started(result):
+            result_holder.update(result)
+            done.set()
+
+        self.request(
+            "thread/start",
+            {
+                "cwd": session["cwd"],
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "personality": "pragmatic",
+            },
+            on_started,
+        )
+        done.wait(timeout=30)
+        thread = result_holder.get("thread") or {}
+        backend["thread_id"] = thread.get("id")
+        self.thread_id = backend["thread_id"]
+        session["backend"] = backend
+
+    def start_turn(self, session, turn, prompt, context_text=""):
+        self.ensure_session(session)
+        self.turn_id = None
+        payload_text = prompt
+        if context_text:
+            payload_text = context_text.strip() + "\n\n" + prompt.strip()
+        done = threading.Event()
+
+        def on_turn(result):
+            turn_obj = result.get("turn") or {}
+            self.turn_id = turn_obj.get("id")
+            backend = session.setdefault("backend", {})
+            backend["thread_id"] = backend.get("thread_id") or self.thread_id
+            backend["turn_id"] = self.turn_id
+            done.set()
+
+        self.request(
+            "turn/start",
+            {
+                "threadId": self.thread_id,
+                "cwd": session["cwd"],
+                "input": [{"type": "text", "text": payload_text}],
+            },
+            on_turn,
+        )
+        done.wait(timeout=30)
+
+    def interrupt(self):
+        if self.thread_id and self.turn_id:
+            self.request(
+                "turn/interrupt",
+                {"threadId": self.thread_id, "turnId": self.turn_id},
+            )
+
+    def close(self):
+        self.stop_flag.set()
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+
+class StreamCliBackend(BaseBackend):
+    def __init__(self, events, kind):
+        super().__init__(events)
+        self.kind = kind
+        self.running = None
+        self.lock = threading.Lock()
+
+    def interrupt(self):
+        with self.lock:
+            if self.running and self.running.poll() is None:
+                self.running.terminate()
+
+    def close(self):
+        self.stop_flag.set()
+        self.interrupt()
+
+
+class ClaudeBackend(StreamCliBackend):
+    def __init__(self, events):
+        super().__init__(events, "claude")
+
+    def start_turn(self, session, turn, prompt, context_text=""):
+        def run():
+            session_id = session.setdefault("backend", {}).get("session_id") or str(uuid.uuid4())
+            first_turn = not session["backend"].get("session_id")
+            cmd = [
+                "claude",
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "text",
+                "--verbose",
+                "--permission-mode",
+                "bypassPermissions",
+                "--dangerously-skip-permissions",
+            ]
+            if first_turn:
+                cmd += ["--session-id", session_id]
+            else:
+                cmd += ["--resume", session_id]
+
+            payload = prompt
+            if context_text and first_turn:
+                payload = context_text.strip() + "\n\n" + prompt.strip()
+
+            self.emit("work", text="$ " + shlex.join(cmd + [payload]), tag="command")
+            buffer = []
+            with self.lock:
+                self.running = subprocess.Popen(
+                    cmd + [payload],
+                    cwd=session["cwd"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+            try:
+                threading.Thread(target=self._stream_stderr, daemon=True).start()
+                for raw in self.running.stdout:
+                    if self.stop_flag.is_set():
+                        break
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        self.emit("work", text=line, tag="system")
+                        continue
+                    etype = event.get("type")
+                    if etype == "init":
+                        sid = event.get("session_id")
+                        if sid:
+                            session.setdefault("backend", {})["session_id"] = sid
+                        self.emit(
+                            "work",
+                            text=f"claude session {sid or session_id}",
+                            tag="system",
+                        )
+                    elif etype == "message":
+                        role = event.get("role")
+                        content = clean_text(event.get("content"))
+                        if role == "assistant" and content:
+                            if not buffer:
+                                self.emit("assistant_begin", speaker="CLAUDE")
+                            buffer.append(content)
+                            self.emit("assistant_delta", text=content, speaker="CLAUDE")
+                        elif role == "user":
+                            self.emit("user", text=content)
+                    elif etype == "result":
+                        result = event.get("result") or ""
+                        if result and not buffer:
+                            self.emit("assistant_begin", speaker="CLAUDE")
+                            self.emit("assistant_delta", text=clean_text(result), speaker="CLAUDE")
+                        status = event.get("status") or "success"
+                        stats = event.get("usage") or {}
+                        self.emit(
+                            "work",
+                            text=f"Claude {status} · input {stats.get('input_tokens', 0)} · output {stats.get('output_tokens', 0)}",
+                            tag="done" if status == "success" else "system",
+                        )
+                        break
+                    else:
+                        self.emit("work", text=line, tag="system")
+                if buffer:
+                    self.emit("assistant_done", speaker="CLAUDE")
+                self.emit("turn_done", status="completed")
+            except Exception as exc:
+                self.emit("error", text=str(exc))
+                self.emit("turn_done", status="error")
+            finally:
+                with self.lock:
+                    self.running = None
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _stream_stderr(self):
+        proc = self.running
+        if not proc or not proc.stderr:
+            return
+        for raw in proc.stderr:
+            if self.stop_flag.is_set():
+                break
+            line = raw.strip()
+            if line:
+                self.emit("work", text=line, tag="system")
+
+
+class GeminiBackend(StreamCliBackend):
+    def __init__(self, events):
+        super().__init__(events, "gemini")
+
+    def start_turn(self, session, turn, prompt, context_text=""):
+        def run():
+            session_id = session.setdefault("backend", {}).get("session_id") or str(uuid.uuid4())
+            first_turn = not session["backend"].get("session_id")
+            cmd = [
+                "gemini",
+                "-p",
+                prompt,
+                "--output-format",
+                "stream-json",
+                "--yolo",
+                "--skip-trust",
+            ]
+            if first_turn:
+                cmd += ["--session-id", session_id]
+            else:
+                cmd += ["--resume", session_id]
+
+            payload = prompt
+            if context_text and first_turn:
+                payload = context_text.strip() + "\n\n" + prompt.strip()
+                cmd[2] = payload
+
+            self.emit("work", text="$ " + shlex.join(cmd), tag="command")
+            buffer = []
+            with self.lock:
+                self.running = subprocess.Popen(
+                    cmd,
+                    cwd=session["cwd"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+            try:
+                threading.Thread(target=self._stream_stderr, daemon=True).start()
+                for raw in self.running.stdout:
+                    if self.stop_flag.is_set():
+                        break
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        self.emit("work", text=line, tag="system")
+                        continue
+                    etype = event.get("type")
+                    if etype == "init":
+                        sid = event.get("session_id")
+                        if sid:
+                            session.setdefault("backend", {})["session_id"] = sid
+                        self.emit(
+                            "work",
+                            text=f"Gemini session {sid or session_id}",
+                            tag="system",
+                        )
+                    elif etype == "message":
+                        role = event.get("role")
+                        content = clean_text(event.get("content"))
+                        if role == "assistant" and content:
+                            if not buffer:
+                                self.emit("assistant_begin", speaker="GEMINI")
+                            buffer.append(content)
+                            self.emit("assistant_delta", text=content, speaker="GEMINI")
+                        elif role == "user":
+                            self.emit("user", text=content)
+                    elif etype == "result":
+                        result = event.get("result") or ""
+                        if result and not buffer:
+                            self.emit("assistant_begin", speaker="GEMINI")
+                            self.emit("assistant_delta", text=clean_text(result), speaker="GEMINI")
+                        status = event.get("status") or "success"
+                        stats = event.get("stats") or {}
+                        self.emit(
+                            "work",
+                            text=f"Gemini {status} · input {stats.get('input_tokens', 0)} · output {stats.get('output_tokens', 0)}",
+                            tag="done" if status == "success" else "system",
+                        )
+                        break
+                    else:
+                        self.emit("work", text=line, tag="system")
+                if buffer:
+                    self.emit("assistant_done", speaker="GEMINI")
+                self.emit("turn_done", status="completed")
+            except Exception as exc:
+                self.emit("error", text=str(exc))
+                self.emit("turn_done", status="error")
+            finally:
+                with self.lock:
+                    self.running = None
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _stream_stderr(self):
+        proc = self.running
+        if not proc or not proc.stderr:
+            return
+        for raw in proc.stderr:
+            if self.stop_flag.is_set():
+                break
+            line = raw.strip()
+            if line:
+                self.emit("work", text=line, tag="system")
+
+
+class App:
+    def __init__(self):
+        self.config = load_json(CONFIG_FILE, {})
+        ensure_dir(CONFIG_DIR)
+        ensure_dir(SESSIONS_DIR)
+        self.store = SessionStore()
+        self.events = queue.Queue()
+        self.busy = False
+        self.live_speaker = None
+        self.live_turn = None
+        self.transfer_source_session_id = None
+
+        self.win = tk.Tk(className="AgentWorkbench")
+        self.win.title(APP_NAME)
+        set_window_icon(self.win)
+        self.win.geometry(self.config.get("geometry", "1380x920+80+80"))
+        self.win.configure(bg=CODEX)
+        self.win.minsize(1140, 720)
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.recent_projects = self.config.get("recent_projects") or []
+        if not isinstance(self.recent_projects, list):
+            self.recent_projects = []
+        self.session_aliases = self.config.get("session_aliases") or {}
+        if not isinstance(self.session_aliases, dict):
+            self.session_aliases = {}
+        self.agent_specs = [
+            {"key": "codex", "label": "Codex", "color": CODEX},
+            {"key": "claude", "label": "Claude", "color": CLAUDE},
+            {"key": "gemini", "label": "Gemini", "color": GEMINI},
+        ]
+        self.agent_map = {spec["key"]: spec for spec in self.agent_specs}
+        self.cwd = tk.StringVar(master=self.win, value=self.config.get("cwd", os.path.expanduser("~")))
+        self.active_agent = tk.StringVar(master=self.win, value=self.config.get("active_agent", "codex"))
+        if self.active_agent.get() not in self.agent_map:
+            self.active_agent.set("codex")
+        self.status = tk.StringVar(master=self.win, value="Starting…")
+        self.session_title = tk.StringVar(master=self.win, value=APP_NAME)
+        self.session_label = tk.StringVar(master=self.win, value="No session")
+        self.sessions = []
+        self.local_sessions = []
+        self.external_sessions = []
+        self.visible_sessions = []
+        self.session_filter = tk.StringVar(master=self.win, value="")
+        self.current_session = None
+        self.current_turn = None
+        self.session_backend_id = None
+
+        self._build_style()
+        self._build_ui()
+
+        self.backends = {
+            "codex": CodexBackend(self.events),
+            "claude": ClaudeBackend(self.events),
+            "gemini": GeminiBackend(self.events),
+        }
+        self.backends["codex"].start(self.cwd.get())
+
+        self.refresh_sessions()
+        self._restore_last_session()
+        self.win.after(50, self.drain_events)
+
+    def _build_style(self):
+        style = ttk.Style(self.win)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("TNotebook", background=BG, borderwidth=0)
+        style.configure(
+            "TNotebook.Tab",
+            background=PANEL,
+            foreground=TEXT,
+            padding=(14, 8),
+        )
+        style.map("TNotebook.Tab", background=[("selected", SIDEBAR_SEL)])
+        style.configure(
+            "Agent.TCombobox",
+            fieldbackground=PANEL,
+            background=PANEL,
+            foreground=TEXT,
+            arrowcolor=TEXT,
+            selectbackground=PANEL,
+            selectforeground=TEXT,
+            padding=6,
+        )
+        style.map(
+            "Agent.TCombobox",
+            fieldbackground=[("readonly", PANEL), ("!readonly", PANEL)],
+            foreground=[("readonly", TEXT), ("!readonly", TEXT)],
+        )
+
+    def _build_ui(self):
+        outer = tk.Frame(self.win, bg=CODEX)
+        outer.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self._build_sidebar(outer)
+
+        right = tk.Frame(outer, bg=CODEX)
+        right.pack(side="right", fill="both", expand=True, padx=(6, 0))
+
+        topbar = tk.Frame(right, bg=BG)
+        topbar.pack(fill="x", pady=(0, 6))
+        tk.Label(
+            topbar,
+            textvariable=self.session_title,
+            bg=BG,
+            fg=TEXT,
+            anchor="w",
+            font=("Sans", 11, "bold"),
+        ).pack(side="left", fill="x", expand=True, padx=10, pady=8)
+        tk.Label(
+            topbar,
+            textvariable=self.session_label,
+            bg=BG,
+            fg=MUTED,
+            anchor="e",
+        ).pack(side="left", padx=(0, 10))
+        tk.Label(topbar, textvariable=self.status, bg=BG, fg=MUTED, anchor="e").pack(
+            side="right", padx=10
+        )
+
+        content = tk.Frame(right, bg=CODEX)
+        content.pack(fill="both", expand=True)
+        content.grid_rowconfigure(1, weight=1)
+        content.grid_columnconfigure(0, weight=1)
+
+        self.notebook = ttk.Notebook(content)
+        self.notebook.grid(row=1, column=0, sticky="nsew")
+        self.chat_tab = tk.Frame(self.notebook, bg=BG)
+        self.work_tab = tk.Frame(self.notebook, bg=BG)
+        self.artifacts_tab = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(self.chat_tab, text="Conversation")
+        self.notebook.add(self.work_tab, text="Work Log")
+        self.notebook.add(self.artifacts_tab, text="Artifacts")
+
+        chat_header = tk.Frame(self.chat_tab, bg=BG)
+        chat_header.pack(fill="x", padx=8, pady=(8, 0))
+        tk.Label(chat_header, text="Conversation", bg=BG, fg=TEXT, font=("Sans", 11, "bold")).pack(
+            side="left"
+        )
+        tk.Button(chat_header, text="Top", command=self.scroll_chat_to_top, bg=PANEL, fg=TEXT, relief="flat").pack(
+            side="right", padx=(6, 0)
+        )
+        tk.Button(
+            chat_header,
+            text="Latest",
+            command=self.scroll_chat_to_latest,
+            bg=PANEL,
+            fg=TEXT,
+            relief="flat",
+        ).pack(side="right")
+
+        self.chat = ScrolledText(
+            self.chat_tab,
+            wrap="word",
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            borderwidth=0,
+            padx=18,
+            pady=14,
+            font=("Sans", 11),
+            spacing1=3,
+            spacing3=8,
+        )
+        self.chat.pack(fill="both", expand=True, padx=8, pady=8)
+        self.chat.tag_config("user_head", foreground=USER, font=("Sans", 10, "bold"))
+        self.chat.tag_config("assistant_head", foreground=CODEX, font=("Sans", 10, "bold"))
+        self.chat.tag_config("claude_head", foreground=CLAUDE, font=("Sans", 10, "bold"))
+        self.chat.tag_config("gemini_head", foreground=GEMINI, font=("Sans", 10, "bold"))
+        self.chat.tag_config("user", foreground="#dbeafe")
+        self.chat.tag_config("assistant", foreground=TEXT)
+        self.chat.configure(state="disabled")
+
+        work_header = tk.Frame(self.work_tab, bg=BG)
+        work_header.pack(fill="x", padx=8, pady=(8, 0))
+        tk.Label(work_header, text="Work Log", bg=BG, fg=WORK, font=("Sans", 11, "bold")).pack(
+            side="left"
+        )
+        tk.Button(work_header, text="Clear", command=self.clear_work, bg=PANEL, fg=TEXT, relief="flat").pack(
+            side="right"
+        )
+        self.work = ScrolledText(
+            self.work_tab,
+            wrap="word",
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            borderwidth=0,
+            padx=18,
+            pady=14,
+            font=("Monospace", 10),
+        )
+        self.work.pack(fill="both", expand=True, padx=8, pady=8)
+        for tag, color in (
+            ("command", "#67e08a"),
+            ("fileChange", "#f0c24a"),
+            ("reasoning", "#b48cff"),
+            ("tool", "#43c0d6"),
+            ("plan", "#79c0ff"),
+            ("system", MUTED),
+            ("done", "#22c55e"),
+        ):
+            self.work.tag_config(tag, foreground=color)
+        self.work.configure(state="disabled")
+
+        artifacts_header = tk.Frame(self.artifacts_tab, bg=BG)
+        artifacts_header.pack(fill="x", padx=8, pady=(8, 0))
+        tk.Label(artifacts_header, text="Artifacts", bg=BG, fg=TEXT, font=("Sans", 11, "bold")).pack(side="left")
+        tk.Button(
+            artifacts_header,
+            text="Open",
+            command=self.open_selected_artifact,
+            bg=PANEL,
+            fg=TEXT,
+            relief="flat",
+        ).pack(side="right", padx=(6, 0))
+        tk.Button(
+            artifacts_header,
+            text="Refresh",
+            command=self.refresh_artifacts_view,
+            bg=PANEL,
+            fg=TEXT,
+            relief="flat",
+        ).pack(side="right")
+        self.artifact_hint = tk.Label(
+            artifacts_header,
+            text="files and images mentioned in the session",
+            bg=BG,
+            fg=MUTED,
+            anchor="w",
+        )
+        self.artifact_hint.pack(side="left", padx=(10, 0))
+
+        artifact_frame = tk.Frame(self.artifacts_tab, bg=BG)
+        artifact_frame.pack(fill="both", expand=True, padx=8, pady=8)
+        self.artifact_list = tk.Listbox(
+            artifact_frame,
+            bg=PANEL,
+            fg=TEXT,
+            selectbackground=SIDEBAR_SEL,
+            relief="flat",
+            highlightthickness=0,
+            activestyle="none",
+        )
+        self.artifact_list.pack(side="left", fill="both", expand=True)
+        self.artifact_list.bind("<Double-Button-1>", lambda _e: self.open_selected_artifact())
+        self.artifact_list.bind("<<ListboxSelect>>", lambda _e: None)
+        artifact_scroll = tk.Scrollbar(artifact_frame, command=self.artifact_list.yview)
+        artifact_scroll.pack(side="right", fill="y")
+        self.artifact_list.configure(yscrollcommand=artifact_scroll.set)
+
+        composer = tk.Frame(content, bg=BG)
+        composer.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        tk.Label(composer, text="Prompt", bg=BG, fg=TEXT, anchor="w", font=("Sans", 10, "bold")).pack(
+            anchor="w", padx=8, pady=(0, 4)
+        )
+        self.input = ScrolledText(
+            composer,
+            wrap="word",
+            height=4,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            borderwidth=0,
+            padx=14,
+            pady=12,
+            font=("Sans", 11),
+        )
+        self.input.pack(fill="x", padx=8)
+        self.input.bind("<Return>", lambda _e: (self.send(), "break")[1])
+        self.input.bind("<KP_Enter>", lambda _e: (self.send(), "break")[1])
+        self.input.bind("<Control-Return>", lambda _e: (self.send(), "break")[1])
+        self.input.bind("<Command-Return>", lambda _e: (self.send(), "break")[1])
+
+        bar = tk.Frame(composer, bg=BG)
+        bar.pack(fill="x", padx=8, pady=(6, 0))
+        self.hint = tk.Label(bar, text="Enter to send. Shift+Enter makes a newline.", bg=BG, fg=MUTED, anchor="w")
+        self.hint.pack(side="left", fill="x", expand=True)
+        self.stop_btn = tk.Button(bar, text="Stop", command=self.stop, bg="#9f2d2d", fg="white", relief="flat")
+        self.stop_btn.pack(side="right", padx=(6, 0))
+        self.send_btn = tk.Button(bar, text="Send", command=self.send, bg=CODEX, fg="white", relief="flat")
+        self.send_btn.pack(side="right")
+
+    def scroll_chat_to_top(self):
+        self.chat.see("1.0")
+        self.chat.yview_moveto(0.0)
+
+    def scroll_chat_to_latest(self):
+        self.chat.see("end")
+        self.chat.yview_moveto(1.0)
+
+    def refresh_artifacts_view(self, session=None):
+        session = session or self.current_session
+        self.artifact_list.delete(0, "end")
+        self.artifacts = self._artifact_items_for_session(session) if session else []
+        for item in self.artifacts:
+            self.artifact_list.insert("end", item["label"])
+        if self.artifacts:
+            self.artifact_list.selection_set(0)
+
+    def open_selected_artifact(self):
+        if not getattr(self, "artifacts", None):
+            return
+        selection = self.artifact_list.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        if idx >= len(self.artifacts):
+            return
+        path = self.artifacts[idx]["path"]
+        if not path:
+            return
+        try:
+            subprocess.Popen(["xdg-open", path])
+        except Exception as exc:
+            messagebox.showerror("Open artifact", str(exc))
+
+    def _build_sidebar(self, parent):
+        sidebar = tk.Frame(
+            parent,
+            bg=SIDEBAR,
+            width=320,
+            highlightbackground="#cc2f2f",
+            highlightcolor="#cc2f2f",
+            highlightthickness=2,
+        )
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+
+        head = tk.Frame(sidebar, bg=SIDEBAR)
+        head.pack(fill="x", padx=14, pady=(14, 10))
+        tk.Label(head, text="CODEX", bg=SIDEBAR, fg=CODEX, font=("Sans", 14, "bold")).pack(anchor="w")
+        tk.Label(head, text="projects, agents, and sessions", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
+
+        agent_box = tk.Frame(
+            sidebar,
+            bg=SIDEBAR,
+            highlightbackground="#cc2f2f",
+            highlightcolor="#cc2f2f",
+            highlightthickness=2,
+        )
+        agent_box.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Label(agent_box, text="Agent", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
+        self.agent_picker = ttk.Combobox(
+            agent_box,
+            textvariable=self.active_agent,
+            values=[spec["key"] for spec in self.agent_specs],
+            state="readonly",
+            style="Agent.TCombobox",
+        )
+        self.agent_picker.pack(fill="x", pady=(4, 0))
+        self.agent_picker.bind("<<ComboboxSelected>>", lambda _e: self.on_agent_changed())
+
+        cwd_box = tk.Frame(sidebar, bg=SIDEBAR)
+        cwd_box.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Label(cwd_box, text="Working in", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
+        cwd_row = tk.Frame(cwd_box, bg=SIDEBAR)
+        cwd_row.pack(fill="x", pady=(4, 0))
+        self.cwd_entry = tk.Entry(cwd_row, textvariable=self.cwd, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat")
+        self.cwd_entry.pack(side="left", fill="x", expand=True)
+        tk.Button(cwd_row, text="Choose", command=self.choose_cwd, bg=PANEL, fg=TEXT, relief="flat").pack(
+            side="left", padx=(6, 0)
+        )
+
+        actions = tk.Frame(sidebar, bg=SIDEBAR)
+        actions.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Button(actions, text="New Session", command=self.new_session, bg=CODEX, fg="white", relief="flat").pack(
+            fill="x"
+        )
+        tk.Button(actions, text="Find Session", command=self.open_session_finder, bg=PANEL, fg=TEXT, relief="flat").pack(
+            fill="x", pady=(6, 0)
+        )
+        tk.Button(actions, text="Resume Selected", command=self.resume_selected, bg=PANEL, fg=TEXT, relief="flat").pack(
+            fill="x", pady=(6, 0)
+        )
+        tk.Button(actions, text="Refresh Sessions", command=self.refresh_sessions, bg=PANEL, fg=TEXT, relief="flat").pack(
+            fill="x", pady=(6, 0)
+        )
+
+        proj_frame = tk.LabelFrame(
+            sidebar,
+            text="Recent Projects",
+            bg=SIDEBAR,
+            fg=TEXT,
+            highlightbackground="#1f2a35",
+            highlightcolor="#1f2a35",
+            bd=1,
+            relief="flat",
+            padx=8,
+            pady=8,
+        )
+        proj_frame.pack(fill="x", padx=14, pady=(0, 10))
+        self.project_list = tk.Listbox(
+            proj_frame,
+            height=6,
+            bg=PANEL,
+            fg=TEXT,
+            selectbackground=SIDEBAR_SEL,
+            relief="flat",
+            highlightthickness=0,
+            activestyle="none",
+        )
+        self.project_list.pack(fill="both", expand=True)
+        self.project_list.bind("<<ListboxSelect>>", lambda _e: self.select_project())
+
+        sess_frame = tk.LabelFrame(
+            sidebar,
+            text="Sessions",
+            bg=SIDEBAR,
+            fg=TEXT,
+            highlightbackground="#1f2a35",
+            highlightcolor="#1f2a35",
+            bd=1,
+            relief="flat",
+            padx=8,
+            pady=8,
+        )
+        sess_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        sess_tools = tk.Frame(sess_frame, bg=SIDEBAR)
+        sess_tools.pack(fill="x", pady=(0, 6))
+        self.session_search = tk.Entry(
+            sess_tools,
+            textvariable=self.session_filter,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+        )
+        self.session_search.pack(side="left", fill="x", expand=True)
+        self.session_search.insert(0, "")
+        self.session_search.bind("<KeyRelease>", lambda _e: self._render_session_list())
+        tk.Button(
+            sess_tools,
+            text="Clear",
+            command=lambda: (self.session_filter.set(""), self._render_session_list()),
+            bg=PANEL,
+            fg=TEXT,
+            relief="flat",
+        ).pack(side="left", padx=(6, 0))
+        tk.Button(
+            sess_tools,
+            text="Rename",
+            command=self.rename_selected_session,
+            bg=PANEL,
+            fg=TEXT,
+            relief="flat",
+        ).pack(side="left", padx=(6, 0))
+        self.session_list = tk.Listbox(
+            sess_frame,
+            bg=PANEL,
+            fg=TEXT,
+            selectbackground=SIDEBAR_SEL,
+            relief="flat",
+            highlightthickness=0,
+            activestyle="none",
+        )
+        self.session_list.pack(side="left", fill="both", expand=True)
+        self.session_list.bind("<<ListboxSelect>>", lambda _e: self.select_session())
+        sess_scroll = tk.Scrollbar(sess_frame, command=self.session_list.yview)
+        sess_scroll.pack(side="right", fill="y")
+        self.session_list.configure(yscrollcommand=sess_scroll.set)
+
+        self._refresh_project_list()
+
+    def _agent_spec(self, key):
+        return self.agent_map.get(key, {"key": key, "label": key.title(), "color": TEXT})
+
+    def _session_alias(self, session):
+        return clean_text(self.session_aliases.get(session_alias_key(session), ""))
+
+    def _display_session_title(self, session):
+        alias = self._session_alias(session)
+        if alias:
+            return alias
+        return clean_text(session.get("title") or session.get("preview") or "Untitled")
+
+    def _collect_artifact_paths(self, value, out):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"path", "filePath", "file_path", "fileName", "file_name"}:
+                    text = clean_text(child)
+                    if text:
+                        out.add(text)
+                self._collect_artifact_paths(child, out)
+        elif isinstance(value, list):
+            for child in value:
+                self._collect_artifact_paths(child, out)
+
+    def _artifact_items_for_session(self, session):
+        paths = set()
+        for turn in session.get("turns") or []:
+            for item in turn.get("items") or []:
+                if item.get("type") == "fileChange":
+                    for change in item.get("changes") or []:
+                        path = clean_text(change.get("path") or change.get("filePath") or change.get("file_path"))
+                        if path:
+                            paths.add(path)
+                self._collect_artifact_paths(item, paths)
+        items = []
+        for path in sorted(paths, key=lambda p: p.lower()):
+            label = path
+            if os.path.exists(path) and os.path.isdir(path):
+                label = f"{path} [dir]"
+            elif os.path.exists(path):
+                label = f"{path} [file]"
+            items.append({"path": path, "label": label})
+        return items
+
+    def _set_session_alias(self, session, alias):
+        key = session_alias_key(session)
+        alias = clean_text(alias)
+        if alias:
+            self.session_aliases[key] = alias
+        else:
+            self.session_aliases.pop(key, None)
+        if session.get("origin", "local") == "local":
+            session["title"] = alias or clean_text(session.get("title") or session.get("preview") or "Untitled")
+            self.store.save(session)
+        self.config["session_aliases"] = self.session_aliases
+        save_json(CONFIG_FILE, self.config)
+
+    def _refresh_project_list(self):
+        self.project_list.delete(0, "end")
+        projects = self.recent_projects or [self.cwd.get()]
+        for project in projects:
+            self.project_list.insert("end", project_label(project))
+        if self.project_list.size():
+            self.project_list.selection_clear(0, "end")
+            self.project_list.selection_set(0)
+
+    def choose_cwd(self):
+        chosen = filedialog.askdirectory(initialdir=self.cwd.get(), parent=self.win)
+        if chosen:
+            self.cwd.set(chosen)
+            self._remember_project(chosen)
+            self.refresh_sessions()
+
+    def _remember_project(self, cwd):
+        cwd = cwd.rstrip(os.sep)
+        self.recent_projects = [cwd] + [item for item in self.recent_projects if item != cwd]
+        self.recent_projects = self.recent_projects[:10]
+        self._refresh_project_list()
+
+    def select_project(self):
+        selection = self.project_list.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        if idx >= len(self.recent_projects):
+            return
+        self.cwd.set(self.recent_projects[idx])
+        self.refresh_sessions()
+
+    def on_agent_changed(self):
+        self.refresh_sessions()
+
+    def refresh_sessions(self):
+        self.status.set("Loading sessions…")
+        self._remember_project(self.cwd.get())
+        self.local_sessions = self.store.list_for(self.cwd.get(), self.active_agent.get())
+        self.external_sessions = discover_external_sessions(self.cwd.get(), self.active_agent.get())
+        self.sessions = list(self.local_sessions)
+        if not self.sessions:
+            self.current_session = self.store.new_session(self.active_agent.get(), self.cwd.get())
+            self.local_sessions = [self.current_session]
+            self.sessions = list(self.local_sessions)
+            self.external_sessions = []
+            self.transfer_source_session_id = None
+        self._render_session_list()
+        self.open_session(self.sessions[0]["id"], remember=False)
+
+    def _render_session_list(self):
+        self.session_list.delete(0, "end")
+        query = clean_text(self.session_filter.get()).lower()
+        self.visible_sessions = list(self.local_sessions)
+        self.visible_sessions.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
+        if query:
+            self.visible_sessions = [
+                session
+                for session in self.visible_sessions
+                if query in session_search_blob(session, self._session_alias(session))
+            ]
+        for session in self.visible_sessions:
+            title = self._display_session_title(session)
+            self.session_list.insert("end", title)
+        if self.visible_sessions:
+            self.session_list.selection_clear(0, "end")
+            self.session_list.selection_set(0)
+
+    def open_session_finder(self):
+        pool = list(self.local_sessions) + list(self.external_sessions)
+        if not pool:
+            messagebox.showinfo("Find session", "No sessions found for this project and agent.")
+            return
+        finder = tk.Toplevel(self.win)
+        finder.title("Find Session")
+        finder.geometry("760x520")
+        finder.configure(bg=BG)
+        finder.transient(self.win)
+        finder.grab_set()
+
+        query_var = tk.StringVar(master=finder, value="")
+        top = tk.Frame(finder, bg=BG)
+        top.pack(fill="x", padx=10, pady=10)
+        tk.Label(top, text="Search sessions", bg=BG, fg=TEXT, font=("Sans", 11, "bold")).pack(anchor="w")
+        search = tk.Entry(top, textvariable=query_var, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat")
+        search.pack(fill="x", pady=(6, 0))
+
+        body = tk.Frame(finder, bg=BG)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        listbox = tk.Listbox(
+            body,
+            bg=PANEL,
+            fg=TEXT,
+            selectbackground=SIDEBAR_SEL,
+            relief="flat",
+            highlightthickness=0,
+            activestyle="none",
+        )
+        listbox.pack(side="left", fill="both", expand=True)
+        scroll = tk.Scrollbar(body, command=listbox.yview)
+        scroll.pack(side="right", fill="y")
+        listbox.configure(yscrollcommand=scroll.set)
+
+        buttons = tk.Frame(finder, bg=BG)
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+        status = tk.Label(buttons, text="Select a session and press Open or Resume.", bg=BG, fg=MUTED, anchor="w")
+        status.pack(side="left", fill="x", expand=True)
+
+        indexed = []
+
+        def rebuild(*_args):
+            listbox.delete(0, "end")
+            indexed.clear()
+            query = clean_text(query_var.get()).lower()
+            for session in sorted(pool, key=lambda s: s.get("updated_at") or "", reverse=True):
+                alias = self._session_alias(session)
+                blob = session_search_blob(session, alias)
+                if query and query not in blob:
+                    continue
+                title = self._display_session_title(session)
+                origin = session.get("origin", "local")
+                tag = "workbench copy" if origin == "local" else "imported session"
+                label = f"{title} · {self._agent_spec(session.get('agent')).get('label', session.get('agent'))} · {tag}"
+                indexed.append(session)
+                listbox.insert("end", label)
+            if indexed:
+                listbox.selection_set(0)
+
+        def selected_session():
+            sel = listbox.curselection()
+            if not sel:
+                return None
+            idx = sel[0]
+            if idx >= len(indexed):
+                return None
+            return indexed[idx]
+
+        def do_open():
+            session = selected_session()
+            if not session:
+                return
+            finder.destroy()
+            self.open_session(session["id"], remember=True)
+
+        def do_resume():
+            session = selected_session()
+            if not session:
+                return
+            finder.destroy()
+            if session.get("origin", "local") != "local":
+                cloned = self.store.clone_for_continuation(session)
+                self.local_sessions.insert(0, cloned)
+                self.sessions = list(self.local_sessions) + list(self.external_sessions)
+                self.open_session(cloned["id"], remember=False)
+                self._render_session_list()
+            else:
+                self.open_session(session["id"], remember=True)
+            self.status.set("Session loaded.")
+
+        tk.Button(buttons, text="Open", command=do_open, bg=PANEL, fg=TEXT, relief="flat").pack(side="right", padx=(6, 0))
+        tk.Button(buttons, text="Resume", command=do_resume, bg=PANEL, fg=TEXT, relief="flat").pack(side="right")
+
+        search.bind("<KeyRelease>", rebuild)
+        listbox.bind("<Double-Button-1>", lambda _e: do_open())
+        finder.bind("<Return>", lambda _e: do_open())
+        finder.bind("<Escape>", lambda _e: finder.destroy())
+        rebuild()
+        search.focus_set()
+
+    def rename_selected_session(self):
+        selection = self.session_list.curselection()
+        if not selection:
+            messagebox.showinfo("Rename", "Select a session first.")
+            return
+        idx = selection[0]
+        if idx >= len(self.visible_sessions):
+            return
+        session = self.visible_sessions[idx]
+        current = self._display_session_title(session)
+        alias = simpledialog.askstring(
+            "Rename session",
+            "Choose a shorter label for this session:",
+            initialvalue=current,
+            parent=self.win,
+        )
+        if alias is None:
+            return
+        alias = clean_text(alias)
+        if not alias:
+            messagebox.showinfo("Rename", "Name cannot be blank.")
+            return
+        self._set_session_alias(session, alias)
+        source_updated = False
+        if session.get("origin") == "codex-terminal":
+            source_updated = rename_codex_thread_title(session.get("source_session_id"), alias)
+        if session.get("origin", "local") == "local":
+            self.session_title.set(alias)
+        self._render_session_list()
+        self.open_session(session["id"], remember=False)
+        if source_updated:
+            self.status.set(f"Renamed Codex session to '{alias}' in Codex and in Workbench.")
+        else:
+            self.status.set(f"Renamed session to '{alias}' in Workbench.")
+
+    def select_session(self):
+        selection = self.session_list.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        if idx < len(self.visible_sessions):
+            self.open_session(self.visible_sessions[idx]["id"], remember=True)
+
+    def resume_selected(self):
+        selection = self.session_list.curselection()
+        if not selection:
+            messagebox.showinfo("Resume", "Select a session on the left first.")
+            return
+        idx = selection[0]
+        if idx >= len(self.visible_sessions):
+            return
+        session = self.visible_sessions[idx]
+        if session.get("origin", "local") != "local":
+            cloned = self.store.clone_for_continuation(session)
+            self.local_sessions.insert(0, cloned)
+            self.sessions = list(self.local_sessions) + list(self.external_sessions)
+            self.current_session = cloned
+            self.open_session(cloned["id"], remember=False)
+            self._render_session_list()
+            self.status.set(
+                f"Created continuation for {self._agent_spec(session.get('agent')).get('label', session.get('agent'))}. Send a prompt to continue."
+            )
+            return
+        self.open_session(session["id"], remember=True)
+        self.status.set(
+            f"Loaded {self._agent_spec(session.get('agent')).get('label', session.get('agent'))} session. Send a new prompt to continue."
+        )
+
+    def _restore_last_session(self):
+        last_id = self.config.get("last_session_id")
+        if last_id and self.store.get(last_id):
+            self.open_session(last_id, remember=False)
+
+    def open_session(self, session_id, remember=True):
+        session = self.store.get(session_id)
+        if not session:
+            for candidate in self.external_sessions:
+                if candidate.get("id") == session_id:
+                    session = candidate
+                    break
+        if not session:
+            return
+        if self.busy:
+            messagebox.showinfo("Busy", "Wait for the current turn to finish before switching sessions.")
+            return
+        if remember and self.current_session and self.current_session.get("id") != session_id:
+            self.transfer_source_session_id = self.current_session.get("id")
+        self.current_session = deepcopy(session)
+        self.current_turn = None
+        self.session_backend_id = session.get("backend", {}).get("thread_id") or session.get("backend", {}).get("session_id")
+        origin = session.get("origin", "local")
+        title = self._display_session_title(session)
+        if origin != "local" and not self._session_alias(session):
+            title = f"{title} (imported)"
+        self.session_title.set(title)
+        self.session_label.set(
+            f"{self._agent_spec(session.get('agent')).get('label', session.get('agent'))} · {project_label(session.get('cwd'))}"
+        )
+        self._clear_views()
+        self._render_session(session)
+        self.refresh_artifacts_view(session)
+        self.scroll_chat_to_latest()
+        if origin == "local":
+            self.status.set("Ready. Send a prompt to continue this session.")
+        else:
+            self.status.set("Imported session. Click Resume Selected or send a prompt to create a continuation.")
+        self._persist_current()
+
+    def _clear_views(self):
+        for widget in (self.chat, self.work):
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.configure(state="disabled")
+
+    def _render_session(self, session):
+        for turn in session.get("turns") or []:
+            self._render_turn(turn, session.get("agent", "agent"))
+
+    def _render_turn(self, turn, agent_key):
+        for item in turn.get("items") or []:
+            self._render_item(item, agent_key)
+
+    def _render_item(self, item, agent_key):
+        typ = item.get("type", "")
+        if typ == "userMessage":
+            text = self._extract_user_text(item)
+            if text:
+                self.append_chat("YOU", text, "user")
+        elif typ == "agentMessage":
+            text = self._extract_agent_text(item)
+            if text:
+                self.append_chat(self._agent_spec(agent_key)["label"].upper(), text, "assistant")
+        elif typ == "commandExecution":
+            command = clean_text(item.get("command"))
+            if command:
+                self.append_work(f"$ {command}", "command")
+            output = clean_text(item.get("aggregatedOutput"))
+            if output:
+                self.append_work(output, "system")
+        elif typ == "fileChange":
+            paths = []
+            for change in item.get("changes") or []:
+                path = change.get("path") or change.get("filePath")
+                if path:
+                    paths.append(str(path))
+            if paths:
+                self.append_work("files: " + ", ".join(paths), "fileChange")
+        elif typ == "reasoning":
+            summary = " ".join(item.get("summary") or [])
+            if summary:
+                self.append_work(summary, "reasoning")
+        elif typ == "plan":
+            text = clean_text(item.get("text"))
+            if text:
+                self.append_work(text, "plan")
+        elif typ == "mcpToolCall":
+            self.append_work(
+                f"{clean_text(item.get('server'))}.{clean_text(item.get('tool'))}",
+                "tool",
+            )
+        elif typ == "system":
+            text = clean_text(item.get("text") or item.get("message"))
+            if text:
+                self.append_work(text, "system")
+        elif typ == "note":
+            text = clean_text(item.get("text"))
+            if text:
+                self.append_work(text, "system")
+
+    def _extract_user_text(self, item):
+        content = item.get("content") or []
+        parts = []
+        for bit in content:
+            if isinstance(bit, dict) and bit.get("type") == "text":
+                parts.append(bit.get("text", ""))
+        return clean_text(" ".join(parts))
+
+    def _extract_agent_text(self, item):
+        text = item.get("text") or item.get("content") or ""
+        if isinstance(text, list):
+            parts = []
+            for bit in text:
+                if isinstance(bit, dict) and bit.get("type") == "text":
+                    parts.append(bit.get("text", ""))
+            return clean_text(" ".join(parts))
+        return clean_text(text)
+
+    def append_chat(self, speaker, text, tag="assistant"):
+        if not text:
+            return
+        widget = self.chat
+        at_bottom = widget.yview()[1] >= 0.995
+        widget.configure(state="normal")
+        head_tag = "assistant_head"
+        if speaker == "YOU":
+            head_tag = "user_head"
+        elif speaker == "CLAUDE":
+            head_tag = "claude_head"
+        elif speaker == "GEMINI":
+            head_tag = "gemini_head"
+        widget.insert("end", speaker + "\n", head_tag)
+        widget.insert("end", text.rstrip() + "\n\n", tag)
+        widget.configure(state="disabled")
+        if at_bottom:
+            widget.see("end")
+
+    def append_work(self, text, tag="system"):
+        if not text:
+            return
+        widget = self.work
+        at_bottom = widget.yview()[1] >= 0.995
+        widget.configure(state="normal")
+        widget.insert("end", text.rstrip() + "\n", tag)
+        widget.configure(state="disabled")
+        if at_bottom:
+            widget.see("end")
+
+    def clear_work(self):
+        self.work.configure(state="normal")
+        self.work.delete("1.0", "end")
+        self.work.configure(state="disabled")
+
+    def new_session(self):
+        if self.busy:
+            messagebox.showinfo("Busy", "Wait for the current turn to finish before starting a new session.")
+            return
+        session = self.store.new_session(self.active_agent.get(), self.cwd.get())
+        self.local_sessions = [session]
+        self.sessions = [session] + list(self.external_sessions)
+        self.transfer_source_session_id = self.current_session.get("id") if self.current_session else None
+        self._render_session_list()
+        self.open_session(session["id"], remember=False)
+
+    def _persist_current(self):
+        if not self.current_session:
+            return
+        self.store.save(self.current_session)
+
+    def _current_backend(self):
+        return self.backends[self.active_agent.get()]
+
+    def _current_agent_label(self):
+        return self._agent_spec(self.active_agent.get())["label"]
+
+    def _make_turn(self, prompt):
+        turn = self.store.ensure_turn(self.current_session, prompt=prompt)
+        self.current_turn = turn
+        if not self.current_session.get("title") or self.current_session.get("title", "").startswith("New "):
+            self.store.set_title_from_prompt(self.current_session, prompt)
+        return turn
+
+    def send(self):
+        if self.busy:
+            return
+        prompt = clean_text(self.input.get("1.0", "end"))
+        if not prompt:
+            return
+        if prompt.startswith("/resume"):
+            self.input.delete("1.0", "end")
+            self.open_session_finder()
+            return
+        if prompt.startswith("/sessions"):
+            self.input.delete("1.0", "end")
+            self.open_session_finder()
+            return
+        if not os.path.isdir(self.cwd.get()):
+            messagebox.showerror("Invalid directory", "Choose an existing working directory.")
+            return
+        if not self.current_session:
+            self.current_session = self.store.new_session(self.active_agent.get(), self.cwd.get())
+        if self.current_session.get("origin", "local") != "local":
+            self.transfer_source_session_id = self.current_session.get("source_session_id") or self.current_session.get("id")
+            self.current_session = self.store.clone_for_continuation(self.current_session)
+            self.local_sessions.insert(0, self.current_session)
+            self.sessions = list(self.local_sessions) + list(self.external_sessions)
+            self._render_session_list()
+        self._remember_project(self.cwd.get())
+        self.input.delete("1.0", "end")
+        self.busy = True
+        self.send_btn.configure(state="disabled")
+
+        if self.transfer_source_session_id and self.transfer_source_session_id != self.current_session.get("id"):
+            source = self.store.get(self.transfer_source_session_id)
+            if source and not self.current_session.get("turns"):
+                context_text = self.store.summary_for_handoff(source)
+            else:
+                context_text = ""
+        else:
+            context_text = ""
+
+        turn = self._make_turn(prompt)
+        user_item = {"type": "userMessage", "content": [{"type": "text", "text": prompt}]}
+        self.store.add_item(self.current_session, turn, user_item)
+        self.append_chat("YOU", prompt, "user")
+        self.append_work("--- New turn ---", "system")
+        self.status.set(f"{self._current_agent_label()} is working…")
+        self._persist_current()
+
+        backend = self._current_backend()
+        backend.start_turn(self.current_session, turn, prompt, context_text=context_text)
+        self.transfer_source_session_id = None
+
+    def stop(self):
+        self._current_backend().interrupt()
+        self.status.set("Stopping current turn…")
+
+    def _append_assistant_chunk(self, text, speaker):
+        if not text:
+            return
+        if not self.live_speaker:
+            self.live_speaker = speaker
+            widget = self.chat
+            at_bottom = widget.yview()[1] >= 0.995
+            widget.configure(state="normal")
+            head_tag = "assistant_head"
+            if speaker == "CLAUDE":
+                head_tag = "claude_head"
+            elif speaker == "GEMINI":
+                head_tag = "gemini_head"
+            widget.insert("end", speaker + "\n", head_tag)
+            widget.insert("end", text, "assistant")
+            widget.configure(state="disabled")
+            if at_bottom:
+                widget.see("end")
+            if self.current_turn is not None:
+                self.store.add_item(self.current_session, self.current_turn, {"type": "agentMessage", "text": text})
+            return
+        widget = self.chat
+        widget.configure(state="normal")
+        widget.insert("end", text)
+        widget.configure(state="disabled")
+        widget.see("end")
+        if self.current_turn is not None:
+            items = self.current_turn.setdefault("items", [])
+            if items and items[-1].get("type") == "agentMessage":
+                items[-1]["text"] = clean_text(items[-1].get("text", "") + text)
+                self.store.save(self.current_session)
+
+    def handle_event(self, event):
+        kind = event.get("kind")
+        if kind == "status":
+            self.status.set(event.get("text", "Ready"))
+        elif kind == "work":
+            self.append_work(event.get("text", ""), event.get("tag", "system"))
+            if self.current_turn is not None:
+                self.store.add_item(
+                    self.current_session,
+                    self.current_turn,
+                    {"type": "system", "text": event.get("text", ""), "tag": event.get("tag", "system")},
+                )
+        elif kind == "assistant_begin":
+            self.live_speaker = event.get("speaker") or self._current_agent_label().upper()
+        elif kind == "assistant_delta":
+            speaker = event.get("speaker") or self._current_agent_label().upper()
+            self._append_assistant_chunk(event.get("text", ""), speaker)
+        elif kind == "assistant":
+            speaker = event.get("speaker") or self._current_agent_label().upper()
+            text = event.get("text", "")
+            self._append_assistant_chunk(text, speaker)
+        elif kind == "assistant_done":
+            if self.live_speaker:
+                widget = self.chat
+                widget.configure(state="normal")
+                widget.insert("end", "\n\n")
+                widget.configure(state="disabled")
+                widget.see("end")
+            self.live_speaker = None
+            self._persist_current()
+        elif kind == "turn_done":
+            status = event.get("status", "completed")
+            if self.current_turn is not None:
+                self.store.finish_turn(self.current_session, self.current_turn, status=status)
+            self.busy = False
+            self.send_btn.configure(state="normal")
+            self.status.set("Ready" if status == "completed" else f"Turn {status}")
+            self._persist_current()
+            self.refresh_artifacts_view(self.current_session)
+            self.scroll_chat_to_latest()
+            self._render_session_list()
+        elif kind == "error":
+            text = event.get("text", "Error")
+            self.status.set("Error: " + text)
+            self.append_work("ERROR: " + text, "system")
+            if self.current_turn is not None:
+                self.store.add_item(self.current_session, self.current_turn, {"type": "note", "text": "ERROR: " + text})
+                self.store.finish_turn(self.current_session, self.current_turn, status="error")
+            self.busy = False
+            self.send_btn.configure(state="normal")
+            self._persist_current()
+            self.refresh_artifacts_view(self.current_session)
+            self._render_session_list()
+        elif kind == "backend_exit":
+            self.status.set(event.get("text", "Backend stopped"))
+
+    def drain_events(self):
+        try:
+            while True:
+                event = self.events.get_nowait()
+                self.handle_event(event)
+        except queue.Empty:
+            pass
+        self.win.after(50, self.drain_events)
+
+    def close(self):
+        self.config.update(
+            {
+                "cwd": self.cwd.get(),
+                "geometry": self.win.geometry(),
+                "recent_projects": self.recent_projects,
+                "active_agent": self.active_agent.get(),
+                "last_session_id": self.current_session.get("id") if self.current_session else None,
+                "session_aliases": self.session_aliases,
+            }
+        )
+        save_json(CONFIG_FILE, self.config)
+        self._persist_current()
+        for backend in self.backends.values():
+            try:
+                backend.close()
+            except Exception:
+                pass
+        self.win.destroy()
+
+if __name__ == "__main__":
+    app = App()
+    app.win.mainloop()
