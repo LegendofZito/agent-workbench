@@ -41,6 +41,7 @@ CLAUDE = "#ffb86b"
 GEMINI = "#8ab4ff"
 WORK = "#f59e0b"
 USER = "#79c0ff"
+ACCENT = "#2f81f7"
 
 
 def now_iso():
@@ -658,7 +659,6 @@ class CodexBackend(BaseBackend):
 
     def _on_initialized(self, _result):
         self.ready.set()
-        self.emit("status", text="Codex app server ready")
 
     def request(self, method, params, callback=None):
         with self.lock:
@@ -1111,7 +1111,7 @@ class App:
         self.win.title(APP_NAME)
         set_window_icon(self.win)
         self.win.geometry(self.config.get("geometry", "1380x920+80+80"))
-        self.win.configure(bg=CODEX)
+        self.win.configure(bg=ACCENT)
         self.win.minsize(1140, 720)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -1188,36 +1188,33 @@ class App:
         )
 
     def _build_ui(self):
-        outer = tk.Frame(self.win, bg=CODEX)
-        outer.pack(fill="both", expand=True, padx=6, pady=6)
+        outer = tk.Frame(self.win, bg=ACCENT)
+        outer.pack(fill="both", expand=True, padx=3, pady=3)
 
         self._build_sidebar(outer)
 
-        right = tk.Frame(outer, bg=CODEX)
-        right.pack(side="right", fill="both", expand=True, padx=(6, 0))
+        right = tk.Frame(outer, bg=ACCENT)
+        right.pack(side="right", fill="both", expand=True, padx=(3, 0))
 
         topbar = tk.Frame(right, bg=BG)
-        topbar.pack(fill="x", pady=(0, 6))
+        topbar.pack(fill="x", pady=(0, 3))
         tk.Label(
             topbar,
             textvariable=self.session_title,
             bg=BG,
             fg=TEXT,
             anchor="w",
-            font=("Sans", 11, "bold"),
-        ).pack(side="left", fill="x", expand=True, padx=10, pady=8)
+            font=("Sans", 12, "bold"),
+        ).pack(side="left", fill="x", expand=True, padx=12, pady=10)
         tk.Label(
             topbar,
             textvariable=self.session_label,
             bg=BG,
             fg=MUTED,
             anchor="e",
-        ).pack(side="left", padx=(0, 10))
-        tk.Label(topbar, textvariable=self.status, bg=BG, fg=MUTED, anchor="e").pack(
-            side="right", padx=10
-        )
+        ).pack(side="right", padx=12)
 
-        content = tk.Frame(right, bg=CODEX)
+        content = tk.Frame(right, bg=ACCENT)
         content.pack(fill="both", expand=True)
         content.grid_rowconfigure(1, weight=1)
         content.grid_columnconfigure(0, weight=1)
@@ -1230,23 +1227,6 @@ class App:
         self.notebook.add(self.chat_tab, text="Conversation")
         self.notebook.add(self.work_tab, text="Work Log")
         self.notebook.add(self.artifacts_tab, text="Artifacts")
-
-        chat_header = tk.Frame(self.chat_tab, bg=BG)
-        chat_header.pack(fill="x", padx=8, pady=(8, 0))
-        tk.Label(chat_header, text="Conversation", bg=BG, fg=TEXT, font=("Sans", 11, "bold")).pack(
-            side="left"
-        )
-        tk.Button(chat_header, text="Top", command=self.scroll_chat_to_top, bg=PANEL, fg=TEXT, relief="flat").pack(
-            side="right", padx=(6, 0)
-        )
-        tk.Button(
-            chat_header,
-            text="Latest",
-            command=self.scroll_chat_to_latest,
-            bg=PANEL,
-            fg=TEXT,
-            relief="flat",
-        ).pack(side="right")
 
         self.chat = ScrolledText(
             self.chat_tab,
@@ -1271,14 +1251,6 @@ class App:
         self.chat.tag_config("assistant", foreground=TEXT)
         self.chat.configure(state="disabled")
 
-        work_header = tk.Frame(self.work_tab, bg=BG)
-        work_header.pack(fill="x", padx=8, pady=(8, 0))
-        tk.Label(work_header, text="Work Log", bg=BG, fg=WORK, font=("Sans", 11, "bold")).pack(
-            side="left"
-        )
-        tk.Button(work_header, text="Clear", command=self.clear_work, bg=PANEL, fg=TEXT, relief="flat").pack(
-            side="right"
-        )
         self.work = ScrolledText(
             self.work_tab,
             wrap="word",
@@ -1306,26 +1278,17 @@ class App:
 
         artifacts_header = tk.Frame(self.artifacts_tab, bg=BG)
         artifacts_header.pack(fill="x", padx=8, pady=(8, 0))
-        tk.Label(artifacts_header, text="Artifacts", bg=BG, fg=TEXT, font=("Sans", 11, "bold")).pack(side="left")
         tk.Button(
             artifacts_header,
-            text="Open",
+            text="Open selected",
             command=self.open_selected_artifact,
-            bg=PANEL,
-            fg=TEXT,
-            relief="flat",
-        ).pack(side="right", padx=(6, 0))
-        tk.Button(
-            artifacts_header,
-            text="Refresh",
-            command=self.refresh_artifacts_view,
-            bg=PANEL,
-            fg=TEXT,
+            bg=ACCENT,
+            fg="white",
             relief="flat",
         ).pack(side="right")
         self.artifact_hint = tk.Label(
             artifacts_header,
-            text="files and images mentioned in the session",
+            text="Files mentioned or changed in this session",
             bg=BG,
             fg=MUTED,
             anchor="w",
@@ -1352,13 +1315,10 @@ class App:
 
         composer = tk.Frame(content, bg=BG)
         composer.grid(row=2, column=0, sticky="ew", pady=(6, 0))
-        tk.Label(composer, text="Prompt", bg=BG, fg=TEXT, anchor="w", font=("Sans", 10, "bold")).pack(
-            anchor="w", padx=8, pady=(0, 4)
-        )
         self.input = ScrolledText(
             composer,
             wrap="word",
-            height=4,
+            height=3,
             bg=PANEL,
             fg=TEXT,
             insertbackground=TEXT,
@@ -1375,17 +1335,12 @@ class App:
         self.input.bind("<Command-Return>", lambda _e: (self.send(), "break")[1])
 
         bar = tk.Frame(composer, bg=BG)
-        bar.pack(fill="x", padx=8, pady=(6, 0))
-        self.hint = tk.Label(bar, text="Enter to send. Shift+Enter makes a newline.", bg=BG, fg=MUTED, anchor="w")
+        bar.pack(fill="x", padx=8, pady=(6, 8))
+        self.hint = tk.Label(bar, textvariable=self.status, bg=BG, fg=MUTED, anchor="w")
         self.hint.pack(side="left", fill="x", expand=True)
         self.stop_btn = tk.Button(bar, text="Stop", command=self.stop, bg="#9f2d2d", fg="white", relief="flat")
-        self.stop_btn.pack(side="right", padx=(6, 0))
-        self.send_btn = tk.Button(bar, text="Send", command=self.send, bg=CODEX, fg="white", relief="flat")
+        self.send_btn = tk.Button(bar, text="Send", command=self.send, bg=ACCENT, fg="white", relief="flat")
         self.send_btn.pack(side="right")
-
-    def scroll_chat_to_top(self):
-        self.chat.see("1.0")
-        self.chat.yview_moveto(0.0)
 
     def scroll_chat_to_latest(self):
         self.chat.see("end")
@@ -1421,27 +1376,21 @@ class App:
         sidebar = tk.Frame(
             parent,
             bg=SIDEBAR,
-            width=320,
-            highlightbackground="#cc2f2f",
-            highlightcolor="#cc2f2f",
-            highlightthickness=2,
+            width=286,
+            highlightbackground=ACCENT,
+            highlightcolor=ACCENT,
+            highlightthickness=1,
         )
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
 
         head = tk.Frame(sidebar, bg=SIDEBAR)
-        head.pack(fill="x", padx=14, pady=(14, 10))
-        tk.Label(head, text="CODEX", bg=SIDEBAR, fg=CODEX, font=("Sans", 14, "bold")).pack(anchor="w")
-        tk.Label(head, text="projects, agents, and sessions", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
+        head.pack(fill="x", padx=14, pady=(14, 12))
+        tk.Label(head, text="AGENT WORKBENCH", bg=SIDEBAR, fg=TEXT, font=("Sans", 13, "bold")).pack(anchor="w")
+        tk.Label(head, text="Choose an agent, project, and session", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
 
-        agent_box = tk.Frame(
-            sidebar,
-            bg=SIDEBAR,
-            highlightbackground="#cc2f2f",
-            highlightcolor="#cc2f2f",
-            highlightthickness=2,
-        )
-        agent_box.pack(fill="x", padx=14, pady=(0, 10))
+        agent_box = tk.Frame(sidebar, bg=SIDEBAR)
+        agent_box.pack(fill="x", padx=14, pady=(0, 12))
         tk.Label(agent_box, text="Agent", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
         self.agent_picker = ttk.Combobox(
             agent_box,
@@ -1454,56 +1403,31 @@ class App:
         self.agent_picker.bind("<<ComboboxSelected>>", lambda _e: self.on_agent_changed())
 
         cwd_box = tk.Frame(sidebar, bg=SIDEBAR)
-        cwd_box.pack(fill="x", padx=14, pady=(0, 10))
-        tk.Label(cwd_box, text="Working in", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
+        cwd_box.pack(fill="x", padx=14, pady=(0, 12))
+        tk.Label(cwd_box, text="Project", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
         cwd_row = tk.Frame(cwd_box, bg=SIDEBAR)
         cwd_row.pack(fill="x", pady=(4, 0))
-        self.cwd_entry = tk.Entry(cwd_row, textvariable=self.cwd, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat")
+        self.cwd_entry = ttk.Combobox(
+            cwd_row,
+            textvariable=self.cwd,
+            values=self.recent_projects,
+            style="Agent.TCombobox",
+        )
         self.cwd_entry.pack(side="left", fill="x", expand=True)
-        tk.Button(cwd_row, text="Choose", command=self.choose_cwd, bg=PANEL, fg=TEXT, relief="flat").pack(
+        self.cwd_entry.bind("<<ComboboxSelected>>", lambda _e: self.refresh_sessions())
+        self.cwd_entry.bind("<Return>", lambda _e: self.refresh_sessions())
+        tk.Button(cwd_row, text="Browse", command=self.choose_cwd, bg=PANEL, fg=TEXT, relief="flat").pack(
             side="left", padx=(6, 0)
         )
 
         actions = tk.Frame(sidebar, bg=SIDEBAR)
-        actions.pack(fill="x", padx=14, pady=(0, 10))
-        tk.Button(actions, text="New Session", command=self.new_session, bg=CODEX, fg="white", relief="flat").pack(
-            fill="x"
+        actions.pack(fill="x", padx=14, pady=(0, 12))
+        tk.Button(actions, text="New session", command=self.new_session, bg=ACCENT, fg="white", relief="flat").pack(
+            side="left", fill="x", expand=True
         )
-        tk.Button(actions, text="Find Session", command=self.open_session_finder, bg=PANEL, fg=TEXT, relief="flat").pack(
-            fill="x", pady=(6, 0)
+        tk.Button(actions, text="Refresh", command=self.refresh_sessions, bg=PANEL, fg=TEXT, relief="flat").pack(
+            side="left", padx=(6, 0)
         )
-        tk.Button(actions, text="Resume Selected", command=self.resume_selected, bg=PANEL, fg=TEXT, relief="flat").pack(
-            fill="x", pady=(6, 0)
-        )
-        tk.Button(actions, text="Refresh Sessions", command=self.refresh_sessions, bg=PANEL, fg=TEXT, relief="flat").pack(
-            fill="x", pady=(6, 0)
-        )
-
-        proj_frame = tk.LabelFrame(
-            sidebar,
-            text="Recent Projects",
-            bg=SIDEBAR,
-            fg=TEXT,
-            highlightbackground="#1f2a35",
-            highlightcolor="#1f2a35",
-            bd=1,
-            relief="flat",
-            padx=8,
-            pady=8,
-        )
-        proj_frame.pack(fill="x", padx=14, pady=(0, 10))
-        self.project_list = tk.Listbox(
-            proj_frame,
-            height=6,
-            bg=PANEL,
-            fg=TEXT,
-            selectbackground=SIDEBAR_SEL,
-            relief="flat",
-            highlightthickness=0,
-            activestyle="none",
-        )
-        self.project_list.pack(fill="both", expand=True)
-        self.project_list.bind("<<ListboxSelect>>", lambda _e: self.select_project())
 
         sess_frame = tk.LabelFrame(
             sidebar,
@@ -1519,6 +1443,7 @@ class App:
         )
         sess_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
         sess_tools = tk.Frame(sess_frame, bg=SIDEBAR)
+        tk.Label(sess_frame, text="Search", bg=SIDEBAR, fg=MUTED, anchor="w").pack(fill="x")
         sess_tools.pack(fill="x", pady=(0, 6))
         self.session_search = tk.Entry(
             sess_tools,
@@ -1529,16 +1454,7 @@ class App:
             relief="flat",
         )
         self.session_search.pack(side="left", fill="x", expand=True)
-        self.session_search.insert(0, "")
         self.session_search.bind("<KeyRelease>", lambda _e: self._render_session_list())
-        tk.Button(
-            sess_tools,
-            text="Clear",
-            command=lambda: (self.session_filter.set(""), self._render_session_list()),
-            bg=PANEL,
-            fg=TEXT,
-            relief="flat",
-        ).pack(side="left", padx=(6, 0))
         tk.Button(
             sess_tools,
             text="Rename",
@@ -1558,6 +1474,7 @@ class App:
         )
         self.session_list.pack(side="left", fill="both", expand=True)
         self.session_list.bind("<<ListboxSelect>>", lambda _e: self.select_session())
+        self.session_list.bind("<Double-Button-1>", lambda _e: self.input.focus_set())
         sess_scroll = tk.Scrollbar(sess_frame, command=self.session_list.yview)
         sess_scroll.pack(side="right", fill="y")
         self.session_list.configure(yscrollcommand=sess_scroll.set)
@@ -1622,13 +1539,8 @@ class App:
         save_json(CONFIG_FILE, self.config)
 
     def _refresh_project_list(self):
-        self.project_list.delete(0, "end")
-        projects = self.recent_projects or [self.cwd.get()]
-        for project in projects:
-            self.project_list.insert("end", project_label(project))
-        if self.project_list.size():
-            self.project_list.selection_clear(0, "end")
-            self.project_list.selection_set(0)
+        if hasattr(self, "cwd_entry"):
+            self.cwd_entry.configure(values=self.recent_projects)
 
     def choose_cwd(self):
         chosen = filedialog.askdirectory(initialdir=self.cwd.get(), parent=self.win)
@@ -1643,16 +1555,6 @@ class App:
         self.recent_projects = self.recent_projects[:10]
         self._refresh_project_list()
 
-    def select_project(self):
-        selection = self.project_list.curselection()
-        if not selection:
-            return
-        idx = selection[0]
-        if idx >= len(self.recent_projects):
-            return
-        self.cwd.set(self.recent_projects[idx])
-        self.refresh_sessions()
-
     def on_agent_changed(self):
         self.refresh_sessions()
 
@@ -1661,7 +1563,7 @@ class App:
         self._remember_project(self.cwd.get())
         self.local_sessions = self.store.list_for(self.cwd.get(), self.active_agent.get())
         self.external_sessions = discover_external_sessions(self.cwd.get(), self.active_agent.get())
-        self.sessions = list(self.local_sessions)
+        self.sessions = list(self.local_sessions) + list(self.external_sessions)
         if not self.sessions:
             self.current_session = self.store.new_session(self.active_agent.get(), self.cwd.get())
             self.local_sessions = [self.current_session]
@@ -1672,9 +1574,10 @@ class App:
         self.open_session(self.sessions[0]["id"], remember=False)
 
     def _render_session_list(self):
+        selected_id = self.current_session.get("id") if self.current_session else None
         self.session_list.delete(0, "end")
         query = clean_text(self.session_filter.get()).lower()
-        self.visible_sessions = list(self.local_sessions)
+        self.visible_sessions = list(self.sessions)
         self.visible_sessions.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
         if query:
             self.visible_sessions = [
@@ -1684,111 +1587,26 @@ class App:
             ]
         for session in self.visible_sessions:
             title = self._display_session_title(session)
+            if session.get("origin", "local") != "local":
+                title = "[Imported] " + title
             self.session_list.insert("end", title)
         if self.visible_sessions:
             self.session_list.selection_clear(0, "end")
-            self.session_list.selection_set(0)
+            selected_idx = next(
+                (
+                    idx
+                    for idx, session in enumerate(self.visible_sessions)
+                    if session.get("id") == selected_id
+                ),
+                0,
+            )
+            self.session_list.selection_set(selected_idx)
+            self.session_list.see(selected_idx)
 
     def open_session_finder(self):
-        pool = list(self.local_sessions) + list(self.external_sessions)
-        if not pool:
-            messagebox.showinfo("Find session", "No sessions found for this project and agent.")
-            return
-        finder = tk.Toplevel(self.win)
-        finder.title("Find Session")
-        finder.geometry("760x520")
-        finder.configure(bg=BG)
-        finder.transient(self.win)
-        finder.grab_set()
-
-        query_var = tk.StringVar(master=finder, value="")
-        top = tk.Frame(finder, bg=BG)
-        top.pack(fill="x", padx=10, pady=10)
-        tk.Label(top, text="Search sessions", bg=BG, fg=TEXT, font=("Sans", 11, "bold")).pack(anchor="w")
-        search = tk.Entry(top, textvariable=query_var, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat")
-        search.pack(fill="x", pady=(6, 0))
-
-        body = tk.Frame(finder, bg=BG)
-        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        listbox = tk.Listbox(
-            body,
-            bg=PANEL,
-            fg=TEXT,
-            selectbackground=SIDEBAR_SEL,
-            relief="flat",
-            highlightthickness=0,
-            activestyle="none",
-        )
-        listbox.pack(side="left", fill="both", expand=True)
-        scroll = tk.Scrollbar(body, command=listbox.yview)
-        scroll.pack(side="right", fill="y")
-        listbox.configure(yscrollcommand=scroll.set)
-
-        buttons = tk.Frame(finder, bg=BG)
-        buttons.pack(fill="x", padx=10, pady=(0, 10))
-        status = tk.Label(buttons, text="Select a session and press Open or Resume.", bg=BG, fg=MUTED, anchor="w")
-        status.pack(side="left", fill="x", expand=True)
-
-        indexed = []
-
-        def rebuild(*_args):
-            listbox.delete(0, "end")
-            indexed.clear()
-            query = clean_text(query_var.get()).lower()
-            for session in sorted(pool, key=lambda s: s.get("updated_at") or "", reverse=True):
-                alias = self._session_alias(session)
-                blob = session_search_blob(session, alias)
-                if query and query not in blob:
-                    continue
-                title = self._display_session_title(session)
-                origin = session.get("origin", "local")
-                tag = "workbench copy" if origin == "local" else "imported session"
-                label = f"{title} · {self._agent_spec(session.get('agent')).get('label', session.get('agent'))} · {tag}"
-                indexed.append(session)
-                listbox.insert("end", label)
-            if indexed:
-                listbox.selection_set(0)
-
-        def selected_session():
-            sel = listbox.curselection()
-            if not sel:
-                return None
-            idx = sel[0]
-            if idx >= len(indexed):
-                return None
-            return indexed[idx]
-
-        def do_open():
-            session = selected_session()
-            if not session:
-                return
-            finder.destroy()
-            self.open_session(session["id"], remember=True)
-
-        def do_resume():
-            session = selected_session()
-            if not session:
-                return
-            finder.destroy()
-            if session.get("origin", "local") != "local":
-                cloned = self.store.clone_for_continuation(session)
-                self.local_sessions.insert(0, cloned)
-                self.sessions = list(self.local_sessions) + list(self.external_sessions)
-                self.open_session(cloned["id"], remember=False)
-                self._render_session_list()
-            else:
-                self.open_session(session["id"], remember=True)
-            self.status.set("Session loaded.")
-
-        tk.Button(buttons, text="Open", command=do_open, bg=PANEL, fg=TEXT, relief="flat").pack(side="right", padx=(6, 0))
-        tk.Button(buttons, text="Resume", command=do_resume, bg=PANEL, fg=TEXT, relief="flat").pack(side="right")
-
-        search.bind("<KeyRelease>", rebuild)
-        listbox.bind("<Double-Button-1>", lambda _e: do_open())
-        finder.bind("<Return>", lambda _e: do_open())
-        finder.bind("<Escape>", lambda _e: finder.destroy())
-        rebuild()
-        search.focus_set()
+        self.session_search.focus_set()
+        self.session_search.select_range(0, "end")
+        self.status.set("Search all local and imported sessions in the sidebar.")
 
     def rename_selected_session(self):
         selection = self.session_list.curselection()
@@ -1833,31 +1651,6 @@ class App:
         if idx < len(self.visible_sessions):
             self.open_session(self.visible_sessions[idx]["id"], remember=True)
 
-    def resume_selected(self):
-        selection = self.session_list.curselection()
-        if not selection:
-            messagebox.showinfo("Resume", "Select a session on the left first.")
-            return
-        idx = selection[0]
-        if idx >= len(self.visible_sessions):
-            return
-        session = self.visible_sessions[idx]
-        if session.get("origin", "local") != "local":
-            cloned = self.store.clone_for_continuation(session)
-            self.local_sessions.insert(0, cloned)
-            self.sessions = list(self.local_sessions) + list(self.external_sessions)
-            self.current_session = cloned
-            self.open_session(cloned["id"], remember=False)
-            self._render_session_list()
-            self.status.set(
-                f"Created continuation for {self._agent_spec(session.get('agent')).get('label', session.get('agent'))}. Send a prompt to continue."
-            )
-            return
-        self.open_session(session["id"], remember=True)
-        self.status.set(
-            f"Loaded {self._agent_spec(session.get('agent')).get('label', session.get('agent'))} session. Send a new prompt to continue."
-        )
-
     def _restore_last_session(self):
         last_id = self.config.get("last_session_id")
         if last_id and self.store.get(last_id):
@@ -1895,7 +1688,7 @@ class App:
         if origin == "local":
             self.status.set("Ready. Send a prompt to continue this session.")
         else:
-            self.status.set("Imported session. Click Resume Selected or send a prompt to create a continuation.")
+            self.status.set("Imported session. Send a prompt to create a continuation.")
         self._persist_current()
 
     def _clear_views(self):
@@ -2007,18 +1800,13 @@ class App:
         if at_bottom:
             widget.see("end")
 
-    def clear_work(self):
-        self.work.configure(state="normal")
-        self.work.delete("1.0", "end")
-        self.work.configure(state="disabled")
-
     def new_session(self):
         if self.busy:
             messagebox.showinfo("Busy", "Wait for the current turn to finish before starting a new session.")
             return
         session = self.store.new_session(self.active_agent.get(), self.cwd.get())
-        self.local_sessions = [session]
-        self.sessions = [session] + list(self.external_sessions)
+        self.local_sessions.insert(0, session)
+        self.sessions = list(self.local_sessions) + list(self.external_sessions)
         self.transfer_source_session_id = self.current_session.get("id") if self.current_session else None
         self._render_session_list()
         self.open_session(session["id"], remember=False)
@@ -2070,6 +1858,8 @@ class App:
         self.input.delete("1.0", "end")
         self.busy = True
         self.send_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.stop_btn.pack(side="right", padx=(0, 6))
 
         if self.transfer_source_session_id and self.transfer_source_session_id != self.current_session.get("id"):
             source = self.store.get(self.transfer_source_session_id)
@@ -2094,6 +1884,7 @@ class App:
 
     def stop(self):
         self._current_backend().interrupt()
+        self.stop_btn.configure(state="disabled")
         self.status.set("Stopping current turn…")
 
     def _append_assistant_chunk(self, text, speaker):
@@ -2164,6 +1955,7 @@ class App:
                 self.store.finish_turn(self.current_session, self.current_turn, status=status)
             self.busy = False
             self.send_btn.configure(state="normal")
+            self.stop_btn.pack_forget()
             self.status.set("Ready" if status == "completed" else f"Turn {status}")
             self._persist_current()
             self.refresh_artifacts_view(self.current_session)
@@ -2178,6 +1970,7 @@ class App:
                 self.store.finish_turn(self.current_session, self.current_turn, status="error")
             self.busy = False
             self.send_btn.configure(state="normal")
+            self.stop_btn.pack_forget()
             self._persist_current()
             self.refresh_artifacts_view(self.current_session)
             self._render_session_list()
