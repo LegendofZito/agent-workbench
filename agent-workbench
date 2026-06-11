@@ -1626,6 +1626,7 @@ class App:
         self.live_source_signature = None
         self.loading_external_sessions = set()
         self.render_generation = 0
+        self.agent_settings_visible = False
 
         self.win = tk.Tk(className="AgentWorkbench")
         self.win.title(APP_NAME)
@@ -1679,6 +1680,8 @@ class App:
 
         self._build_style()
         self._build_ui()
+        self.win.bind("<F5>", lambda _e: self.refresh_sessions())
+        self.win.bind("<Control-f>", lambda _e: self.session_search.focus_set())
 
         self.backends = {
             "codex": CodexBackend(self.events),
@@ -1801,11 +1804,24 @@ class App:
             spacing3=8,
         )
         self.chat.pack(fill="both", expand=True, padx=8, pady=(4, 8))
-        self.chat.tag_config("user_head", foreground=USER, font=("Sans", 10, "bold"))
+        self.chat.tag_config(
+            "user_head",
+            foreground=USER,
+            font=("Sans", 10, "bold"),
+            justify="right",
+            spacing1=8,
+        )
         self.chat.tag_config("assistant_head", foreground=CODEX, font=("Sans", 10, "bold"))
         self.chat.tag_config("claude_head", foreground=CLAUDE, font=("Sans", 10, "bold"))
         self.chat.tag_config("gemini_head", foreground=GEMINI, font=("Sans", 10, "bold"))
-        self.chat.tag_config("user", foreground="#dbeafe")
+        self.chat.tag_config(
+            "user",
+            foreground="#dbeafe",
+            background="#17324d",
+            justify="right",
+            spacing1=3,
+            spacing3=8,
+        )
         self.chat.tag_config("assistant", foreground=TEXT)
         self.chat.tag_config(
             "chat_h1",
@@ -1831,6 +1847,7 @@ class App:
             font=("Monospace", 10),
         )
         self.chat.tag_config("chat_bold", foreground="#f8fafc", font=("Sans", 11, "bold"))
+        self.chat.bind("<Configure>", self.update_chat_margins)
         self.chat.configure(state="disabled")
 
         self.work = ScrolledText(
@@ -2028,6 +2045,23 @@ class App:
         self.chat.see("end")
         self.chat.yview_moveto(1.0)
 
+    def update_chat_margins(self, event=None):
+        width = event.width if event is not None else self.chat.winfo_width()
+        user_left = max(120, int(width * 0.38))
+        right = 20
+        self.chat.tag_config(
+            "user_head",
+            lmargin1=user_left,
+            lmargin2=user_left,
+            rmargin=right,
+        )
+        self.chat.tag_config(
+            "user",
+            lmargin1=user_left,
+            lmargin2=user_left,
+            rmargin=right,
+        )
+
     def refresh_artifacts_view(self, session=None):
         session = session or self.current_session
         self.artifact_list.delete(0, "end")
@@ -2117,7 +2151,7 @@ class App:
         sidebar = tk.Frame(
             parent,
             bg=SIDEBAR,
-            width=286,
+            width=304,
             highlightbackground=BORDER,
             highlightcolor=BORDER,
             highlightthickness=1,
@@ -2126,12 +2160,12 @@ class App:
         sidebar.pack_propagate(False)
 
         head = tk.Frame(sidebar, bg=SIDEBAR)
-        head.pack(fill="x", padx=14, pady=(14, 12))
+        head.pack(fill="x", padx=14, pady=(14, 10))
         tk.Label(head, text="AGENT WORKBENCH", bg=SIDEBAR, fg=TEXT, font=("Sans", 13, "bold")).pack(anchor="w")
-        tk.Label(head, text="Choose an agent, project, and session", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
+        tk.Label(head, text="Agents and sessions", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
 
         agent_box = tk.Frame(sidebar, bg=SIDEBAR)
-        agent_box.pack(fill="x", padx=14, pady=(0, 12))
+        agent_box.pack(fill="x", padx=14, pady=(0, 8))
         tk.Label(agent_box, text="Agent", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
         self.agent_picker = ttk.Combobox(
             agent_box,
@@ -2143,9 +2177,25 @@ class App:
         self.agent_picker.pack(fill="x", pady=(4, 0))
         self.agent_picker.bind("<<ComboboxSelected>>", lambda _e: self.on_agent_changed())
 
-        tk.Label(agent_box, text="Model", bg=SIDEBAR, fg=MUTED).pack(anchor="w", pady=(9, 0))
-        self.model_picker = ttk.Combobox(
+        self.agent_settings_btn = tk.Button(
             agent_box,
+            text="Agent settings  >",
+            command=self.toggle_agent_settings,
+            bg=SIDEBAR,
+            fg=MUTED,
+            activebackground=SIDEBAR,
+            activeforeground=TEXT,
+            relief="flat",
+            anchor="w",
+            padx=0,
+            pady=5,
+        )
+        self.agent_settings_btn.pack(fill="x", pady=(3, 0))
+        self.agent_settings_box = tk.Frame(agent_box, bg=SIDEBAR)
+
+        tk.Label(self.agent_settings_box, text="Model", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
+        self.model_picker = ttk.Combobox(
+            self.agent_settings_box,
             textvariable=self.selected_model,
             state="readonly",
             style="Agent.TCombobox",
@@ -2153,10 +2203,10 @@ class App:
         self.model_picker.pack(fill="x", pady=(4, 0))
         self.model_picker.bind("<<ComboboxSelected>>", lambda _e: self.on_agent_setting_changed())
 
-        self.effort_label = tk.Label(agent_box, text="Effort", bg=SIDEBAR, fg=MUTED)
+        self.effort_label = tk.Label(self.agent_settings_box, text="Effort", bg=SIDEBAR, fg=MUTED)
         self.effort_label.pack(anchor="w", pady=(9, 0))
         self.effort_picker = ttk.Combobox(
-            agent_box,
+            self.agent_settings_box,
             textvariable=self.selected_effort,
             state="readonly",
             style="Agent.TCombobox",
@@ -2166,7 +2216,7 @@ class App:
         self.refresh_agent_controls()
 
         cwd_box = tk.Frame(sidebar, bg=SIDEBAR)
-        cwd_box.pack(fill="x", padx=14, pady=(0, 12))
+        cwd_box.pack(fill="x", padx=14, pady=(0, 10))
         tk.Label(cwd_box, text="Project", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
         cwd_row = tk.Frame(cwd_box, bg=SIDEBAR)
         cwd_row.pack(fill="x", pady=(4, 0))
@@ -2183,30 +2233,30 @@ class App:
             side="left", padx=(6, 0)
         )
 
-        actions = tk.Frame(sidebar, bg=SIDEBAR)
-        actions.pack(fill="x", padx=14, pady=(0, 12))
-        tk.Button(actions, text="New session", command=self.new_session, bg=ACCENT, fg="white", relief="flat").pack(
-            side="left", fill="x", expand=True
-        )
-        tk.Button(actions, text="Refresh", command=self.refresh_sessions, bg=PANEL, fg=TEXT, relief="flat").pack(
-            side="left", padx=(6, 0)
-        )
-
-        sess_frame = tk.LabelFrame(
+        tk.Button(
             sidebar,
-            text="Sessions",
-            bg=SIDEBAR,
-            fg=TEXT,
-            highlightbackground="#1f2a35",
-            highlightcolor="#1f2a35",
-            bd=1,
+            text="+  New session",
+            command=self.new_session,
+            bg=ACCENT,
+            fg="white",
             relief="flat",
-            padx=8,
-            pady=8,
+            pady=6,
+        ).pack(fill="x", padx=14, pady=(0, 10))
+
+        sess_frame = tk.Frame(
+            sidebar,
+            bg=SIDEBAR,
         )
         sess_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        tk.Label(
+            sess_frame,
+            text="SESSIONS",
+            bg=SIDEBAR,
+            fg=MUTED,
+            anchor="w",
+            font=("Sans", 9, "bold"),
+        ).pack(fill="x", pady=(0, 5))
         sess_tools = tk.Frame(sess_frame, bg=SIDEBAR)
-        tk.Label(sess_frame, text="Search", bg=SIDEBAR, fg=MUTED, anchor="w").pack(fill="x")
         sess_tools.pack(fill="x", pady=(0, 6))
         self.session_search = tk.Entry(
             sess_tools,
@@ -2218,14 +2268,6 @@ class App:
         )
         self.session_search.pack(side="left", fill="x", expand=True)
         self.session_search.bind("<KeyRelease>", lambda _e: self._render_session_list())
-        tk.Button(
-            sess_tools,
-            text="Rename",
-            command=self.rename_selected_session,
-            bg=PANEL,
-            fg=TEXT,
-            relief="flat",
-        ).pack(side="left", padx=(6, 0))
         self.session_list = tk.Listbox(
             sess_frame,
             bg=PANEL,
@@ -2238,6 +2280,8 @@ class App:
         self.session_list.pack(side="left", fill="both", expand=True)
         self.session_list.bind("<<ListboxSelect>>", lambda _e: self.select_session())
         self.session_list.bind("<Double-Button-1>", lambda _e: self.input.focus_set())
+        self.session_list.bind("<Button-3>", self.show_session_menu)
+        self.session_list.bind("<F2>", lambda _e: self.rename_selected_session())
         self.session_list.bind("<Motion>", self._schedule_session_tooltip)
         self.session_list.bind("<Leave>", lambda _e: self._hide_session_tooltip())
         self.session_list.bind("<Button>", lambda _e: self._hide_session_tooltip())
@@ -2247,8 +2291,29 @@ class App:
         sess_scroll = tk.Scrollbar(sess_frame, command=self.session_list.yview)
         sess_scroll.pack(side="right", fill="y")
         self.session_list.configure(yscrollcommand=sess_scroll.set)
+        self.session_menu = tk.Menu(self.win, tearoff=False)
+        self.session_menu.add_command(label="Rename session", command=self.rename_selected_session)
 
         self._refresh_project_list()
+
+    def toggle_agent_settings(self):
+        self.agent_settings_visible = not self.agent_settings_visible
+        if self.agent_settings_visible:
+            self.agent_settings_box.pack(fill="x", pady=(2, 0))
+            self.agent_settings_btn.configure(text="Agent settings  v", fg=TEXT)
+        else:
+            self.agent_settings_box.pack_forget()
+            self.agent_settings_btn.configure(text="Agent settings  >", fg=MUTED)
+
+    def show_session_menu(self, event):
+        index = self.session_list.nearest(event.y)
+        bounds = self.session_list.bbox(index)
+        if not bounds or not (bounds[1] <= event.y < bounds[1] + bounds[3]):
+            return
+        self.session_list.selection_clear(0, "end")
+        self.session_list.selection_set(index)
+        self.session_list.activate(index)
+        self.session_menu.tk_popup(event.x_root, event.y_root)
 
     def _agent_spec(self, key):
         return self.agent_map.get(key, {"key": key, "label": key.title(), "color": TEXT})
@@ -2267,10 +2332,14 @@ class App:
         timestamp = clean_text(session.get("updated_at"))
         try:
             moment = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone()
-            stamp = moment.strftime("%b %d %H:%M")
+            today = datetime.now().astimezone().date()
+            if moment.date() == today:
+                stamp = moment.strftime("%H:%M")
+            else:
+                stamp = moment.strftime("%b %d")
         except (ValueError, TypeError):
             stamp = ""
-        return f"{stamp} · {title}" if stamp else title
+        return f"{stamp}  {title}" if stamp else title
 
     def _session_source_label(self, session):
         origin = session.get("origin", "local")
