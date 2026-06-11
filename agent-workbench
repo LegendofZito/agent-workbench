@@ -42,9 +42,19 @@ TEXT = "#e6edf3"
 MUTED = "#8b949e"
 SIDEBAR = "#11161d"
 SIDEBAR_SEL = "#22303d"
-CODEX = "#dc2626"
-CLAUDE = "#ffb86b"
-GEMINI = "#8ab4ff"
+CODEX = "#60a5fa"
+CLAUDE = "#d97757"
+GEMINI = "#a78bfa"
+AGENT_BACKGROUNDS = {
+    "codex": "#101c29",
+    "claude": "#241811",
+    "gemini": "#17172a",
+}
+AGENT_ACCENTS = {
+    "codex": ("#2563eb", "#60a5fa", "#dbeafe", "#ffffff"),
+    "claude": ("#8f3f2b", "#b85c3f", "#d97757", "#f0a17f"),
+    "gemini": ("#4285f4", "#9b72cb", "#d96570", "#f9ab00"),
+}
 WORK = "#f59e0b"
 USER = "#79c0ff"
 ACCENT = "#2f81f7"
@@ -1569,6 +1579,15 @@ class App:
         self.notebook.add(self.artifacts_tab, text="Artifacts")
         self.notebook.add(self.terminal_tab, text="Terminal")
 
+        self.agent_accent_bar = tk.Frame(self.chat_tab, bg=BG, height=5)
+        self.agent_accent_bar.pack(fill="x", padx=8, pady=(8, 0))
+        self.agent_accent_bar.pack_propagate(False)
+        self.agent_accent_segments = []
+        for _ in range(4):
+            segment = tk.Frame(self.agent_accent_bar, bg=BG)
+            segment.pack(side="left", fill="both", expand=True)
+            self.agent_accent_segments.append(segment)
+
         self.chat = ScrolledText(
             self.chat_tab,
             wrap="word",
@@ -1583,7 +1602,7 @@ class App:
             spacing1=3,
             spacing3=8,
         )
-        self.chat.pack(fill="both", expand=True, padx=8, pady=8)
+        self.chat.pack(fill="both", expand=True, padx=8, pady=(4, 8))
         self.chat.tag_config("user_head", foreground=USER, font=("Sans", 10, "bold"))
         self.chat.tag_config("assistant_head", foreground=CODEX, font=("Sans", 10, "bold"))
         self.chat.tag_config("claude_head", foreground=CLAUDE, font=("Sans", 10, "bold"))
@@ -2166,7 +2185,18 @@ class App:
         self._refresh_project_list()
 
     def on_agent_changed(self):
+        self.apply_agent_theme(self.active_agent.get())
         self.refresh_sessions()
+
+    def apply_agent_theme(self, agent_key):
+        background = AGENT_BACKGROUNDS.get(agent_key, PANEL)
+        accents = AGENT_ACCENTS.get(agent_key, (ACCENT,) * 4)
+        self.chat_tab.configure(bg=background)
+        self.agent_accent_bar.configure(bg=background)
+        for segment, color in zip(self.agent_accent_segments, accents):
+            segment.configure(bg=color)
+        self.chat.configure(bg=background)
+        self.input.configure(bg=background)
 
     def refresh_sessions(self):
         self.status.set("Loading sessions…")
@@ -2282,6 +2312,7 @@ class App:
         if remember and self.current_session and self.current_session.get("id") != session_id:
             self.transfer_source_session_id = self.current_session.get("id")
         self.current_session = deepcopy(session)
+        self.apply_agent_theme(session.get("agent", self.active_agent.get()))
         self.live_source_signature = self._source_signature(
             self.current_session.get("source_path")
         )
