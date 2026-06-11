@@ -243,6 +243,7 @@ def claude_jsonl_turns(path):
     current = None
     pending_text = []
     seen = set()
+    tool_context = {}
 
     def ensure_turn(timestamp=""):
         nonlocal current
@@ -324,13 +325,43 @@ def claude_jsonl_turns(path):
                             )
                         text = clean_text(output)
                         if text:
-                            ensure_turn(obj.get("timestamp"))["items"].append(
-                                {
-                                    "type": "system",
-                                    "text": text,
-                                    "tag": "system",
-                                }
-                            )
+                            tool_id = clean_text(result.get("tool_use_id"))
+                            context = tool_context.get(tool_id) or {}
+                            tool_name = context.get("name")
+                            if tool_name in {"WebSearch", "WebFetch"}:
+                                raw_text = ""
+                                report_text = text
+                                marker = "\n\nI found "
+                                if marker in text:
+                                    raw_text, readable = text.split(marker, 1)
+                                    report_text = "I found " + readable
+                                if raw_text:
+                                    ensure_turn(obj.get("timestamp"))["items"].append(
+                                        {"type": "system", "text": raw_text, "tag": "tool"}
+                                    )
+                                subject = clean_text(
+                                    context.get("query") or context.get("url")
+                                )
+                                title = (
+                                    "Research results"
+                                    if not subject
+                                    else "Research: " + shorten(subject, 72)
+                                )
+                                ensure_turn(obj.get("timestamp"))["items"].append(
+                                    {
+                                        "type": "report",
+                                        "title": title,
+                                        "text": report_text,
+                                    }
+                                )
+                            else:
+                                ensure_turn(obj.get("timestamp"))["items"].append(
+                                    {
+                                        "type": "system",
+                                        "text": text,
+                                        "tag": "system",
+                                    }
+                                )
                     continue
 
                 for block in blocks:
@@ -351,6 +382,13 @@ def claude_jsonl_turns(path):
                         flush_assistant_text(final=False)
                         name = clean_text(block.get("name"))
                         tool_input = block.get("input") or {}
+                        tool_id = clean_text(block.get("id"))
+                        if tool_id:
+                            tool_context[tool_id] = {
+                                "name": name,
+                                "query": clean_text(tool_input.get("query")),
+                                "url": clean_text(tool_input.get("url")),
+                            }
                         if name == "Bash":
                             command = clean_text(tool_input.get("command"))
                             if command:
@@ -1627,6 +1665,7 @@ class App:
         self.loading_external_sessions = set()
         self.render_generation = 0
         self.agent_settings_visible = False
+        self.report_cards = []
 
         self.win = tk.Tk(className="AgentWorkbench")
         self.win.title(APP_NAME)
@@ -2061,6 +2100,9 @@ class App:
             lmargin2=user_left,
             rmargin=right,
         )
+        for card in self.report_cards:
+            card_width = max(420, width - 90)
+            card["frame"].configure(width=card_width)
 
     def refresh_artifacts_view(self, session=None):
         session = session or self.current_session
@@ -2755,6 +2797,12 @@ class App:
 
     def _clear_views(self):
         self.render_generation += 1
+        for card in self.report_cards:
+            try:
+                card["frame"].destroy()
+            except tk.TclError:
+                pass
+        self.report_cards = []
         for widget in (self.chat, self.work):
             widget.configure(state="normal")
             widget.delete("1.0", "end")
@@ -2791,6 +2839,11 @@ class App:
             text = self._extract_agent_text(item)
             if text:
                 self.append_chat(self._agent_spec(agent_key)["label"].upper(), text, "assistant")
+        elif typ == "report":
+            self.append_report(
+                clean_text(item.get("title")) or "Agent report",
+                clean_text(item.get("text")),
+            )
         elif typ == "commandExecution":
             command = clean_text(item.get("command"))
             if command:
@@ -2864,6 +2917,75 @@ class App:
             self._insert_formatted_chat(text)
         else:
             widget.insert("end", text.rstrip() + "\n\n", tag)
+        widget.configure(state="disabled")
+        if at_bottom:
+            widget.see("end")
+
+    def append_report(self, title, text):
+        if not text:
+            return
+        widget = self.chat
+        at_bottom = widget.yview()[1] >= 0.995
+        widget.configure(state="normal")
+        width = max(420, widget.winfo_width() - 90)
+        frame = tk.Frame(
+            widget,
+            bg="#111c27",
+            highlightbackground="#35506a",
+            highlightthickness=1,
+            width=width,
+        )
+        frame.pack_propagate(False)
+        header = tk.Frame(frame, bg="#111c27")
+        header.pack(fill="x")
+        content = ScrolledText(
+            frame,
+            wrap="word",
+            height=14,
+            bg="#0d151e",
+            fg=TEXT,
+            relief="flat",
+            borderwidth=0,
+            padx=16,
+            pady=14,
+            font=("Sans", 10),
+        )
+        content.insert("1.0", text)
+        content.configure(state="disabled")
+        card_state = {"expanded": False}
+
+        def toggle():
+            if card_state["expanded"]:
+                content.pack_forget()
+                button.configure(text=f">  View {title}")
+                frame.configure(height=44)
+                card_state["expanded"] = False
+            else:
+                content.pack(fill="both", expand=True)
+                button.configure(text=f"v  Hide {title}")
+                frame.configure(height=340)
+                card_state["expanded"] = True
+            widget.see("end")
+
+        button = tk.Button(
+            header,
+            text=f">  View {title}",
+            command=toggle,
+            bg="#111c27",
+            fg="#93c5fd",
+            activebackground="#17283a",
+            activeforeground="#bfdbfe",
+            relief="flat",
+            anchor="w",
+            font=("Sans", 10, "bold"),
+            padx=14,
+            pady=10,
+        )
+        button.pack(fill="x")
+        frame.configure(height=44)
+        widget.window_create("end", window=frame, padx=18, pady=8)
+        widget.insert("end", "\n")
+        self.report_cards.append({"frame": frame, "content": content, "button": button})
         widget.configure(state="disabled")
         if at_bottom:
             widget.see("end")

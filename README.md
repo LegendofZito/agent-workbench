@@ -7,7 +7,9 @@ plans, and progress in a separate work log.
 Selected Codex and Claude terminal sessions are mirrored live. Conversation
 messages keep readable headings, lists, checklists, emphasis, and inline code
 while implementation output stays in Work Log. User messages appear in a
-right-side chat lane, with agent responses kept on the left.
+right-side chat lane, with agent responses kept on the left. Substantial web
+research appears as a collapsed, scrollable report card inside Conversation;
+raw tool payloads remain in Work Log.
 
 The sidebar provides per-agent model and effort controls. Defaults favor
 responsive general use: Codex GPT-5.5 at medium effort, Claude Sonnet at medium
