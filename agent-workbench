@@ -230,12 +230,21 @@ def first_text_from_claude_jsonl(path):
 
 
 def title_from_claude_jsonl(path):
-    for obj in read_jsonl_lines(path, limit=120):
-        if isinstance(obj, dict) and obj.get("type") == "ai-title":
-            title = clean_text(obj.get("aiTitle"))
-            if title:
-                return title
-    return ""
+    title = ""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    obj = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(obj, dict) and obj.get("type") == "ai-title":
+                    candidate = clean_text(obj.get("aiTitle"))
+                    if candidate:
+                        title = candidate
+    except OSError:
+        return ""
+    return title
 
 
 def claude_jsonl_turns(path):
@@ -573,6 +582,27 @@ def rename_codex_thread_title(thread_id, title):
             con.close()
         except Exception:
             pass
+
+
+def rename_claude_session_title(path, session_id, title):
+    title = clean_text(title)
+    if not path or not session_id or not title or not os.path.isfile(path):
+        return False
+    record = {
+        "type": "ai-title",
+        "aiTitle": title,
+        "sessionId": session_id,
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return True
+    except OSError:
+        return False
 
 
 def gemini_sessions_for_cwd(cwd):
@@ -1722,7 +1752,6 @@ class App:
         self.live_source_signature = None
         self.loading_external_sessions = set()
         self.render_generation = 0
-        self.agent_settings_visible = False
         self.report_cards = []
 
         self.win = tk.Tk(className="AgentWorkbench")
@@ -2271,7 +2300,7 @@ class App:
         sidebar = tk.Frame(
             parent,
             bg=SIDEBAR,
-            width=304,
+            width=340,
             highlightbackground=BORDER,
             highlightcolor=BORDER,
             highlightthickness=1,
@@ -2281,8 +2310,29 @@ class App:
 
         head = tk.Frame(sidebar, bg=SIDEBAR)
         head.pack(fill="x", padx=14, pady=(14, 10))
-        tk.Label(head, text="AGENT WORKBENCH", bg=SIDEBAR, fg=TEXT, font=("Sans", 13, "bold")).pack(anchor="w")
-        tk.Label(head, text="Agents and sessions", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
+        head_text = tk.Frame(head, bg=SIDEBAR)
+        head_text.pack(side="left", fill="x", expand=True)
+        tk.Label(
+            head_text,
+            text="AGENT WORKBENCH",
+            bg=SIDEBAR,
+            fg=TEXT,
+            font=("Sans", 13, "bold"),
+        ).pack(anchor="w")
+        tk.Label(head_text, text="Agents and sessions", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
+        tk.Button(
+            head,
+            text="+ Clients",
+            command=self.open_add_client_dialog,
+            bg=PANEL,
+            fg=TEXT,
+            activebackground=SIDEBAR_SEL,
+            activeforeground=TEXT,
+            relief="flat",
+            padx=8,
+            pady=4,
+            cursor="hand2",
+        ).pack(side="right", anchor="n")
 
         agent_box = tk.Frame(sidebar, bg=SIDEBAR)
         agent_box.pack(fill="x", padx=14, pady=(0, 8))
@@ -2297,40 +2347,16 @@ class App:
         self.agent_picker.pack(fill="x", pady=(4, 0))
         self.agent_picker.bind("<<ComboboxSelected>>", lambda _e: self.on_agent_changed())
 
-        tk.Button(
-            agent_box,
-            text="+  Add client",
-            command=self.open_add_client_dialog,
-            bg=PANEL,
-            fg=TEXT,
-            activebackground=SIDEBAR_SEL,
-            activeforeground=TEXT,
-            relief="flat",
-            anchor="w",
-            padx=10,
-            pady=5,
-            cursor="hand2",
-        ).pack(fill="x", pady=(6, 0))
+        settings_row = tk.Frame(agent_box, bg=SIDEBAR)
+        settings_row.pack(fill="x", pady=(8, 0))
+        model_box = tk.Frame(settings_row, bg=SIDEBAR)
+        model_box.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        effort_box = tk.Frame(settings_row, bg=SIDEBAR)
+        effort_box.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
-        self.agent_settings_btn = tk.Button(
-            agent_box,
-            text="Agent settings  >",
-            command=self.toggle_agent_settings,
-            bg=SIDEBAR,
-            fg=MUTED,
-            activebackground=SIDEBAR,
-            activeforeground=TEXT,
-            relief="flat",
-            anchor="w",
-            padx=0,
-            pady=5,
-        )
-        self.agent_settings_btn.pack(fill="x", pady=(3, 0))
-        self.agent_settings_box = tk.Frame(agent_box, bg=SIDEBAR)
-
-        tk.Label(self.agent_settings_box, text="Model", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
+        tk.Label(model_box, text="Model", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
         self.model_picker = ttk.Combobox(
-            self.agent_settings_box,
+            model_box,
             textvariable=self.selected_model,
             state="readonly",
             style="Agent.TCombobox",
@@ -2338,10 +2364,10 @@ class App:
         self.model_picker.pack(fill="x", pady=(4, 0))
         self.model_picker.bind("<<ComboboxSelected>>", lambda _e: self.on_agent_setting_changed())
 
-        self.effort_label = tk.Label(self.agent_settings_box, text="Effort", bg=SIDEBAR, fg=MUTED)
-        self.effort_label.pack(anchor="w", pady=(9, 0))
+        self.effort_label = tk.Label(effort_box, text="Effort", bg=SIDEBAR, fg=MUTED)
+        self.effort_label.pack(anchor="w")
         self.effort_picker = ttk.Combobox(
-            self.agent_settings_box,
+            effort_box,
             textvariable=self.selected_effort,
             state="readonly",
             style="Agent.TCombobox",
@@ -2693,15 +2719,6 @@ class App:
         self.terminal_shell.send(command + "\n")
         self.status.set("Client setup started in Terminal.")
 
-    def toggle_agent_settings(self):
-        self.agent_settings_visible = not self.agent_settings_visible
-        if self.agent_settings_visible:
-            self.agent_settings_box.pack(fill="x", pady=(2, 0))
-            self.agent_settings_btn.configure(text="Agent settings  v", fg=TEXT)
-        else:
-            self.agent_settings_box.pack_forget()
-            self.agent_settings_btn.configure(text="Agent settings  >", fg=MUTED)
-
     def show_session_menu(self, event):
         index = self.session_list.nearest(event.y)
         bounds = self.session_list.bbox(index)
@@ -2904,12 +2921,7 @@ class App:
         custom = bool(self._agent_spec(agent_key).get("custom"))
         self.model_picker.configure(state="disabled" if custom else "readonly")
         self.effort_picker.configure(state="disabled" if custom else "readonly")
-        if agent_key == "gemini":
-            self.effort_label.configure(text="Effort (managed by Gemini)")
-        elif custom:
-            self.effort_label.configure(text="Effort (managed by client)")
-        else:
-            self.effort_label.configure(text="Effort")
+        self.effort_label.configure(text="Effort")
 
     def on_agent_setting_changed(self):
         agent_key = self.active_agent.get()
@@ -3013,16 +3025,29 @@ class App:
         if not alias:
             messagebox.showinfo("Rename", "Name cannot be blank.")
             return
-        self._set_session_alias(session, alias)
         source_updated = False
         if session.get("origin") == "codex-terminal":
             source_updated = rename_codex_thread_title(session.get("source_session_id"), alias)
+        elif session.get("origin") == "claude-terminal":
+            source_updated = rename_claude_session_title(
+                session.get("source_path"),
+                session.get("source_session_id"),
+                alias,
+            )
+        if source_updated:
+            session["title"] = alias
+            self.session_aliases.pop(session_alias_key(session), None)
+            self.config["session_aliases"] = self.session_aliases
+            save_json(CONFIG_FILE, self.config)
+        else:
+            self._set_session_alias(session, alias)
         if session.get("origin", "local") == "local":
             self.session_title.set(alias)
         self._render_session_list()
         self.open_session(session["id"], remember=False)
         if source_updated:
-            self.status.set(f"Renamed Codex session to '{alias}' in Codex and in Workbench.")
+            agent = self._agent_spec(session.get("agent", ""))["label"]
+            self.status.set(f"Renamed session to '{alias}' in {agent} and Workbench.")
         else:
             self.status.set(f"Renamed session to '{alias}' in Workbench.")
 
@@ -3131,13 +3156,16 @@ class App:
         def load():
             if origin == "claude-terminal":
                 turns = claude_jsonl_turns(path)
+                title = title_from_claude_jsonl(path)
             else:
                 turns = codex_rollout_turns(path)
+                title = ""
             self.events.put(
                 {
                     "kind": "external_session_loaded",
                     "session_id": session_id,
                     "turns": turns,
+                    "title": title,
                     "signature": self._source_signature(path),
                 }
             )
@@ -3744,10 +3772,13 @@ class App:
             session_id = event.get("session_id")
             self.loading_external_sessions.discard(session_id)
             turns = event.get("turns") or []
+            source_title = clean_text(event.get("title"))
             for session in self.external_sessions:
                 if session.get("id") == session_id:
                     session["turns"] = turns
                     session["transcript_loaded"] = True
+                    if source_title:
+                        session["title"] = source_title
                     break
             if self.current_session and self.current_session.get("id") == session_id:
                 chat_at_bottom = self.chat.yview()[1] >= 0.995
@@ -3756,10 +3787,13 @@ class App:
                 work_position = self.work.yview()[0]
                 self.current_session["turns"] = turns
                 self.current_session["transcript_loaded"] = True
+                if source_title:
+                    self.current_session["title"] = source_title
                 self.current_session["updated_at"] = now_iso()
                 self.live_source_signature = event.get("signature")
                 self._clear_views()
                 self._render_session(self.current_session)
+                self._render_session_list()
                 self.refresh_artifacts_view(self.current_session)
                 if not chat_at_bottom:
                     self.chat.yview_moveto(chat_position)
