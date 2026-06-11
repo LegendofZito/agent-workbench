@@ -242,8 +242,36 @@ def claude_session_is_resumable(path):
     return False
 
 
-def title_from_claude_jsonl(path):
+def claude_context_limit(model):
+    model = clean_text(model).lower()
+    if re.search(r"(?:opus-4-[678]|sonnet-4-6|fable-5)", model):
+        return 1_000_000
+    return 200_000
+
+
+def context_from_usage(usage, model="", compact_count=0):
+    if not isinstance(usage, dict):
+        return {}
+    used = sum(
+        int(usage.get(key) or 0)
+        for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+    )
+    if used <= 0:
+        return {}
+    limit = claude_context_limit(model)
+    return {
+        "used": used,
+        "limit": limit,
+        "percent": min(100.0, used * 100.0 / limit),
+        "model": clean_text(model),
+        "compact_count": int(compact_count or 0),
+    }
+
+
+def claude_session_metadata(path):
     title = ""
+    context = {}
+    compact_count = 0
     try:
         with open(path, encoding="utf-8") as handle:
             for line in handle:
@@ -255,9 +283,35 @@ def title_from_claude_jsonl(path):
                     candidate = clean_text(obj.get("aiTitle"))
                     if candidate:
                         title = candidate
+                if (
+                    isinstance(obj, dict)
+                    and obj.get("type") == "system"
+                    and obj.get("subtype") == "compact_boundary"
+                ):
+                    compact_count += 1
+                    continue
+                if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                    continue
+                if obj.get("isSidechain"):
+                    continue
+                message = obj.get("message") or {}
+                model = clean_text(message.get("model"))
+                if not model or model == "<synthetic>":
+                    continue
+                candidate = context_from_usage(
+                    message.get("usage") or {},
+                    model,
+                    compact_count,
+                )
+                if candidate:
+                    context = candidate
     except OSError:
-        return ""
-    return title
+        return {"title": "", "context": {}}
+    return {"title": title, "context": context}
+
+
+def title_from_claude_jsonl(path):
+    return claude_session_metadata(path)["title"]
 
 
 def claude_jsonl_turns(path):
@@ -565,6 +619,39 @@ def codex_rollout_turns(path):
     return [turn for turn in turns if turn.get("items")]
 
 
+def codex_context_from_rollout(path):
+    context = {}
+    if not path or not os.path.isfile(path):
+        return context
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    obj = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if obj.get("type") != "event_msg":
+                    continue
+                payload = obj.get("payload") or {}
+                if payload.get("type") != "token_count":
+                    continue
+                info = payload.get("info") or {}
+                usage = info.get("last_token_usage") or {}
+                used = int(usage.get("input_tokens") or usage.get("total_tokens") or 0)
+                limit = int(info.get("model_context_window") or 0)
+                if used > 0 and limit > 0:
+                    context = {
+                        "used": used,
+                        "limit": limit,
+                        "percent": min(100.0, used * 100.0 / limit),
+                        "model": "Codex",
+                        "compact_count": 0,
+                    }
+    except OSError:
+        return {}
+    return context
+
+
 def rename_codex_thread_title(thread_id, title):
     db = os.path.expanduser("~/.codex/state_5.sqlite")
     if not thread_id or not os.path.exists(db):
@@ -699,7 +786,8 @@ def claude_sessions_for_cwd(cwd):
             continue
         sid = path.stem
         preview = first_text_from_claude_jsonl(str(path))
-        generated_title = title_from_claude_jsonl(str(path))
+        metadata = claude_session_metadata(str(path))
+        generated_title = metadata["title"]
         try:
             mtime = path.stat().st_mtime
         except OSError:
@@ -717,6 +805,7 @@ def claude_sessions_for_cwd(cwd):
                 "updated_at": iso_from_unix(mtime),
                 "source_path": str(path),
                 "backend": {"session_id": sid},
+                "context": metadata["context"],
                 "turns": [],
                 "transcript_loaded": False,
             }
@@ -779,6 +868,7 @@ def codex_sessions_for_cwd(cwd):
                 "updated_at": iso_from_unix(row["updated_at"]),
                 "source_path": row["rollout_path"],
                 "backend": {"thread_id": sid},
+                "context": codex_context_from_rollout(row["rollout_path"]),
                 "turns": turns,
             }
         )
@@ -1186,6 +1276,22 @@ class CodexBackend(BaseBackend):
         elif method == "turn/completed":
             turn = params.get("turn") or {}
             self.emit("turn_done", status=(turn.get("status") or "completed"))
+        elif method == "thread/tokenUsage/updated":
+            token_usage = params.get("tokenUsage") or {}
+            usage = token_usage.get("last") or {}
+            used = int(usage.get("inputTokens") or usage.get("totalTokens") or 0)
+            limit = int(token_usage.get("modelContextWindow") or 0)
+            if used > 0 and limit > 0:
+                self.emit(
+                    "context_usage",
+                    context={
+                        "used": used,
+                        "limit": limit,
+                        "percent": min(100.0, used * 100.0 / limit),
+                        "model": "Codex",
+                        "compact_count": 0,
+                    },
+                )
         elif method == "thread/created" or method == "thread/resumed":
             thread = params.get("thread") or {}
             self.thread_id = thread.get("id") or self.thread_id
@@ -1578,6 +1684,12 @@ class ClaudeBackend(StreamCliBackend):
                         )
                     elif etype == "assistant":
                         message = event.get("message") or {}
+                        context = context_from_usage(
+                            message.get("usage") or {},
+                            message.get("model") or model,
+                        )
+                        if context:
+                            self.emit("context_usage", context=context)
                         for block in message.get("content") or []:
                             if not isinstance(block, dict):
                                 continue
@@ -1818,6 +1930,7 @@ class App:
         self.selected_effort = tk.StringVar(master=self.win, value=initial_settings["effort"])
         self.status = tk.StringVar(master=self.win, value="Starting…")
         self.activity_text = tk.StringVar(master=self.win, value="Starting")
+        self.context_text = tk.StringVar(master=self.win, value="Context --")
         self.session_title = tk.StringVar(master=self.win, value=APP_NAME)
         self.session_label = tk.StringVar(master=self.win, value="No session")
         self.sessions = []
@@ -1924,6 +2037,16 @@ class App:
             font=("Sans", 9, "bold"),
         )
         self.activity_badge.pack(side="right", padx=(0, 4))
+        self.context_badge = tk.Label(
+            topbar,
+            textvariable=self.context_text,
+            bg="#24303c",
+            fg="#cbd5e1",
+            padx=9,
+            pady=4,
+            font=("Sans", 9, "bold"),
+        )
+        self.context_badge.pack(side="right", padx=(0, 4))
 
         content = tk.Frame(right, bg=BORDER)
         content.pack(fill="both", expand=True)
@@ -1965,6 +2088,13 @@ class App:
             spacing3=8,
         )
         self.chat.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        self.chat.vbar.configure(
+            background="#64748b",
+            activebackground="#94a3b8",
+            troughcolor="#0b1118",
+            relief="flat",
+            borderwidth=0,
+        )
         self.chat.tag_config(
             "user_head",
             foreground=USER,
@@ -2193,6 +2323,29 @@ class App:
             self.activity_text.set(f"Working{dots}")
             self.activity_frame += 1
         self.win.after(350, self.animate_activity)
+
+    def update_context_indicator(self, context=None):
+        context = context or {}
+        used = int(context.get("used") or 0)
+        limit = int(context.get("limit") or 0)
+        if used <= 0 or limit <= 0:
+            self.context_text.set("Context --")
+            bg, fg, thumb = "#24303c", "#cbd5e1", "#64748b"
+        else:
+            percent = min(100, round(used * 100 / limit))
+            used_label = f"{used / 1_000_000:.1f}M" if used >= 1_000_000 else f"{round(used / 1000)}K"
+            limit_label = f"{limit // 1_000_000}M" if limit >= 1_000_000 else f"{limit // 1000}K"
+            self.context_text.set(f"Context {percent}% · {used_label}/{limit_label}")
+            if percent < 50:
+                bg, fg, thumb = "#16351f", "#bbf7d0", "#22c55e"
+            elif percent < 75:
+                bg, fg, thumb = "#3b350b", "#fef08a", "#eab308"
+            elif percent < 90:
+                bg, fg, thumb = "#4a2b0b", "#fed7aa", "#f97316"
+            else:
+                bg, fg, thumb = "#4a1d1d", "#fecaca", "#ef4444"
+        self.context_badge.configure(bg=bg, fg=fg)
+        self.chat.vbar.configure(background=thumb, activebackground=fg)
 
     def on_notebook_tab_changed(self, _event=None):
         selected = self.notebook.select()
@@ -3121,6 +3274,7 @@ class App:
             self.selected_effort.set(effort)
         self.refresh_agent_controls()
         self.apply_agent_theme(session.get("agent", self.active_agent.get()))
+        self.update_context_indicator(session.get("context"))
         self.live_source_signature = self._source_signature(
             self.current_session.get("source_path")
         )
@@ -3179,16 +3333,20 @@ class App:
         def load():
             if origin == "claude-terminal":
                 turns = claude_jsonl_turns(path)
-                title = title_from_claude_jsonl(path)
+                metadata = claude_session_metadata(path)
+                title = metadata["title"]
+                context = metadata["context"]
             else:
                 turns = codex_rollout_turns(path)
                 title = ""
+                context = codex_context_from_rollout(path)
             self.events.put(
                 {
                     "kind": "external_session_loaded",
                     "session_id": session_id,
                     "turns": turns,
                     "title": title,
+                    "context": context,
                     "signature": self._source_signature(path),
                 }
             )
@@ -3797,17 +3955,27 @@ class App:
                 self.send_btn.configure(text="Send", state="normal")
                 self.stop_btn.pack_forget()
                 self.set_activity("error")
+        elif kind == "context_usage":
+            context = event.get("context") or {}
+            if self.current_session and context:
+                previous = self.current_session.get("context") or {}
+                context["compact_count"] = previous.get("compact_count", 0)
+                self.current_session["context"] = context
+                self.update_context_indicator(context)
         elif kind == "external_session_loaded":
             session_id = event.get("session_id")
             self.loading_external_sessions.discard(session_id)
             turns = event.get("turns") or []
             source_title = clean_text(event.get("title"))
+            context = event.get("context") or {}
             for session in self.external_sessions:
                 if session.get("id") == session_id:
                     session["turns"] = turns
                     session["transcript_loaded"] = True
                     if source_title:
                         session["title"] = source_title
+                    if context:
+                        session["context"] = context
                     break
             if self.current_session and self.current_session.get("id") == session_id:
                 chat_at_bottom = self.chat.yview()[1] >= 0.995
@@ -3818,6 +3986,9 @@ class App:
                 self.current_session["transcript_loaded"] = True
                 if source_title:
                     self.current_session["title"] = source_title
+                if context:
+                    self.current_session["context"] = context
+                    self.update_context_indicator(context)
                 self.current_session["updated_at"] = now_iso()
                 self.live_source_signature = event.get("signature")
                 self._clear_views()

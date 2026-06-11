@@ -11,6 +11,11 @@ right-side chat lane, with agent responses kept on the left. Substantial web
 research appears as a collapsed, scrollable report card inside Conversation;
 raw tool payloads remain in Work Log.
 
+Codex and Claude sessions show their active context usage in the top bar. The
+conversation scrollbar progresses from green to yellow, orange, and red as the
+context window fills. Claude's meter follows automatic compaction, so transcript
+length is not mistaken for active context usage.
+
 The sidebar provides per-agent model and effort controls. Defaults favor
 responsive general use: Codex GPT-5.5 at medium effort, Claude Sonnet at medium
 effort, and Gemini Auto. Preferences are remembered separately for each agent.
