@@ -1280,6 +1280,64 @@ class StreamCliBackend(BaseBackend):
         self.interrupt()
 
 
+class CustomCliBackend(StreamCliBackend):
+    def __init__(self, events, spec):
+        super().__init__(events, spec["key"])
+        self.spec = spec
+
+    def start_turn(self, session, turn, prompt, context_text=""):
+        def run():
+            template = clean_text(self.spec.get("command"))
+            payload = prompt
+            if context_text:
+                payload = context_text.strip() + "\n\n" + prompt.strip()
+            if not template:
+                self.emit("error", text="Custom client command is empty.")
+                return
+            uses_placeholder = "{prompt}" in template
+            if uses_placeholder:
+                command = template.replace("{prompt}", shlex.quote(payload))
+                stdin_data = None
+            else:
+                command = template
+                stdin_data = payload + "\n"
+            self.emit("work", text="$ " + command, tag="command")
+            with self.lock:
+                self.running = subprocess.Popen(
+                    ["bash", "-lc", command],
+                    cwd=session["cwd"],
+                    stdin=subprocess.PIPE if stdin_data is not None else None,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            try:
+                stdout, stderr = self.running.communicate(input=stdin_data)
+                if stderr:
+                    self.emit("work", text=stderr, tag="system")
+                if stdout:
+                    self.emit(
+                        "assistant_message",
+                        text=clean_text(stdout),
+                        speaker=clean_text(self.spec.get("label")).upper(),
+                    )
+                status = "completed" if self.running.returncode == 0 else "error"
+                if status == "error" and not stderr:
+                    self.emit(
+                        "error",
+                        text=f"Custom client exited with status {self.running.returncode}.",
+                    )
+                self.emit("turn_done", status=status)
+            except Exception as exc:
+                self.emit("error", text=str(exc))
+                self.emit("turn_done", status="error")
+            finally:
+                with self.lock:
+                    self.running = None
+
+        threading.Thread(target=run, daemon=True).start()
+
+
 class TerminalShell:
     def __init__(self, events):
         self.events = events
@@ -1681,14 +1739,29 @@ class App:
         self.session_aliases = self.config.get("session_aliases") or {}
         if not isinstance(self.session_aliases, dict):
             self.session_aliases = {}
+        self.custom_clients = self.config.get("custom_clients") or []
+        if not isinstance(self.custom_clients, list):
+            self.custom_clients = []
         self.agent_specs = [
             {"key": "codex", "label": "Codex", "color": CODEX},
             {"key": "claude", "label": "Claude", "color": CLAUDE},
             {"key": "gemini", "label": "Gemini", "color": GEMINI},
         ]
+        for client in self.custom_clients:
+            key = clean_text(client.get("key"))
+            label = clean_text(client.get("label"))
+            command = clean_text(client.get("command"))
+            if key and label and command:
+                self.agent_specs.append(
+                    {"key": key, "label": label, "color": "#67e8f9", "custom": True}
+                )
         self.agent_map = {spec["key"]: spec for spec in self.agent_specs}
         saved_agent_settings = self.config.get("agent_settings") or {}
         self.agent_settings = deepcopy(DEFAULT_AGENT_SETTINGS)
+        for client in self.custom_clients:
+            key = clean_text(client.get("key"))
+            if key:
+                self.agent_settings[key] = {"model": "Default", "effort": "Default"}
         for agent_key, settings in saved_agent_settings.items():
             if agent_key in self.agent_settings and isinstance(settings, dict):
                 self.agent_settings[agent_key].update(settings)
@@ -1727,6 +1800,10 @@ class App:
             "claude": ClaudeBackend(self.events),
             "gemini": GeminiBackend(self.events),
         }
+        for client in self.custom_clients:
+            key = clean_text(client.get("key"))
+            if key in self.agent_map:
+                self.backends[key] = CustomCliBackend(self.events, client)
         self.terminal_shell = TerminalShell(self.events)
         if shutil.which("codex"):
             self.backends["codex"].start(self.cwd.get())
@@ -2445,6 +2522,63 @@ class App:
                 cursor="hand2",
             ).pack(side="right", padx=10)
 
+        custom = tk.Frame(
+            body,
+            bg="#111c27",
+            highlightbackground="#35506a",
+            highlightthickness=1,
+        )
+        custom.pack(fill="x", pady=(12, 4))
+        tk.Label(
+            custom,
+            text="Another command-line agent",
+            bg="#111c27",
+            fg=TEXT,
+            font=("Sans", 10, "bold"),
+        ).pack(side="left", padx=12, pady=12)
+        tk.Button(
+            custom,
+            text="Add custom CLI",
+            command=lambda: self.add_custom_client(dialog),
+            bg="#334155",
+            fg="white",
+            relief="flat",
+            padx=12,
+            pady=6,
+            cursor="hand2",
+        ).pack(side="right", padx=10)
+
+        if self.custom_clients:
+            tk.Label(
+                body,
+                text="CUSTOM CLIENTS",
+                bg=BG,
+                fg=MUTED,
+                font=("Sans", 9, "bold"),
+            ).pack(anchor="w", pady=(12, 3))
+            for client in self.custom_clients:
+                row = tk.Frame(body, bg=PANEL)
+                row.pack(fill="x", pady=2)
+                tk.Label(
+                    row,
+                    text=clean_text(client.get("label")),
+                    bg=PANEL,
+                    fg=TEXT,
+                    anchor="w",
+                ).pack(side="left", fill="x", expand=True, padx=12, pady=8)
+                tk.Button(
+                    row,
+                    text="Remove",
+                    command=lambda key=client.get("key"): self.remove_custom_client(
+                        key, dialog
+                    ),
+                    bg="#4a1d1d",
+                    fg="#fca5a5",
+                    relief="flat",
+                    padx=10,
+                    cursor="hand2",
+                ).pack(side="right", padx=8)
+
         tk.Button(
             body,
             text="Close",
@@ -2459,6 +2593,87 @@ class App:
         x = self.win.winfo_rootx() + (self.win.winfo_width() - dialog.winfo_reqwidth()) // 2
         y = self.win.winfo_rooty() + (self.win.winfo_height() - dialog.winfo_reqheight()) // 2
         dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def add_custom_client(self, parent):
+        label = simpledialog.askstring(
+            "Add custom CLI",
+            "Client name shown in Agent Workbench:",
+            parent=parent,
+        )
+        label = clean_text(label)
+        if not label:
+            return
+        command = simpledialog.askstring(
+            "Add custom CLI",
+            (
+                "Command template.\n\n"
+                "Use {prompt} where the prompt belongs, for example:\n"
+                "aider --message {prompt}\n\n"
+                "If omitted, the prompt is sent to standard input."
+            ),
+            parent=parent,
+        )
+        command = clean_text(command)
+        if not command:
+            return
+        try:
+            executable = shlex.split(command.replace("{prompt}", "prompt"))[0]
+        except (ValueError, IndexError):
+            messagebox.showerror("Add custom CLI", "The command template is not valid.", parent=parent)
+            return
+        if not shutil.which(executable):
+            messagebox.showerror(
+                "Add custom CLI",
+                f"'{executable}' was not found on this machine.",
+                parent=parent,
+            )
+            return
+        base = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "custom"
+        key = "custom-" + base
+        suffix = 2
+        while key in self.agent_map:
+            key = f"custom-{base}-{suffix}"
+            suffix += 1
+        client = {"key": key, "label": label, "command": command}
+        self.custom_clients.append(client)
+        spec = {"key": key, "label": label, "color": "#67e8f9", "custom": True}
+        self.agent_specs.append(spec)
+        self.agent_map[key] = spec
+        self.agent_settings[key] = {"model": "Default", "effort": "Default"}
+        self.backends[key] = CustomCliBackend(self.events, client)
+        self.agent_picker.configure(values=[item["key"] for item in self.agent_specs])
+        self.config["custom_clients"] = self.custom_clients
+        save_json(CONFIG_FILE, self.config)
+        self.active_agent.set(key)
+        parent.destroy()
+        self.on_agent_changed()
+        self.status.set(f"Added {label}. Prompts will run through its local CLI command.")
+
+    def remove_custom_client(self, key, parent):
+        if self.busy and self.active_agent.get() == key:
+            messagebox.showinfo(
+                "Remove custom CLI",
+                "Wait for the current turn to finish before removing this client.",
+                parent=parent,
+            )
+            return
+        backend = self.backends.pop(key, None)
+        if backend:
+            backend.close()
+        self.custom_clients = [
+            client for client in self.custom_clients if client.get("key") != key
+        ]
+        self.agent_specs = [spec for spec in self.agent_specs if spec.get("key") != key]
+        self.agent_map.pop(key, None)
+        self.agent_settings.pop(key, None)
+        self.config["custom_clients"] = self.custom_clients
+        save_json(CONFIG_FILE, self.config)
+        self.agent_picker.configure(values=[item["key"] for item in self.agent_specs])
+        if self.active_agent.get() == key:
+            self.active_agent.set("codex")
+            self.on_agent_changed()
+        parent.destroy()
+        self.status.set("Custom client registration removed. Saved sessions were kept.")
 
     def launch_client_setup(self, command, dialog=None):
         if dialog is not None:
@@ -2675,14 +2890,24 @@ class App:
 
     def refresh_agent_controls(self):
         agent_key = self.active_agent.get()
-        self.model_picker.configure(values=MODEL_OPTIONS[agent_key])
-        self.effort_picker.configure(values=EFFORT_OPTIONS[agent_key])
-        if self.selected_model.get() not in MODEL_OPTIONS[agent_key]:
-            self.selected_model.set(DEFAULT_AGENT_SETTINGS[agent_key]["model"])
-        if self.selected_effort.get() not in EFFORT_OPTIONS[agent_key]:
-            self.selected_effort.set(DEFAULT_AGENT_SETTINGS[agent_key]["effort"])
+        model_options = MODEL_OPTIONS.get(agent_key, ("Default",))
+        effort_options = EFFORT_OPTIONS.get(agent_key, ("Default",))
+        defaults = DEFAULT_AGENT_SETTINGS.get(
+            agent_key, {"model": "Default", "effort": "Default"}
+        )
+        self.model_picker.configure(values=model_options)
+        self.effort_picker.configure(values=effort_options)
+        if self.selected_model.get() not in model_options:
+            self.selected_model.set(defaults["model"])
+        if self.selected_effort.get() not in effort_options:
+            self.selected_effort.set(defaults["effort"])
+        custom = bool(self._agent_spec(agent_key).get("custom"))
+        self.model_picker.configure(state="disabled" if custom else "readonly")
+        self.effort_picker.configure(state="disabled" if custom else "readonly")
         if agent_key == "gemini":
             self.effort_label.configure(text="Effort (managed by Gemini)")
+        elif custom:
+            self.effort_label.configure(text="Effort (managed by client)")
         else:
             self.effort_label.configure(text="Effort")
 
@@ -2833,13 +3058,18 @@ class App:
             self.transfer_source_session_id = self.current_session.get("id")
         self.current_session = deepcopy(session)
         agent_key = session.get("agent", self.active_agent.get())
-        settings = self.agent_settings.get(agent_key, DEFAULT_AGENT_SETTINGS[agent_key])
+        settings = self.agent_settings.get(
+            agent_key,
+            DEFAULT_AGENT_SETTINGS.get(
+                agent_key, {"model": "Default", "effort": "Default"}
+            ),
+        )
         backend = session.get("backend") or {}
         model = backend.get("model") or settings["model"]
         effort = backend.get("effort") or settings["effort"]
-        if model in MODEL_OPTIONS[agent_key]:
+        if model in MODEL_OPTIONS.get(agent_key, ("Default",)):
             self.selected_model.set(model)
-        if effort in EFFORT_OPTIONS[agent_key]:
+        if effort in EFFORT_OPTIONS.get(agent_key, ("Default",)):
             self.selected_effort.set(effort)
         self.refresh_agent_controls()
         self.apply_agent_theme(session.get("agent", self.active_agent.get()))
@@ -3223,6 +3453,20 @@ class App:
     def _current_agent_label(self):
         return self._agent_spec(self.active_agent.get())["label"]
 
+    def _agent_executable(self, agent_key):
+        if agent_key in {"codex", "claude", "gemini"}:
+            return agent_key
+        client = next(
+            (item for item in self.custom_clients if item.get("key") == agent_key),
+            None,
+        )
+        if not client:
+            return ""
+        try:
+            return shlex.split(clean_text(client.get("command")).replace("{prompt}", "prompt"))[0]
+        except (ValueError, IndexError):
+            return ""
+
     def _self_project_context(self, prompt):
         if not re.search(
             r"\b(agent workbench|this app|the app|itself|yourself|self)\b",
@@ -3276,7 +3520,8 @@ class App:
             self.status.set("The agent is still working. Use Stop if you need to interrupt it.")
             return
         agent_key = self.active_agent.get()
-        if not shutil.which(agent_key):
+        executable = self._agent_executable(agent_key)
+        if not executable or not shutil.which(executable):
             self.status.set(
                 f"{self._current_agent_label()} is not installed. Use Add client to connect it."
             )
@@ -3550,6 +3795,7 @@ class App:
                 "agent_settings": self.agent_settings,
                 "last_session_id": self.current_session.get("id") if self.current_session else None,
                 "session_aliases": self.session_aliases,
+                "custom_clients": self.custom_clients,
             }
         )
         save_json(CONFIG_FILE, self.config)

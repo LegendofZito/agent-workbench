@@ -54,6 +54,12 @@ Use **Add client** in the sidebar to connect Codex, Claude Code, or Gemini CLI.
 Installed clients open their own vendor-managed sign-in flow. Missing clients
 link only to the vendor's official installation guide.
 
+Other local command-line agents can be registered with **Add custom CLI**. Enter
+a command template such as `aider --message {prompt}`. If `{prompt}` is omitted,
+Agent Workbench sends the prompt through standard input. Custom definitions are
+stored only in the current user's local configuration and never include or copy
+the client's credentials.
+
 ## Security
 
 This prototype starts agent CLIs in their unrestricted automation modes:
