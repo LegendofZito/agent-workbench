@@ -756,6 +756,42 @@ def rename_claude_session_title(path, session_id, title):
         return False
 
 
+def claude_session_path(session_id, cwd=""):
+    session_id = clean_text(session_id)
+    if not session_id:
+        return ""
+    if cwd:
+        expected = os.path.expanduser(
+            f"~/.claude/projects/{project_key(cwd)}/{session_id}.jsonl"
+        )
+        if os.path.isfile(expected):
+            return expected
+    root = Path(os.path.expanduser("~/.claude/projects"))
+    try:
+        return str(next(root.glob(f"*/{session_id}.jsonl")))
+    except (OSError, StopIteration):
+        return ""
+
+
+def sync_claude_session_title(session):
+    if not session or session.get("agent") != "claude":
+        return False
+    session_id = clean_text((session.get("backend") or {}).get("session_id"))
+    title = clean_text(session.get("title"))
+    if not session_id or not title or title.startswith("New "):
+        return False
+    path = claude_session_path(session_id, session.get("cwd"))
+    if not path:
+        return False
+    if claude_session_metadata(path).get("title") == title:
+        return True
+    updated = rename_claude_session_title(path, session_id, title)
+    if updated:
+        session["source_path"] = path
+        session["source_session_id"] = session_id
+    return updated
+
+
 def gemini_sessions_for_cwd(cwd):
     cmd = [
         "gemini",
@@ -1944,7 +1980,6 @@ class App:
         self.loading_external_sessions = set()
         self.render_generation = 0
         self.report_cards = []
-        self.response_controls = []
         self.artifact_preview_image = None
         self.dnd_available = False
         self.link_counter = 0
@@ -2561,6 +2596,15 @@ class App:
             "<Control-c>",
             lambda _event: self.copy_widget_selection(self.chat),
         )
+        self.chat.bind(
+            "<Command-c>",
+            lambda _event: self.copy_widget_selection(self.chat),
+        )
+        self.chat.bind(
+            "<ButtonRelease-1>",
+            lambda _event: self.chat.tag_raise("sel"),
+        )
+        self.chat.tag_raise("sel")
         self.chat.configure(state="disabled")
 
         self.work = ScrolledText(
@@ -2612,20 +2656,9 @@ class App:
             pady=6,
             cursor="hand2",
         ).pack(side="right")
-        tk.Button(
-            artifacts_header,
-            text="Open",
-            command=self.open_selected_artifact,
-            bg=PANEL_ALT,
-            fg=TEXT,
-            relief="flat",
-            padx=12,
-            pady=6,
-            cursor="hand2",
-        ).pack(side="right", padx=(0, 6))
         self.artifact_hint = tk.Label(
             self.artifacts_tab,
-            text="Drop screenshots, images, text files, or documents here. Files are copied into this session's local artifact folder.",
+            text="Files used in this conversation are saved here automatically.",
             bg=BG,
             fg=MUTED,
             anchor="w",
@@ -2695,28 +2728,6 @@ class App:
         self.artifact_preview_text.bind(
             "<Button-3>", lambda event: self.show_text_menu(event, self.artifact_preview_text)
         )
-        preview_actions = tk.Frame(preview, bg=PANEL)
-        preview_actions.pack(fill="x", padx=18, pady=(0, 16))
-        for label, command in (
-            ("Attach", self.attach_selected_artifact),
-            ("Open", self.open_selected_artifact),
-            ("Copy path", self.copy_selected_artifact_path),
-            ("Rename", self.rename_selected_artifact),
-            ("Delete", self.delete_selected_artifact),
-        ):
-            tk.Button(
-                preview_actions,
-                text=label,
-                command=command,
-                bg=PANEL_ALT,
-                fg=TEXT,
-                activebackground=SIDEBAR_SEL,
-                activeforeground=TEXT,
-                relief="flat",
-                padx=10,
-                pady=5,
-                cursor="hand2",
-            ).pack(side="left", padx=(0, 6))
 
         self.terminal = ScrolledText(
             self.terminal_tab,
@@ -2948,26 +2959,22 @@ class App:
 
     def show_text_menu(self, event, widget):
         menu = tk.Menu(self.win, tearoff=False, bg=PANEL_ALT, fg=TEXT)
-
-        def copy_selection():
-            try:
-                text = widget.get("sel.first", "sel.last")
-            except tk.TclError:
-                return
-            self.copy_text(text)
-
-        menu.add_command(label="Copy selection", command=copy_selection)
+        try:
+            selected_text = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            selected_text = ""
+        menu.add_command(
+            label="Copy",
+            command=lambda value=selected_text: self.copy_text(value),
+        )
         menu.add_command(
             label="Copy all",
             command=lambda: self.copy_text(widget.get("1.0", "end-1c")),
         )
-        try:
-            has_selection = bool(widget.tag_ranges("sel"))
-        except tk.TclError:
-            has_selection = False
-        if not has_selection:
+        if not selected_text:
             menu.entryconfigure(0, state="disabled")
         menu.tk_popup(event.x_root, event.y_root)
+        return "break"
 
     def show_edit_menu(self, event, widget):
         menu = tk.Menu(self.win, tearoff=False, bg=PANEL_ALT, fg=TEXT)
@@ -3025,13 +3032,13 @@ class App:
             initialdir=self.cwd.get(),
         )
         if paths:
-            stored = self.store_artifacts(paths)
+            stored = self.store_artifacts(paths, reveal=not attach_to_prompt)
             if attach_to_prompt:
                 self.queue_attachments(stored)
                 self.notebook.select(self.chat_tab)
                 self.input.focus_set()
 
-    def store_artifacts(self, paths):
+    def store_artifacts(self, paths, reveal=False):
         if not self.current_session:
             self.status.set("Start or open a session before adding files.")
             return []
@@ -3052,7 +3059,8 @@ class App:
                 continue
         self.refresh_artifacts_view(self.current_session)
         if stored:
-            self.notebook.select(self.artifacts_tab)
+            if reveal:
+                self.notebook.select(self.artifacts_tab)
             self.status.set(f"Stored {len(stored)} artifact{'s' if len(stored) != 1 else ''}.")
         else:
             self.status.set("No readable files were added.")
@@ -3092,34 +3100,54 @@ class App:
     def _setup_drag_and_drop(self):
         try:
             self.win.tk.call("package", "require", "tkdnd")
-            self.win.tk.call(
-                "tkdnd::drop_target",
-                "register",
-                self.artifacts_tab._w,
-                "DND_Files",
-            )
-            command = self.win.register(self._handle_drop_data)
-            self.win.tk.call(
-                "bind",
-                self.artifacts_tab._w,
-                "<<Drop>>",
-                f"{command} %D",
-            )
+            artifact_command = self.win.register(self._handle_artifact_drop)
+            conversation_command = self.win.register(self._handle_conversation_drop)
+            for widget, command in (
+                (self.artifacts_tab, artifact_command),
+                (self.chat_tab, conversation_command),
+                (self.chat, conversation_command),
+                (self.input, conversation_command),
+            ):
+                self.win.tk.call(
+                    "tkdnd::drop_target",
+                    "register",
+                    widget._w,
+                    "DND_Files",
+                )
+                self.win.tk.call(
+                    "bind",
+                    widget._w,
+                    "<<Drop>>",
+                    f"{command} %D",
+                )
             self.dnd_available = True
             self.artifact_hint.configure(
-                text="Drop screenshots, images, text files, or documents here. Files are copied into this session's local artifact folder."
+                text="Files used in this conversation are saved here automatically."
             )
         except tk.TclError:
             self.artifact_hint.configure(
-                text="Use Add files to store screenshots and documents. Install Fedora package 'tkdnd' to enable desktop file drops."
+                text="Files attached in Conversation are saved here automatically. Use Add files to store more."
             )
 
-    def _handle_drop_data(self, data):
+    def _drop_paths(self, data):
         try:
-            paths = list(self.win.tk.splitlist(data))
+            return list(self.win.tk.splitlist(data))
         except tk.TclError:
-            paths = [data]
-        self.store_artifacts(paths)
+            return [data]
+
+    def _handle_artifact_drop(self, data):
+        self.store_artifacts(self._drop_paths(data), reveal=True)
+        return "copy"
+
+    def _handle_conversation_drop(self, data):
+        stored = self.store_artifacts(self._drop_paths(data), reveal=False)
+        self.queue_attachments(stored)
+        if stored:
+            self.notebook.select(self.chat_tab)
+            self.input.focus_set()
+            self.status.set(
+                f"Attached {len(stored)} file{'s' if len(stored) != 1 else ''} to the next message."
+            )
         return "copy"
 
     def refresh_artifacts_view(self, session=None):
@@ -3158,7 +3186,9 @@ class App:
     def _clear_artifact_preview(self):
         self.artifact_preview_image = None
         self.artifact_preview_title.configure(text="No artifacts yet")
-        self.artifact_preview_meta.configure(text="Add files or drop them into the Artifacts tab.")
+        self.artifact_preview_meta.configure(
+            text="Drop a file into Conversation or use Add files."
+        )
         self.artifact_preview_image_label.configure(image="", text="")
         self.artifact_preview_text.pack_forget()
 
@@ -3809,6 +3839,12 @@ class App:
 
     def _session_list_label(self, session):
         title = shorten(self._display_session_title(session), 48)
+        backend = session.get("backend") or {}
+        if (
+            session.get("origin", "local") == "local"
+            and not clean_text(backend.get("session_id") or backend.get("thread_id"))
+        ):
+            title = "Draft · " + title
         timestamp = clean_text(session.get("updated_at"))
         try:
             moment = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone()
@@ -3824,6 +3860,9 @@ class App:
     def _session_source_label(self, session):
         origin = session.get("origin", "local")
         if origin == "local":
+            backend = session.get("backend") or {}
+            if not clean_text(backend.get("session_id") or backend.get("thread_id")):
+                return "Draft — not yet created in the agent client"
             return "Agent Workbench session"
         agent = self._agent_spec(session.get("agent"))["label"]
         return f"Imported from {agent}"
@@ -4227,9 +4266,21 @@ class App:
             messagebox.showinfo("Rename", "Name cannot be blank.")
             return
         source_updated = False
-        if session.get("origin") == "codex-terminal":
+        origin = session.get("origin", "local")
+        if origin == "local":
+            session["title"] = alias
+            self.session_aliases.pop(session_alias_key(session), None)
+            self.store.save(session)
+            if session.get("agent") == "claude":
+                source_updated = sync_claude_session_title(session)
+            elif session.get("agent") == "codex":
+                source_updated = rename_codex_thread_title(
+                    (session.get("backend") or {}).get("thread_id"),
+                    alias,
+                )
+        elif origin == "codex-terminal":
             source_updated = rename_codex_thread_title(session.get("source_session_id"), alias)
-        elif session.get("origin") == "claude-terminal":
+        elif origin == "claude-terminal":
             source_updated = rename_claude_session_title(
                 session.get("source_path"),
                 session.get("source_session_id"),
@@ -4240,9 +4291,9 @@ class App:
             self.session_aliases.pop(session_alias_key(session), None)
             self.config["session_aliases"] = self.session_aliases
             save_json(CONFIG_FILE, self.config)
-        else:
+        elif origin != "local":
             self._set_session_alias(session, alias)
-        if session.get("origin", "local") == "local":
+        if origin == "local":
             self.session_title.set(alias)
         self._render_session_list()
         self.open_session(session["id"], remember=False)
@@ -4414,12 +4465,6 @@ class App:
         self.render_generation += 1
         if clear_attachments:
             self.clear_attachments()
-        for control in self.response_controls:
-            try:
-                control.destroy()
-            except tk.TclError:
-                pass
-        self.response_controls = []
         for card in self.report_cards:
             try:
                 card["frame"].destroy()
@@ -4547,31 +4592,10 @@ class App:
             widget.insert("end", text.rstrip() + "\n\n", tag)
         content_end = widget.index("end-1c")
         self._linkify_chat_range(content_start, content_end)
-        if speaker != "YOU":
-            self._append_response_copy_button(text)
+        widget.tag_raise("sel")
         widget.configure(state="disabled")
         if at_bottom:
             widget.see("end")
-
-    def _append_response_copy_button(self, text):
-        frame = tk.Frame(self.chat, bg=self.chat.cget("bg"))
-        tk.Button(
-            frame,
-            text="Copy",
-            command=lambda value=text: self.copy_text(value),
-            bg=PANEL_ALT,
-            fg=MUTED,
-            activebackground=SIDEBAR_SEL,
-            activeforeground=TEXT,
-            relief="flat",
-            padx=9,
-            pady=3,
-            cursor="hand2",
-            font=("Sans", 8),
-        ).pack(side="left")
-        self.response_controls.append(frame)
-        self.chat.window_create("end", window=frame, padx=0, pady=6)
-        self.chat.insert("end", "\n")
 
     def append_report(self, title, text):
         if not text:
@@ -5063,6 +5087,7 @@ class App:
             status = event.get("status", "completed")
             if session and turn:
                 self.store.finish_turn(session, turn, status=status)
+                sync_claude_session_title(session)
             workspace["busy"] = False
             workspace["pending_user_input"] = None
             workspace["live_speaker"] = None
@@ -5138,13 +5163,6 @@ class App:
                 widget = self.chat
                 widget.configure(state="normal")
                 widget.insert("end", "\n\n")
-                response_text = ""
-                if self.current_turn:
-                    items = self.current_turn.get("items") or []
-                    if items and items[-1].get("type") == "agentMessage":
-                        response_text = clean_text(items[-1].get("text"))
-                if response_text:
-                    self._append_response_copy_button(response_text)
                 widget.configure(state="disabled")
                 widget.see("end")
             self.live_speaker = None
@@ -5184,6 +5202,7 @@ class App:
             status = event.get("status", "completed")
             if self.current_turn is not None:
                 self.store.finish_turn(self.current_session, self.current_turn, status=status)
+            sync_claude_session_title(self.current_session)
             self.busy = False
             self.pending_user_input = None
             self.send_btn.configure(text="Send", state="normal")

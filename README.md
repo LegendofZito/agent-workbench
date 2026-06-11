@@ -38,17 +38,18 @@ from the sidebar. Deleting a terminal-backed session also removes it from that
 agent client's resume history after confirmation.
 
 The Artifacts tab stores screenshots, images, text files, and other documents in
-a local folder dedicated to the selected session. Files can be added with the
-file picker or dragged into the tab when TkDND is installed. Images and text
-files have built-in previews; every artifact can be opened or have its local
-path copied. Use **Attach** in the composer or artifact preview to make files
-available to the agent on the next turn. Adding a file from the Artifacts tab
-stores it without sending it.
+a local folder dedicated to the selected session. Drop a file directly into
+Conversation to store it and attach it to the next message, or use **Attach**.
+Images and text files have built-in previews. Adding a file from the Artifacts
+tab stores it without sending it; secondary actions are available by
+right-clicking the file.
 
 Conversation text supports click-drag selection, `Ctrl+C`, right-click copy,
-clickable web links, and clickable existing local paths. Every agent response
-has an inline **Copy** action. New sessions ask for an optional title and
+clickable web links, and clickable existing local paths. Right-clicking selected
+text opens a compact **Copy** menu. New sessions ask for an optional title and
 automatically derive one from the first prompt when the title is left blank.
+Unsent sessions are marked as drafts; once Claude creates the real session,
+Workbench keeps its title synchronized with Claude Code's `/resume` history.
 
 The built-in Terminal tab provides a persistent PTY shell in the selected
 project. It loads the user's normal interactive shell configuration and
