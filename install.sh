@@ -17,6 +17,17 @@ if ! command -v xdg-open >/dev/null 2>&1; then
   printf 'Missing xdg-utils. On Fedora, run: sudo dnf install xdg-utils\n' >&2
   exit 1
 fi
+if ! python3 -c 'import PIL' >/dev/null 2>&1; then
+  printf 'Optional image previews unavailable. On Fedora, run: sudo dnf install python3-pillow\n' >&2
+fi
+if ! python3 - <<'PY' >/dev/null 2>&1
+import tkinter as tk
+root = tk.Tcl()
+root.eval("package require tkdnd")
+PY
+then
+  printf 'Optional drag and drop unavailable. On Fedora, run: sudo dnf install tkdnd\n' >&2
+fi
 
 install -d "${HOME}/.local/bin" "${data_home}/applications" "${data_home}/icons"
 install -d "${config_home}/agent-workbench"

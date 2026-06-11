@@ -2,7 +2,9 @@
 """Agent Workbench for Codex, Claude, and Gemini."""
 
 import fcntl
+import hashlib
 import json
+import mimetypes
 import os
 import pty
 import queue
@@ -17,6 +19,7 @@ import termios
 import threading
 import time
 import uuid
+import urllib.parse
 from copy import deepcopy
 from datetime import datetime, timezone
 
@@ -24,6 +27,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 from pathlib import Path
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = None
+    ImageTk = None
 
 
 APP_ID = "agent-workbench"
@@ -35,20 +44,22 @@ LEGACY_CONFIG_DIR = os.path.join(CONFIG_ROOT, "codex-conversation-viewer")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 INSTALL_INFO_FILE = os.path.join(CONFIG_DIR, "install.json")
 SESSIONS_DIR = os.path.join(CONFIG_DIR, "sessions")
+ARTIFACTS_DIR = os.path.join(CONFIG_DIR, "artifacts")
 
-BG = "#0d1117"
-PANEL = "#151b23"
-TEXT = "#e6edf3"
-MUTED = "#8b949e"
-SIDEBAR = "#11161d"
-SIDEBAR_SEL = "#22303d"
+BG = "#0b0f16"
+PANEL = "#121925"
+PANEL_ALT = "#182131"
+TEXT = "#edf3fb"
+MUTED = "#93a4b8"
+SIDEBAR = "#0e141e"
+SIDEBAR_SEL = "#243249"
 CODEX = "#60a5fa"
 CLAUDE = "#d97757"
 GEMINI = "#a78bfa"
 AGENT_BACKGROUNDS = {
-    "codex": "#101c29",
-    "claude": "#241811",
-    "gemini": "#17172a",
+    "codex": "#111923",
+    "claude": "#171617",
+    "gemini": "#151520",
 }
 AGENT_ACCENTS = {
     "codex": ("#2563eb", "#60a5fa", "#dbeafe", "#ffffff"),
@@ -57,7 +68,7 @@ AGENT_ACCENTS = {
 }
 MODEL_OPTIONS = {
     "codex": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"),
-    "claude": ("sonnet", "opus", "haiku"),
+    "claude": ("Default", "opus", "sonnet", "haiku"),
     "gemini": ("Auto", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"),
 }
 EFFORT_OPTIONS = {
@@ -67,13 +78,13 @@ EFFORT_OPTIONS = {
 }
 DEFAULT_AGENT_SETTINGS = {
     "codex": {"model": "gpt-5.5", "effort": "medium"},
-    "claude": {"model": "sonnet", "effort": "medium"},
+    "claude": {"model": "Default", "effort": "medium"},
     "gemini": {"model": "Auto", "effort": "Default"},
 }
 WORK = "#f59e0b"
 USER = "#79c0ff"
-ACCENT = "#2f81f7"
-BORDER = "#22c55e"
+ACCENT = "#4f8cff"
+BORDER = "#263244"
 ANSI_ESCAPE = re.compile(
     r"(?:\x1B[@-_][0-?]*[ -/]*[@-~])|(?:\x1B\][^\x07]*(?:\x07|\x1B\\))"
 )
@@ -87,8 +98,40 @@ def clean_text(value):
     return str(value or "").replace("\r", "").strip()
 
 
+def prompt_with_attachments(prompt, paths):
+    readable = []
+    for path in paths:
+        candidate = os.path.abspath(os.path.expanduser(str(path)))
+        if os.path.isfile(candidate):
+            readable.append(candidate)
+    if not readable:
+        return prompt
+    files = "\n".join(f"- {path}" for path in readable)
+    return (
+        "The user attached the following local files. Inspect each relevant file "
+        "with the appropriate file or image-reading tool before answering:\n"
+        f"{files}\n\nUser request:\n{prompt}"
+    )
+
+
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
+
+
+def safe_filename(name):
+    name = os.path.basename(clean_text(name))
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" .")
+    return name or "artifact"
+
+
+def unique_destination(directory, name):
+    base, ext = os.path.splitext(safe_filename(name))
+    candidate = os.path.join(directory, base + ext)
+    counter = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{base} {counter}{ext}")
+        counter += 1
+    return candidate
 
 
 def migrate_legacy_config():
@@ -308,6 +351,14 @@ def claude_session_metadata(path):
     except OSError:
         return {"title": "", "context": {}}
     return {"title": title, "context": context}
+
+
+def claude_model_alias(model):
+    value = clean_text(model).lower()
+    for alias in ("opus", "sonnet", "haiku"):
+        if alias in value:
+            return alias
+    return "Default"
 
 
 def title_from_claude_jsonl(path):
@@ -804,7 +855,12 @@ def claude_sessions_for_cwd(cwd):
                 "created_at": iso_from_unix(mtime),
                 "updated_at": iso_from_unix(mtime),
                 "source_path": str(path),
-                "backend": {"session_id": sid},
+                "backend": {
+                    "session_id": sid,
+                    "model": claude_model_alias(
+                        (metadata.get("context") or {}).get("model")
+                    ),
+                },
                 "context": metadata["context"],
                 "turns": [],
                 "transcript_loaded": False,
@@ -940,6 +996,7 @@ class SessionStore:
     def __init__(self):
         ensure_dir(CONFIG_DIR)
         ensure_dir(SESSIONS_DIR)
+        ensure_dir(ARTIFACTS_DIR)
         self.sessions = {}
         self.load()
 
@@ -979,11 +1036,11 @@ class SessionStore:
         except OSError:
             pass
 
-    def new_session(self, agent_key, cwd):
+    def new_session(self, agent_key, cwd, title=""):
         session = self._make_session(
             agent_key=agent_key,
             cwd=cwd,
-            title=f"New {agent_key} session",
+            title=clean_text(title) or f"New {agent_key} session",
             backend={},
             turns=[],
             origin="local",
@@ -1635,7 +1692,7 @@ class ClaudeBackend(StreamCliBackend):
             ]
             model = clean_text(session["backend"].get("model"))
             effort = clean_text(session["backend"].get("effort"))
-            if model:
+            if model and model != "Default":
                 cmd += ["--model", model]
             if effort:
                 cmd += ["--effort", effort]
@@ -1880,6 +1937,11 @@ class App:
         self.loading_external_sessions = set()
         self.render_generation = 0
         self.report_cards = []
+        self.artifact_preview_image = None
+        self.dnd_available = False
+        self.link_counter = 0
+        self.latest_agent_text = ""
+        self.pending_attachments = []
 
         self.win = tk.Tk(className="AgentWorkbench")
         self.win.title(APP_NAME)
@@ -1921,6 +1983,10 @@ class App:
         for agent_key, settings in saved_agent_settings.items():
             if agent_key in self.agent_settings and isinstance(settings, dict):
                 self.agent_settings[agent_key].update(settings)
+        if not self.config.get("client_default_models_v1"):
+            if self.agent_settings["claude"].get("model") == "sonnet":
+                self.agent_settings["claude"]["model"] = "Default"
+            self.config["client_default_models_v1"] = True
         self.cwd = tk.StringVar(master=self.win, value=self.config.get("cwd", os.path.expanduser("~")))
         self.active_agent = tk.StringVar(master=self.win, value=self.config.get("active_agent", "codex"))
         if self.active_agent.get() not in self.agent_map:
@@ -1930,7 +1996,8 @@ class App:
         self.selected_effort = tk.StringVar(master=self.win, value=initial_settings["effort"])
         self.status = tk.StringVar(master=self.win, value="Starting…")
         self.activity_text = tk.StringVar(master=self.win, value="Starting")
-        self.context_text = tk.StringVar(master=self.win, value="Context --")
+        self.context_text = tk.StringVar(master=self.win, value="Active context --")
+        self.attachment_text = tk.StringVar(master=self.win, value="")
         self.session_title = tk.StringVar(master=self.win, value=APP_NAME)
         self.session_label = tk.StringVar(master=self.win, value="No session")
         self.sessions = []
@@ -1949,6 +2016,7 @@ class App:
 
         self._build_style()
         self._build_ui()
+        self._setup_drag_and_drop()
         self.win.bind("<F5>", lambda _e: self.refresh_sessions())
         self.win.bind("<Control-f>", lambda _e: self.session_search.focus_set())
 
@@ -1980,11 +2048,16 @@ class App:
         style.configure("TNotebook", background=BG, borderwidth=0)
         style.configure(
             "TNotebook.Tab",
-            background=PANEL,
+            background="#151d29",
             foreground=TEXT,
-            padding=(14, 8),
+            padding=(16, 9),
+            borderwidth=0,
         )
-        style.map("TNotebook.Tab", background=[("selected", SIDEBAR_SEL)])
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#25344a"), ("active", "#1d293a")],
+            foreground=[("selected", "white")],
+        )
         style.configure(
             "Agent.TCombobox",
             fieldbackground=PANEL,
@@ -2047,6 +2120,20 @@ class App:
             font=("Sans", 9, "bold"),
         )
         self.context_badge.pack(side="right", padx=(0, 4))
+        self.copy_latest_btn = tk.Button(
+            topbar,
+            text="Copy latest",
+            command=self.copy_latest_response,
+            bg=PANEL_ALT,
+            fg=TEXT,
+            activebackground=SIDEBAR_SEL,
+            activeforeground=TEXT,
+            relief="flat",
+            padx=9,
+            pady=4,
+            cursor="hand2",
+        )
+        self.copy_latest_btn.pack(side="right", padx=(0, 4))
 
         content = tk.Frame(right, bg=BORDER)
         content.pack(fill="both", expand=True)
@@ -2064,7 +2151,7 @@ class App:
         self.notebook.add(self.artifacts_tab, text="Artifacts")
         self.notebook.add(self.terminal_tab, text="Terminal")
 
-        self.agent_accent_bar = tk.Frame(self.chat_tab, bg=BG, height=5)
+        self.agent_accent_bar = tk.Frame(self.chat_tab, bg=BG, height=3)
         self.agent_accent_bar.pack(fill="x", padx=8, pady=(8, 0))
         self.agent_accent_bar.pack_propagate(False)
         self.agent_accent_segments = []
@@ -2081,8 +2168,8 @@ class App:
             insertbackground=TEXT,
             relief="flat",
             borderwidth=0,
-            padx=18,
-            pady=14,
+            padx=24,
+            pady=20,
             font=("Sans", 11),
             spacing1=3,
             spacing3=8,
@@ -2139,6 +2226,7 @@ class App:
         )
         self.chat.tag_config("chat_bold", foreground="#f8fafc", font=("Sans", 11, "bold"))
         self.chat.bind("<Configure>", self.update_chat_margins)
+        self.chat.bind("<Button-3>", lambda event: self.show_text_menu(event, self.chat))
         self.chat.configure(state="disabled")
 
         self.work = ScrolledText(
@@ -2149,11 +2237,12 @@ class App:
             insertbackground=TEXT,
             relief="flat",
             borderwidth=0,
-            padx=18,
-            pady=14,
+            padx=20,
+            pady=18,
             font=("Monospace", 10),
         )
         self.work.pack(fill="both", expand=True, padx=8, pady=8)
+        self.work.bind("<Button-3>", lambda event: self.show_text_menu(event, self.work))
         for tag, color in (
             ("command", "#67e08a"),
             ("fileChange", "#f0c24a"),
@@ -2168,41 +2257,132 @@ class App:
         self.work.configure(state="disabled")
 
         artifacts_header = tk.Frame(self.artifacts_tab, bg=BG)
-        artifacts_header.pack(fill="x", padx=8, pady=(8, 0))
+        artifacts_header.pack(fill="x", padx=14, pady=(14, 8))
+        tk.Label(
+            artifacts_header,
+            text="Session files",
+            bg=BG,
+            fg=TEXT,
+            font=("Sans", 12, "bold"),
+        ).pack(side="left")
         tk.Button(
             artifacts_header,
-            text="Open selected",
-            command=self.open_selected_artifact,
+            text="+ Add files",
+            command=lambda: self.choose_artifacts(attach_to_prompt=False),
             bg=ACCENT,
             fg="white",
+            activebackground="#6aa0ff",
+            activeforeground="white",
             relief="flat",
+            padx=12,
+            pady=6,
+            cursor="hand2",
         ).pack(side="right")
-        self.artifact_hint = tk.Label(
+        tk.Button(
             artifacts_header,
-            text="Files mentioned or changed in this session",
+            text="Open",
+            command=self.open_selected_artifact,
+            bg=PANEL_ALT,
+            fg=TEXT,
+            relief="flat",
+            padx=12,
+            pady=6,
+            cursor="hand2",
+        ).pack(side="right", padx=(0, 6))
+        self.artifact_hint = tk.Label(
+            self.artifacts_tab,
+            text="Drop screenshots, images, text files, or documents here. Files are copied into this session's local artifact folder.",
             bg=BG,
             fg=MUTED,
             anchor="w",
         )
-        self.artifact_hint.pack(side="left", padx=(10, 0))
+        self.artifact_hint.pack(fill="x", padx=14, pady=(0, 10))
 
         artifact_frame = tk.Frame(self.artifacts_tab, bg=BG)
-        artifact_frame.pack(fill="both", expand=True, padx=8, pady=8)
+        artifact_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        artifact_list_frame = tk.Frame(artifact_frame, bg=PANEL, width=330)
+        artifact_list_frame.pack(side="left", fill="y")
+        artifact_list_frame.pack_propagate(False)
         self.artifact_list = tk.Listbox(
-            artifact_frame,
+            artifact_list_frame,
             bg=PANEL,
             fg=TEXT,
             selectbackground=SIDEBAR_SEL,
             relief="flat",
             highlightthickness=0,
             activestyle="none",
+            font=("Sans", 10),
         )
-        self.artifact_list.pack(side="left", fill="both", expand=True)
+        self.artifact_list.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
         self.artifact_list.bind("<Double-Button-1>", lambda _e: self.open_selected_artifact())
-        self.artifact_list.bind("<<ListboxSelect>>", lambda _e: None)
-        artifact_scroll = tk.Scrollbar(artifact_frame, command=self.artifact_list.yview)
+        self.artifact_list.bind("<<ListboxSelect>>", lambda _e: self.preview_selected_artifact())
+        self.artifact_list.bind("<Button-3>", self.show_artifact_menu)
+        artifact_scroll = tk.Scrollbar(artifact_list_frame, command=self.artifact_list.yview)
         artifact_scroll.pack(side="right", fill="y")
         self.artifact_list.configure(yscrollcommand=artifact_scroll.set)
+
+        preview = tk.Frame(
+            artifact_frame,
+            bg=PANEL,
+            highlightbackground="#2f3d52",
+            highlightthickness=1,
+        )
+        preview.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        self.artifact_preview_title = tk.Label(
+            preview,
+            text="No artifact selected",
+            bg=PANEL,
+            fg=TEXT,
+            anchor="w",
+            font=("Sans", 12, "bold"),
+        )
+        self.artifact_preview_title.pack(fill="x", padx=18, pady=(16, 4))
+        self.artifact_preview_meta = tk.Label(
+            preview,
+            text="",
+            bg=PANEL,
+            fg=MUTED,
+            anchor="w",
+        )
+        self.artifact_preview_meta.pack(fill="x", padx=18)
+        self.artifact_preview_image_label = tk.Label(preview, bg=PANEL, fg=MUTED)
+        self.artifact_preview_image_label.pack(fill="both", expand=True, padx=18, pady=14)
+        self.artifact_preview_text = ScrolledText(
+            preview,
+            wrap="word",
+            bg="#0d131d",
+            fg=TEXT,
+            relief="flat",
+            borderwidth=0,
+            padx=14,
+            pady=12,
+            font=("Sans", 10),
+        )
+        self.artifact_preview_text.bind(
+            "<Button-3>", lambda event: self.show_text_menu(event, self.artifact_preview_text)
+        )
+        preview_actions = tk.Frame(preview, bg=PANEL)
+        preview_actions.pack(fill="x", padx=18, pady=(0, 16))
+        for label, command in (
+            ("Attach", self.attach_selected_artifact),
+            ("Open", self.open_selected_artifact),
+            ("Copy path", self.copy_selected_artifact_path),
+            ("Rename", self.rename_selected_artifact),
+            ("Delete", self.delete_selected_artifact),
+        ):
+            tk.Button(
+                preview_actions,
+                text=label,
+                command=command,
+                bg=PANEL_ALT,
+                fg=TEXT,
+                activebackground=SIDEBAR_SEL,
+                activeforeground=TEXT,
+                relief="flat",
+                padx=10,
+                pady=5,
+                cursor="hand2",
+            ).pack(side="left", padx=(0, 6))
 
         self.terminal = ScrolledText(
             self.terminal_tab,
@@ -2262,17 +2442,39 @@ class App:
         composer = tk.Frame(content, bg=BG)
         self.composer = composer
         composer.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.attachment_bar = tk.Frame(composer, bg=PANEL)
+        tk.Label(
+            self.attachment_bar,
+            textvariable=self.attachment_text,
+            bg=PANEL,
+            fg="#bfdbfe",
+            anchor="w",
+            font=("Sans", 9),
+        ).pack(side="left", fill="x", expand=True, padx=12, pady=7)
+        tk.Button(
+            self.attachment_bar,
+            text="Clear",
+            command=self.clear_attachments,
+            bg=PANEL_ALT,
+            fg=TEXT,
+            activebackground=SIDEBAR_SEL,
+            activeforeground=TEXT,
+            relief="flat",
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        ).pack(side="right", padx=6, pady=4)
         self.input = ScrolledText(
             composer,
             wrap="word",
             height=3,
-            bg=PANEL,
+            bg=PANEL_ALT,
             fg=TEXT,
             insertbackground=TEXT,
             relief="flat",
             borderwidth=0,
-            padx=14,
-            pady=12,
+            padx=16,
+            pady=14,
             font=("Sans", 11),
         )
         self.input.pack(fill="x", padx=8)
@@ -2280,14 +2482,41 @@ class App:
         self.input.bind("<KP_Enter>", self.handle_prompt_return)
         self.input.bind("<Control-Return>", lambda _e: self.send() or "break")
         self.input.bind("<Command-Return>", lambda _e: self.send() or "break")
+        self.input.bind("<Button-3>", lambda event: self.show_edit_menu(event, self.input))
 
         bar = tk.Frame(composer, bg=BG)
         bar.pack(fill="x", padx=8, pady=(6, 8))
         self.hint = tk.Label(bar, textvariable=self.status, bg=BG, fg=MUTED, anchor="w")
         self.hint.pack(side="left", fill="x", expand=True)
         self.stop_btn = tk.Button(bar, text="Stop", command=self.stop, bg="#9f2d2d", fg="white", relief="flat")
-        self.send_btn = tk.Button(bar, text="Send", command=self.send, bg=ACCENT, fg="white", relief="flat")
+        self.attach_btn = tk.Button(
+            bar,
+            text="Attach",
+            command=lambda: self.choose_artifacts(attach_to_prompt=True),
+            bg=PANEL_ALT,
+            fg=TEXT,
+            activebackground=SIDEBAR_SEL,
+            activeforeground=TEXT,
+            relief="flat",
+            padx=12,
+            pady=6,
+            cursor="hand2",
+        )
+        self.send_btn = tk.Button(
+            bar,
+            text="Send",
+            command=self.send,
+            bg=ACCENT,
+            fg="white",
+            activebackground="#6aa0ff",
+            activeforeground="white",
+            relief="flat",
+            padx=16,
+            pady=6,
+            cursor="hand2",
+        )
         self.send_btn.pack(side="right")
+        self.attach_btn.pack(side="right", padx=(0, 6))
         self.notebook.bind("<<NotebookTabChanged>>", self.on_notebook_tab_changed)
         self.win.after(250, self.animate_activity)
 
@@ -2329,18 +2558,22 @@ class App:
         used = int(context.get("used") or 0)
         limit = int(context.get("limit") or 0)
         if used <= 0 or limit <= 0:
-            self.context_text.set("Context --")
+            self.context_text.set("Active context --")
             bg, fg, thumb = "#24303c", "#cbd5e1", "#64748b"
         else:
             percent = min(100, round(used * 100 / limit))
             used_label = f"{used / 1_000_000:.1f}M" if used >= 1_000_000 else f"{round(used / 1000)}K"
             limit_label = f"{limit // 1_000_000}M" if limit >= 1_000_000 else f"{limit // 1000}K"
-            self.context_text.set(f"Context {percent}% · {used_label}/{limit_label}")
-            if percent < 50:
+            compact_count = int(context.get("compact_count") or 0)
+            compact_label = f" · compacted {compact_count}×" if compact_count else ""
+            self.context_text.set(
+                f"Active {percent}% · {used_label}/{limit_label}{compact_label}"
+            )
+            if percent < 40:
                 bg, fg, thumb = "#16351f", "#bbf7d0", "#22c55e"
-            elif percent < 75:
+            elif percent < 60:
                 bg, fg, thumb = "#3b350b", "#fef08a", "#eab308"
-            elif percent < 90:
+            elif percent < 80:
                 bg, fg, thumb = "#4a2b0b", "#fed7aa", "#f97316"
             else:
                 bg, fg, thumb = "#4a1d1d", "#fecaca", "#ef4444"
@@ -2379,31 +2612,324 @@ class App:
             card_width = max(420, width - 90)
             card["frame"].configure(width=card_width)
 
+    def show_text_menu(self, event, widget):
+        menu = tk.Menu(self.win, tearoff=False, bg=PANEL_ALT, fg=TEXT)
+
+        def copy_selection():
+            try:
+                text = widget.get("sel.first", "sel.last")
+            except tk.TclError:
+                return
+            self.copy_text(text)
+
+        menu.add_command(label="Copy selection", command=copy_selection)
+        menu.add_command(
+            label="Copy all",
+            command=lambda: self.copy_text(widget.get("1.0", "end-1c")),
+        )
+        try:
+            has_selection = bool(widget.tag_ranges("sel"))
+        except tk.TclError:
+            has_selection = False
+        if not has_selection:
+            menu.entryconfigure(0, state="disabled")
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def show_edit_menu(self, event, widget):
+        menu = tk.Menu(self.win, tearoff=False, bg=PANEL_ALT, fg=TEXT)
+        menu.add_command(label="Cut", command=lambda: widget.event_generate("<<Cut>>"))
+        menu.add_command(label="Copy", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="Paste", command=lambda: widget.event_generate("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="Select all", command=lambda: widget.tag_add("sel", "1.0", "end"))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def copy_text(self, text):
+        text = str(text or "")
+        if not text:
+            return
+        self.win.clipboard_clear()
+        self.win.clipboard_append(text)
+        self.win.update_idletasks()
+        self.status.set("Copied to clipboard.")
+
+    def copy_latest_response(self):
+        if not self.latest_agent_text:
+            self.status.set("No agent response is available to copy.")
+            return
+        self.copy_text(self.latest_agent_text)
+
+    def _artifact_session_key(self, session):
+        raw = clean_text(
+            (session or {}).get("source_session_id")
+            or (session or {}).get("id")
+            or "unassigned"
+        )
+        label = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-")[:48] or "session"
+        return f"{label}-{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:8]}"
+
+    def _artifact_directory(self, session=None):
+        directory = os.path.join(
+            ARTIFACTS_DIR,
+            self._artifact_session_key(session or self.current_session),
+        )
+        ensure_dir(directory)
+        return directory
+
+    def choose_artifacts(self, attach_to_prompt=True):
+        paths = filedialog.askopenfilenames(
+            title="Add artifacts",
+            parent=self.win,
+            initialdir=self.cwd.get(),
+        )
+        if paths:
+            stored = self.store_artifacts(paths)
+            if attach_to_prompt:
+                self.queue_attachments(stored)
+                self.notebook.select(self.chat_tab)
+                self.input.focus_set()
+
+    def store_artifacts(self, paths):
+        if not self.current_session:
+            self.status.set("Start or open a session before adding files.")
+            return []
+        directory = self._artifact_directory()
+        stored = []
+        for source in paths:
+            source = urllib.parse.unquote(str(source or "").strip())
+            if source.startswith("file://"):
+                source = urllib.parse.urlparse(source).path
+            source = os.path.abspath(os.path.expanduser(source))
+            if not os.path.isfile(source):
+                continue
+            destination = unique_destination(directory, os.path.basename(source))
+            try:
+                shutil.copy2(source, destination)
+                stored.append(destination)
+            except OSError:
+                continue
+        self.refresh_artifacts_view(self.current_session)
+        if stored:
+            self.notebook.select(self.artifacts_tab)
+            self.status.set(f"Stored {len(stored)} artifact{'s' if len(stored) != 1 else ''}.")
+        else:
+            self.status.set("No readable files were added.")
+        return stored
+
+    def queue_attachments(self, paths):
+        for path in paths:
+            if path and path not in self.pending_attachments and os.path.isfile(path):
+                self.pending_attachments.append(path)
+        self._update_attachment_bar()
+
+    def attach_selected_artifact(self):
+        item = self._selected_artifact()
+        if item:
+            self.queue_attachments([item["path"]])
+            self.notebook.select(self.chat_tab)
+            self.input.focus_set()
+
+    def clear_attachments(self):
+        self.pending_attachments = []
+        self._update_attachment_bar()
+
+    def _update_attachment_bar(self):
+        count = len(self.pending_attachments)
+        if not count:
+            self.attachment_text.set("")
+            self.attachment_bar.pack_forget()
+            return
+        names = ", ".join(os.path.basename(path) for path in self.pending_attachments[:3])
+        if count > 3:
+            names += f", +{count - 3} more"
+        self.attachment_text.set(
+            f"{count} file{'s' if count != 1 else ''} attached: {names}"
+        )
+        self.attachment_bar.pack(fill="x", padx=8, pady=(0, 6), before=self.input)
+
+    def _setup_drag_and_drop(self):
+        try:
+            self.win.tk.call("package", "require", "tkdnd")
+            self.win.tk.call(
+                "tkdnd::drop_target",
+                "register",
+                self.artifacts_tab._w,
+                "DND_Files",
+            )
+            command = self.win.register(self._handle_drop_data)
+            self.win.tk.call(
+                "bind",
+                self.artifacts_tab._w,
+                "<<Drop>>",
+                f"{command} %D",
+            )
+            self.dnd_available = True
+            self.artifact_hint.configure(
+                text="Drop screenshots, images, text files, or documents here. Files are copied into this session's local artifact folder."
+            )
+        except tk.TclError:
+            self.artifact_hint.configure(
+                text="Use Add files to store screenshots and documents. Install Fedora package 'tkdnd' to enable desktop file drops."
+            )
+
+    def _handle_drop_data(self, data):
+        try:
+            paths = list(self.win.tk.splitlist(data))
+        except tk.TclError:
+            paths = [data]
+        self.store_artifacts(paths)
+        return "copy"
+
     def refresh_artifacts_view(self, session=None):
         session = session or self.current_session
         self.artifact_list.delete(0, "end")
         self.artifacts = self._artifact_items_for_session(session) if session else []
         for item in self.artifacts:
-            self.artifact_list.insert("end", item["label"])
+            prefix = "● " if item.get("stored") else "↗ "
+            self.artifact_list.insert("end", prefix + item["label"])
         if self.artifacts:
             self.artifact_list.selection_set(0)
+            self.preview_selected_artifact()
+        else:
+            self._clear_artifact_preview()
 
     def open_selected_artifact(self):
-        if not getattr(self, "artifacts", None):
+        item = self._selected_artifact()
+        if not item:
             return
-        selection = self.artifact_list.curselection()
-        if not selection:
-            return
-        idx = selection[0]
-        if idx >= len(self.artifacts):
-            return
-        path = self.artifacts[idx]["path"]
+        path = item["path"]
         if not path:
             return
         try:
             subprocess.Popen(["xdg-open", path])
         except Exception as exc:
             messagebox.showerror("Open artifact", str(exc))
+
+    def _selected_artifact(self):
+        if not getattr(self, "artifacts", None):
+            return None
+        selection = self.artifact_list.curselection()
+        if not selection or selection[0] >= len(self.artifacts):
+            return None
+        return self.artifacts[selection[0]]
+
+    def _clear_artifact_preview(self):
+        self.artifact_preview_image = None
+        self.artifact_preview_title.configure(text="No artifacts yet")
+        self.artifact_preview_meta.configure(text="Add files or drop them into the Artifacts tab.")
+        self.artifact_preview_image_label.configure(image="", text="")
+        self.artifact_preview_text.pack_forget()
+
+    def preview_selected_artifact(self):
+        item = self._selected_artifact()
+        if not item:
+            self._clear_artifact_preview()
+            return
+        path = item["path"]
+        self.artifact_preview_image = None
+        self.artifact_preview_text.pack_forget()
+        self.artifact_preview_image_label.configure(image="", text="")
+        size = os.path.getsize(path) if os.path.isfile(path) else 0
+        mime = mimetypes.guess_type(path)[0] or "file"
+        self.artifact_preview_title.configure(text=os.path.basename(path))
+        self.artifact_preview_meta.configure(
+            text=f"{mime} · {size / 1024:.1f} KB · {path}"
+        )
+        if Image and ImageTk and mime.startswith("image/"):
+            try:
+                image = Image.open(path)
+                image.thumbnail((760, 520))
+                self.artifact_preview_image = ImageTk.PhotoImage(image)
+                self.artifact_preview_image_label.configure(image=self.artifact_preview_image)
+                return
+            except (OSError, ValueError):
+                pass
+        if mime.startswith("text/") or os.path.splitext(path)[1].lower() in {
+            ".md", ".json", ".jsonl", ".log", ".py", ".js", ".ts", ".tsx",
+            ".jsx", ".css", ".html", ".yaml", ".yml", ".toml", ".ini",
+        }:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as handle:
+                    text = handle.read(200_000)
+                self.artifact_preview_text.configure(state="normal")
+                self.artifact_preview_text.delete("1.0", "end")
+                self.artifact_preview_text.insert("1.0", text)
+                self.artifact_preview_text.configure(state="disabled")
+                self.artifact_preview_text.pack(
+                    fill="both", expand=True, padx=18, pady=14
+                )
+                return
+            except OSError:
+                pass
+        self.artifact_preview_image_label.configure(
+            text="Preview unavailable\n\nOpen the artifact with its default desktop application.",
+            justify="center",
+        )
+
+    def copy_selected_artifact_path(self):
+        item = self._selected_artifact()
+        if item:
+            self.copy_text(item["path"])
+
+    def rename_selected_artifact(self):
+        item = self._selected_artifact()
+        if not item or not item.get("stored"):
+            self.status.set("Only stored session artifacts can be renamed.")
+            return
+        name = simpledialog.askstring(
+            "Rename artifact",
+            "New file name:",
+            initialvalue=os.path.basename(item["path"]),
+            parent=self.win,
+        )
+        if not clean_text(name):
+            return
+        destination = unique_destination(
+            os.path.dirname(item["path"]),
+            safe_filename(name),
+        )
+        try:
+            os.rename(item["path"], destination)
+        except OSError as exc:
+            messagebox.showerror("Rename artifact", str(exc))
+            return
+        self.refresh_artifacts_view(self.current_session)
+
+    def delete_selected_artifact(self):
+        item = self._selected_artifact()
+        if not item or not item.get("stored"):
+            self.status.set("Only stored session artifacts can be deleted here.")
+            return
+        if not messagebox.askyesno(
+            "Delete artifact",
+            f"Delete {os.path.basename(item['path'])} from this session?",
+            parent=self.win,
+        ):
+            return
+        try:
+            os.unlink(item["path"])
+        except OSError as exc:
+            messagebox.showerror("Delete artifact", str(exc))
+            return
+        self.refresh_artifacts_view(self.current_session)
+
+    def show_artifact_menu(self, event):
+        index = self.artifact_list.nearest(event.y)
+        if index < 0 or index >= len(getattr(self, "artifacts", [])):
+            return
+        self.artifact_list.selection_clear(0, "end")
+        self.artifact_list.selection_set(index)
+        self.preview_selected_artifact()
+        menu = tk.Menu(self.win, tearoff=False, bg=PANEL_ALT, fg=TEXT)
+        menu.add_command(label="Attach to prompt", command=self.attach_selected_artifact)
+        menu.add_command(label="Open", command=self.open_selected_artifact)
+        menu.add_command(label="Copy path", command=self.copy_selected_artifact_path)
+        menu.add_command(label="Rename", command=self.rename_selected_artifact)
+        menu.add_command(label="Delete", command=self.delete_selected_artifact)
+        if not self.artifacts[index].get("stored"):
+            menu.entryconfigure(3, state="disabled")
+            menu.entryconfigure(4, state="disabled")
+        menu.tk_popup(event.x_root, event.y_root)
 
     def append_terminal(self, text):
         if not text:
@@ -3019,6 +3545,18 @@ class App:
 
     def _artifact_items_for_session(self, session):
         paths = set()
+        directory = self._artifact_directory(session)
+        items = []
+        for name in sorted(os.listdir(directory), key=str.lower):
+            path = os.path.join(directory, name)
+            if os.path.isfile(path):
+                items.append(
+                    {
+                        "path": path,
+                        "label": name,
+                        "stored": True,
+                    }
+                )
         for turn in session.get("turns") or []:
             for item in turn.get("items") or []:
                 if item.get("type") == "fileChange":
@@ -3027,14 +3565,22 @@ class App:
                         if path:
                             paths.add(path)
                 self._collect_artifact_paths(item, paths)
-        items = []
         for path in sorted(paths, key=lambda p: p.lower()):
-            label = path
-            if os.path.exists(path) and os.path.isdir(path):
-                label = f"{path} [dir]"
-            elif os.path.exists(path):
-                label = f"{path} [file]"
-            items.append({"path": path, "label": label})
+            resolved = os.path.expanduser(path)
+            if not os.path.isabs(resolved):
+                resolved = os.path.join(session.get("cwd") or self.cwd.get(), resolved)
+            resolved = os.path.abspath(resolved)
+            if not os.path.exists(resolved):
+                continue
+            if any(existing["path"] == resolved for existing in items):
+                continue
+            items.append(
+                {
+                    "path": resolved,
+                    "label": os.path.basename(resolved) or resolved,
+                    "stored": False,
+                }
+            )
         return items
 
     def _set_session_alias(self, session, alias):
@@ -3376,12 +3922,14 @@ class App:
 
     def _clear_views(self):
         self.render_generation += 1
+        self.clear_attachments()
         for card in self.report_cards:
             try:
                 card["frame"].destroy()
             except tk.TclError:
                 pass
         self.report_cards = []
+        self.latest_agent_text = ""
         for widget in (self.chat, self.work):
             widget.configure(state="normal")
             widget.delete("1.0", "end")
@@ -3417,6 +3965,7 @@ class App:
         elif typ == "agentMessage":
             text = self._extract_agent_text(item)
             if text:
+                self.latest_agent_text = text
                 self.append_chat(self._agent_spec(agent_key)["label"].upper(), text, "assistant")
         elif typ == "report":
             self.append_report(
@@ -3491,11 +4040,16 @@ class App:
             head_tag = "claude_head"
         elif speaker == "GEMINI":
             head_tag = "gemini_head"
+        if speaker != "YOU":
+            self.latest_agent_text = text
         widget.insert("end", speaker + "\n", head_tag)
+        content_start = widget.index("end-1c")
         if tag == "assistant":
             self._insert_formatted_chat(text)
         else:
             widget.insert("end", text.rstrip() + "\n\n", tag)
+        content_end = widget.index("end-1c")
+        self._linkify_chat_range(content_start, content_end)
         widget.configure(state="disabled")
         if at_bottom:
             widget.see("end")
@@ -3533,6 +4087,7 @@ class App:
         )
         content.insert("1.0", text)
         content.configure(state="disabled")
+        content.bind("<Button-3>", lambda event: self.show_text_menu(event, content))
         card_state = {"expanded": False}
 
         def toggle():
@@ -3563,7 +4118,20 @@ class App:
             pady=10,
             cursor="hand2",
         )
-        button.pack(fill="x")
+        button.pack(side="left", fill="x", expand=True)
+        tk.Button(
+            header,
+            text="Copy",
+            command=lambda value=text: self.copy_text(value),
+            bg="#17283a",
+            fg="#bfdbfe",
+            activebackground="#21364c",
+            activeforeground="white",
+            relief="flat",
+            padx=14,
+            pady=10,
+            cursor="hand2",
+        ).pack(side="right")
         frame.configure(height=44)
         widget.window_create("end", window=frame, padx=18, pady=8)
         widget.insert("end", "\n")
@@ -3571,6 +4139,32 @@ class App:
         widget.configure(state="disabled")
         if at_bottom:
             widget.see("end")
+
+    def _linkify_chat_range(self, start, end):
+        text = self.chat.get(start, end)
+        candidates = []
+        for match in re.finditer(r"https?://[^\s<>()]+", text):
+            target = match.group(0).rstrip(".,;:!?]}")
+            candidates.append((match.start(), match.start() + len(target), target))
+        for match in re.finditer(r"(?<![\w])(?:~?/|/)[^\s`<>]+", text):
+            target = match.group(0).rstrip(".,;:!?]})")
+            path = os.path.abspath(os.path.expanduser(target))
+            if os.path.exists(path):
+                candidates.append((match.start(), match.start() + len(target), path))
+        for offset_start, offset_end, target in candidates:
+            tag = f"link_{self.link_counter}"
+            self.link_counter += 1
+            tag_start = self.chat.index(f"{start}+{offset_start}c")
+            tag_end = self.chat.index(f"{start}+{offset_end}c")
+            self.chat.tag_add(tag, tag_start, tag_end)
+            self.chat.tag_config(tag, foreground="#79b8ff", underline=True)
+            self.chat.tag_bind(tag, "<Enter>", lambda _e: self.chat.configure(cursor="hand2"))
+            self.chat.tag_bind(tag, "<Leave>", lambda _e: self.chat.configure(cursor="xterm"))
+            self.chat.tag_bind(
+                tag,
+                "<Button-1>",
+                lambda _e, value=target: subprocess.Popen(["xdg-open", value]),
+            )
 
     def _insert_inline_chat(self, text, base_tag="assistant"):
         cursor = 0
@@ -3644,7 +4238,16 @@ class App:
         if self.busy:
             messagebox.showinfo("Busy", "Wait for the current turn to finish before starting a new session.")
             return
-        session = self.store.new_session(self.active_agent.get(), self.cwd.get())
+        title = simpledialog.askstring(
+            "New session",
+            "Session title (leave blank to title it from your first prompt):",
+            parent=self.win,
+        )
+        session = self.store.new_session(
+            self.active_agent.get(),
+            self.cwd.get(),
+            title=clean_text(title),
+        )
         self.local_sessions.insert(0, session)
         if self.active_agent.get() == "claude":
             self.sessions = list(self.external_sessions)
@@ -3779,6 +4382,9 @@ class App:
             backend_settings["effort"] = effort
         self._remember_project(self.cwd.get())
         self.input.delete("1.0", "end")
+        attachments = list(self.pending_attachments)
+        backend_prompt = prompt_with_attachments(prompt, attachments)
+        self.clear_attachments()
         self.busy = True
         self.send_btn.configure(text="Send", state="disabled")
         self.stop_btn.configure(state="normal")
@@ -3799,14 +4405,28 @@ class App:
         turn = self._make_turn(prompt)
         user_item = {"type": "userMessage", "content": [{"type": "text", "text": prompt}]}
         self.store.add_item(self.current_session, turn, user_item)
-        self.append_chat("YOU", prompt, "user")
+        visible_prompt = prompt
+        if attachments:
+            names = ", ".join(os.path.basename(path) for path in attachments)
+            visible_prompt += f"\n\nAttached: {names}"
+        self.append_chat("YOU", visible_prompt, "user")
         self.append_work("--- New turn ---", "system")
+        if attachments:
+            self.append_work(
+                "Attached files:\n" + "\n".join(attachments),
+                "fileChange",
+            )
         self.status.set(f"{self._current_agent_label()} is working…")
         self.set_activity("working")
         self._persist_current()
 
         backend = self._current_backend()
-        backend.start_turn(self.current_session, turn, prompt, context_text=context_text)
+        backend.start_turn(
+            self.current_session,
+            turn,
+            backend_prompt,
+            context_text=context_text,
+        )
         self.transfer_source_session_id = None
 
     def stop(self):

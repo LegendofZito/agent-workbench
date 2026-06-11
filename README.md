@@ -12,13 +12,29 @@ research appears as a collapsed, scrollable report card inside Conversation;
 raw tool payloads remain in Work Log.
 
 Codex and Claude sessions show their active context usage in the top bar. The
-conversation scrollbar progresses from green to yellow, orange, and red as the
-context window fills. Claude's meter follows automatic compaction, so transcript
-length is not mistaken for active context usage.
+conversation scrollbar is green below 40%, yellow from 40-60%, orange from
+60-80%, and red above 80%. Claude's meter follows automatic compaction and
+labels compacted sessions, so transcript length is not mistaken for active
+context usage.
 
 The sidebar provides per-agent model and effort controls. Defaults favor
-responsive general use: Codex GPT-5.5 at medium effort, Claude Sonnet at medium
-effort, and Gemini Auto. Preferences are remembered separately for each agent.
+responsive general use: Codex GPT-5.5 at medium effort, the installed Claude
+client's default model at medium effort, and Gemini Auto. Resumed Claude
+terminal sessions retain their detected Opus, Sonnet, or Haiku model family.
+Preferences are remembered separately for each agent.
+
+The Artifacts tab stores screenshots, images, text files, and other documents in
+a local folder dedicated to the selected session. Files can be added with the
+file picker or dragged into the tab when TkDND is installed. Images and text
+files have built-in previews; every artifact can be opened or have its local
+path copied. Use **Attach** in the composer or artifact preview to make files
+available to the agent on the next turn. Adding a file from the Artifacts tab
+stores it without sending it.
+
+Conversation text supports normal selection, right-click copy, clickable web
+links, and clickable existing local paths. **Copy latest** copies the latest
+agent answer. New sessions ask for an optional title and automatically derive
+one from the first prompt when the title is left blank.
 
 The built-in Terminal tab provides a persistent PTY shell in the selected
 project. It loads the user's normal interactive shell configuration and
@@ -33,6 +49,8 @@ supports command history, interactive line input, `Ctrl+C`, and shell restart.
   - `codex`
   - `claude`
   - `gemini`
+- Optional `python3-pillow` for image previews
+- Optional `tkdnd` for desktop drag and drop
 
 ## Run
 
@@ -87,6 +105,9 @@ data under `~/.config/codex-conversation-viewer` is copied automatically on the
 first launch after upgrading. The app also reads local session metadata from
 supported agent tools to populate its session list. It does not include
 analytics or telemetry of its own.
+
+Artifacts remain local under `~/.config/agent-workbench/artifacts`. They are
+never added to the application repository or release archive.
 
 Release downloads contain only the tracked application source, launcher,
 installer, icon, license, and documentation. They do not contain developer or
