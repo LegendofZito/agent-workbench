@@ -39,12 +39,22 @@ Send prompts with `Ctrl+Enter`.
 
 ## Install
 
+Download the latest Linux archive from:
+
+https://github.com/LegendofZito/agent-workbench/releases/latest
+
+Extract it, then run:
+
 ```bash
 ./install.sh
 ```
 
 The installer adds the launcher, executable, and taskbar icon under the user's
 local XDG directories.
+
+Use **Add client** in the sidebar to connect Codex, Claude Code, or Gemini CLI.
+Installed clients open their own vendor-managed sign-in flow. Missing clients
+link only to the vendor's official installation guide.
 
 ## Security
 
@@ -68,6 +78,10 @@ data under `~/.config/codex-conversation-viewer` is copied automatically on the
 first launch after upgrading. The app also reads local session metadata from
 supported agent tools to populate its session list. It does not include
 analytics or telemetry of its own.
+
+Release downloads contain only the tracked application source, launcher,
+installer, icon, license, and documentation. They do not contain developer or
+user sessions, credentials, tokens, local configuration, or account data.
 
 ## License
 

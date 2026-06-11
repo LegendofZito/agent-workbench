@@ -1728,7 +1728,8 @@ class App:
             "gemini": GeminiBackend(self.events),
         }
         self.terminal_shell = TerminalShell(self.events)
-        self.backends["codex"].start(self.cwd.get())
+        if shutil.which("codex"):
+            self.backends["codex"].start(self.cwd.get())
         self.terminal_shell.start(self.cwd.get())
 
         self.refresh_sessions()
@@ -2219,6 +2220,21 @@ class App:
         self.agent_picker.pack(fill="x", pady=(4, 0))
         self.agent_picker.bind("<<ComboboxSelected>>", lambda _e: self.on_agent_changed())
 
+        tk.Button(
+            agent_box,
+            text="+  Add client",
+            command=self.open_add_client_dialog,
+            bg=PANEL,
+            fg=TEXT,
+            activebackground=SIDEBAR_SEL,
+            activeforeground=TEXT,
+            relief="flat",
+            anchor="w",
+            padx=10,
+            pady=5,
+            cursor="hand2",
+        ).pack(fill="x", pady=(6, 0))
+
         self.agent_settings_btn = tk.Button(
             agent_box,
             text="Agent settings  >",
@@ -2337,6 +2353,130 @@ class App:
         self.session_menu.add_command(label="Rename session", command=self.rename_selected_session)
 
         self._refresh_project_list()
+
+    def open_add_client_dialog(self):
+        dialog = tk.Toplevel(self.win)
+        dialog.title("Add agent client")
+        dialog.configure(bg=BG)
+        dialog.transient(self.win)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        body = tk.Frame(dialog, bg=BG, padx=20, pady=18)
+        body.pack(fill="both", expand=True)
+        tk.Label(
+            body,
+            text="Connect an agent client",
+            bg=BG,
+            fg=TEXT,
+            font=("Sans", 14, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            body,
+            text=(
+                "Each client stores its own sign-in. Agent Workbench never receives "
+                "or copies your credentials."
+            ),
+            bg=BG,
+            fg=MUTED,
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", pady=(4, 14))
+
+        clients = (
+            {
+                "name": "Codex",
+                "command": "codex",
+                "connect": "codex login",
+                "docs": "https://developers.openai.com/codex/cli",
+            },
+            {
+                "name": "Claude Code",
+                "command": "claude",
+                "connect": "claude",
+                "docs": "https://docs.anthropic.com/en/docs/claude-code/quickstart",
+            },
+            {
+                "name": "Gemini CLI",
+                "command": "gemini",
+                "connect": "gemini",
+                "docs": "https://geminicli.com/docs/get-started/",
+            },
+        )
+
+        for client in clients:
+            row = tk.Frame(
+                body,
+                bg=PANEL,
+                highlightbackground="#2d3b49",
+                highlightthickness=1,
+            )
+            row.pack(fill="x", pady=4)
+            info = tk.Frame(row, bg=PANEL)
+            info.pack(side="left", fill="x", expand=True, padx=12, pady=10)
+            tk.Label(
+                info,
+                text=client["name"],
+                bg=PANEL,
+                fg=TEXT,
+                font=("Sans", 10, "bold"),
+            ).pack(anchor="w")
+            installed = shutil.which(client["command"]) is not None
+            tk.Label(
+                info,
+                text="Installed" if installed else "Not installed",
+                bg=PANEL,
+                fg="#86efac" if installed else "#facc15",
+            ).pack(anchor="w")
+            action_text = "Connect" if installed else "Install guide"
+            if installed:
+                action = lambda value=client["connect"]: self.launch_client_setup(value, dialog)
+            else:
+                action = lambda url=client["docs"]: subprocess.Popen(["xdg-open", url])
+            tk.Button(
+                row,
+                text=action_text,
+                command=action,
+                bg=ACCENT if installed else "#334155",
+                fg="white",
+                relief="flat",
+                padx=12,
+                pady=6,
+                cursor="hand2",
+            ).pack(side="right", padx=10)
+
+        tk.Button(
+            body,
+            text="Close",
+            command=dialog.destroy,
+            bg=PANEL,
+            fg=TEXT,
+            relief="flat",
+            padx=14,
+            pady=6,
+        ).pack(anchor="e", pady=(12, 0))
+        dialog.update_idletasks()
+        x = self.win.winfo_rootx() + (self.win.winfo_width() - dialog.winfo_reqwidth()) // 2
+        y = self.win.winfo_rooty() + (self.win.winfo_height() - dialog.winfo_reqheight()) // 2
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def launch_client_setup(self, command, dialog=None):
+        if dialog is not None:
+            dialog.destroy()
+        terminals = (
+            ("konsole", ["konsole", "-e", "bash", "-lc"]),
+            ("gnome-terminal", ["gnome-terminal", "--", "bash", "-lc"]),
+            ("xterm", ["xterm", "-e", "bash", "-lc"]),
+        )
+        script = f"{command}; printf '\\nSetup finished. Press Enter to close.\\n'; read"
+        for executable, prefix in terminals:
+            if shutil.which(executable):
+                subprocess.Popen(prefix + [script], cwd=self.cwd.get())
+                self.status.set("Client setup opened. Complete the vendor sign-in there.")
+                return
+        self.notebook.select(self.terminal_tab)
+        self.terminal_shell.send(command + "\n")
+        self.status.set("Client setup started in Terminal.")
 
     def toggle_agent_settings(self):
         self.agent_settings_visible = not self.agent_settings_visible
@@ -3135,6 +3275,22 @@ class App:
         if self.busy:
             self.status.set("The agent is still working. Use Stop if you need to interrupt it.")
             return
+        agent_key = self.active_agent.get()
+        if not shutil.which(agent_key):
+            self.status.set(
+                f"{self._current_agent_label()} is not installed. Use Add client to connect it."
+            )
+            self.open_add_client_dialog()
+            return
+        if agent_key == "codex":
+            codex_backend = self.backends["codex"]
+            if codex_backend.proc is None or codex_backend.proc.poll() is not None:
+                codex_backend.stop_flag.clear()
+                codex_backend.ready.clear()
+                codex_backend.start(self.cwd.get())
+                if not codex_backend.ready.wait(timeout=15):
+                    self.status.set("Codex installed, but its local service did not start.")
+                    return
         if prompt.startswith("/resume"):
             self.input.delete("1.0", "end")
             self.open_session_finder()
