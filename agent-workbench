@@ -4850,21 +4850,37 @@ class App:
 
     def send(self):
         prompt = clean_text(self.input.get("1.0", "end"))
-        if not prompt:
+        attachments = [
+            path for path in self.pending_attachments if path and os.path.isfile(path)
+        ]
+        if not prompt and not attachments:
             return
+        if not prompt:
+            names = ", ".join(os.path.basename(path) for path in attachments)
+            prompt = f"Please inspect and respond to the attached file{'s' if len(attachments) != 1 else ''}: {names}"
         if self.pending_user_input:
             pending = self.pending_user_input
             self.pending_user_input = None
             self.input.delete("1.0", "end")
-            self.append_chat("YOU", prompt, "user")
+            reply = prompt_with_attachments(prompt, attachments)
+            visible_prompt = prompt
+            if attachments:
+                visible_prompt += "\n\nAttached: " + ", ".join(
+                    os.path.basename(path) for path in attachments
+                )
+                self.clear_attachments()
+            self.append_chat("YOU", visible_prompt, "user")
             if self.current_turn is not None:
                 self.store.add_item(
                     self.current_session,
                     self.current_turn,
-                    {"type": "userMessage", "content": [{"type": "text", "text": prompt}]},
+                    {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": visible_prompt}],
+                    },
                 )
             self.backends["codex"].answer_user_input(
-                pending["request_id"], pending["questions"], prompt
+                pending["request_id"], pending["questions"], reply
             )
             self.send_btn.configure(text="Send", state="disabled")
             self.stop_btn.configure(state="normal")
@@ -4919,7 +4935,6 @@ class App:
             backend_settings["effort"] = effort
         self._remember_project(self.cwd.get())
         self.input.delete("1.0", "end")
-        attachments = list(self.pending_attachments)
         backend_prompt = prompt_with_attachments(prompt, attachments)
         self.clear_attachments()
         self.busy = True

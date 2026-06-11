@@ -42,7 +42,8 @@ a local folder dedicated to the selected session. Drop a file directly into
 Conversation to store it and attach it to the next message, or use **Attach**.
 Images and text files have built-in previews. Adding a file from the Artifacts
 tab stores it without sending it; secondary actions are available by
-right-clicking the file.
+right-clicking the file. A queued attachment can be sent without typing a
+separate message; Workbench asks the agent to inspect it.
 
 Conversation text supports click-drag selection, `Ctrl+C`, right-click copy,
 clickable web links, and clickable existing local paths. Right-clicking selected
