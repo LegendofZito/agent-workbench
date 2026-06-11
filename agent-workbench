@@ -2934,10 +2934,12 @@ class App:
             highlightbackground="#35506a",
             highlightthickness=1,
             width=width,
+            cursor="arrow",
         )
         frame.pack_propagate(False)
         header = tk.Frame(frame, bg="#111c27")
         header.pack(fill="x")
+        header.configure(cursor="arrow")
         content = ScrolledText(
             frame,
             wrap="word",
@@ -2980,6 +2982,7 @@ class App:
             font=("Sans", 10, "bold"),
             padx=14,
             pady=10,
+            cursor="hand2",
         )
         button.pack(fill="x")
         frame.configure(height=44)
