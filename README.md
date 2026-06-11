@@ -11,17 +11,31 @@ right-side chat lane, with agent responses kept on the left. Substantial web
 research appears as a collapsed, scrollable report card inside Conversation;
 raw tool payloads remain in Work Log.
 
+Workspace tabs can run multiple independent agent sessions at the same time,
+including several Claude sessions or a mix of Claude, Codex, Gemini, and custom
+CLI agents. Background tabs continue working and display an activity marker.
+Open tabs, selected sessions, agents, projects, models, and effort settings are
+restored after restart. Use `Ctrl+T` for a new tab, `Ctrl+W` to close one, and
+`Ctrl+Tab` to switch.
+
 Codex and Claude sessions show their active context usage in the top bar. The
 conversation scrollbar is green below 40%, yellow from 40-60%, orange from
 60-80%, and red above 80%. Claude's meter follows automatic compaction and
 labels compacted sessions, so transcript length is not mistaken for active
 context usage.
 
-The sidebar provides per-agent model and effort controls. Defaults favor
+The sidebar provides per-agent model and effort controls. Claude choices
+include Fable, Opus, Sonnet, and Haiku. Defaults favor
 responsive general use: Codex GPT-5.5 at medium effort, the installed Claude
 client's default model at medium effort, and Gemini Auto. Resumed Claude
-terminal sessions retain their detected Opus, Sonnet, or Haiku model family.
+terminal sessions retain their detected Fable, Opus, Sonnet, or Haiku model family.
 Preferences are remembered separately for each agent.
+
+Newly named sessions appear immediately, including empty drafts. Claude session
+names are passed into Claude Code so they also appear in its `/resume` picker.
+Sessions can be renamed, moved up or down with persistent ordering, or deleted
+from the sidebar. Deleting a terminal-backed session also removes it from that
+agent client's resume history after confirmation.
 
 The Artifacts tab stores screenshots, images, text files, and other documents in
 a local folder dedicated to the selected session. Files can be added with the
@@ -31,10 +45,10 @@ path copied. Use **Attach** in the composer or artifact preview to make files
 available to the agent on the next turn. Adding a file from the Artifacts tab
 stores it without sending it.
 
-Conversation text supports normal selection, right-click copy, clickable web
-links, and clickable existing local paths. **Copy latest** copies the latest
-agent answer. New sessions ask for an optional title and automatically derive
-one from the first prompt when the title is left blank.
+Conversation text supports click-drag selection, `Ctrl+C`, right-click copy,
+clickable web links, and clickable existing local paths. Every agent response
+has an inline **Copy** action. New sessions ask for an optional title and
+automatically derive one from the first prompt when the title is left blank.
 
 The built-in Terminal tab provides a persistent PTY shell in the selected
 project. It loads the user's normal interactive shell configuration and

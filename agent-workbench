@@ -68,7 +68,7 @@ AGENT_ACCENTS = {
 }
 MODEL_OPTIONS = {
     "codex": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"),
-    "claude": ("Default", "opus", "sonnet", "haiku"),
+    "claude": ("Default", "fable", "opus", "sonnet", "haiku"),
     "gemini": ("Auto", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"),
 }
 EFFORT_OPTIONS = {
@@ -355,7 +355,7 @@ def claude_session_metadata(path):
 
 def claude_model_alias(model):
     value = clean_text(model).lower()
-    for alias in ("opus", "sonnet", "haiku"):
+    for alias in ("fable", "opus", "sonnet", "haiku"):
         if alias in value:
             return alias
     return "Default"
@@ -1086,7 +1086,7 @@ class SessionStore:
         items = [
             s
             for s in self.sessions.values()
-            if s.get("cwd") == cwd and s.get("agent") == agent_key and (s.get("turns") or [])
+            if s.get("cwd") == cwd and s.get("agent") == agent_key
         ]
         items.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
         unique = []
@@ -1138,21 +1138,25 @@ class SessionStore:
 
 
 class BaseBackend:
-    def __init__(self, events):
+    def __init__(self, events, workspace_id=None):
         self.events = events
+        self.workspace_id = workspace_id
         self.stop_flag = threading.Event()
         self.active = False
 
     def emit(self, kind, **payload):
-        self.events.put({"kind": kind, **payload})
+        event = {"kind": kind, **payload}
+        if self.workspace_id:
+            event["workspace_id"] = self.workspace_id
+        self.events.put(event)
 
     def stop(self):
         self.stop_flag.set()
 
 
 class CodexBackend(BaseBackend):
-    def __init__(self, events):
-        super().__init__(events)
+    def __init__(self, events, workspace_id=None):
+        super().__init__(events, workspace_id)
         self.proc = None
         self.cwd = None
         self.thread_id = None
@@ -1472,8 +1476,8 @@ class CodexBackend(BaseBackend):
 
 
 class StreamCliBackend(BaseBackend):
-    def __init__(self, events, kind):
-        super().__init__(events)
+    def __init__(self, events, kind, workspace_id=None):
+        super().__init__(events, workspace_id)
         self.kind = kind
         self.running = None
         self.lock = threading.Lock()
@@ -1489,8 +1493,8 @@ class StreamCliBackend(BaseBackend):
 
 
 class CustomCliBackend(StreamCliBackend):
-    def __init__(self, events, spec):
-        super().__init__(events, spec["key"])
+    def __init__(self, events, spec, workspace_id=None):
+        super().__init__(events, spec["key"], workspace_id)
         self.spec = spec
 
     def start_turn(self, session, turn, prompt, context_text=""):
@@ -1671,8 +1675,8 @@ class TerminalShell:
 
 
 class ClaudeBackend(StreamCliBackend):
-    def __init__(self, events):
-        super().__init__(events, "claude")
+    def __init__(self, events, workspace_id=None):
+        super().__init__(events, "claude", workspace_id)
 
     def start_turn(self, session, turn, prompt, context_text=""):
         def run():
@@ -1698,6 +1702,9 @@ class ClaudeBackend(StreamCliBackend):
                 cmd += ["--effort", effort]
             if first_turn:
                 cmd += ["--session-id", session_id]
+                title = clean_text(session.get("title"))
+                if title and not title.startswith("New "):
+                    cmd += ["--name", title]
             else:
                 cmd += ["--resume", session_id]
 
@@ -1805,8 +1812,8 @@ class ClaudeBackend(StreamCliBackend):
 
 
 class GeminiBackend(StreamCliBackend):
-    def __init__(self, events):
-        super().__init__(events, "gemini")
+    def __init__(self, events, workspace_id=None):
+        super().__init__(events, "gemini", workspace_id)
 
     def start_turn(self, session, turn, prompt, context_text=""):
         def run():
@@ -1937,11 +1944,15 @@ class App:
         self.loading_external_sessions = set()
         self.render_generation = 0
         self.report_cards = []
+        self.response_controls = []
         self.artifact_preview_image = None
         self.dnd_available = False
         self.link_counter = 0
         self.latest_agent_text = ""
         self.pending_attachments = []
+        self.workspaces = {}
+        self.workspace_order = []
+        self.active_workspace_id = None
 
         self.win = tk.Tk(className="AgentWorkbench")
         self.win.title(APP_NAME)
@@ -1957,6 +1968,9 @@ class App:
         self.session_aliases = self.config.get("session_aliases") or {}
         if not isinstance(self.session_aliases, dict):
             self.session_aliases = {}
+        self.session_order = self.config.get("session_order") or {}
+        if not isinstance(self.session_order, dict):
+            self.session_order = {}
         self.custom_clients = self.config.get("custom_clients") or []
         if not isinstance(self.custom_clients, list):
             self.custom_clients = []
@@ -2019,25 +2033,336 @@ class App:
         self._setup_drag_and_drop()
         self.win.bind("<F5>", lambda _e: self.refresh_sessions())
         self.win.bind("<Control-f>", lambda _e: self.session_search.focus_set())
+        self.win.bind("<Control-t>", lambda _e: self.new_workspace())
+        self.win.bind(
+            "<Control-w>",
+            lambda _e: self.close_workspace(self.active_workspace_id),
+        )
+        self.win.bind("<Control-Tab>", lambda _e: self.cycle_workspace(1))
+        self.win.bind("<Control-Shift-Tab>", lambda _e: self.cycle_workspace(-1))
 
-        self.backends = {
-            "codex": CodexBackend(self.events),
-            "claude": ClaudeBackend(self.events),
-            "gemini": GeminiBackend(self.events),
+        self.terminal_shell = TerminalShell(self.events)
+        self.terminal_shell.start(self.cwd.get())
+
+        if not self._restore_saved_workspaces():
+            workspace_id = self._create_workspace()
+            self.active_workspace_id = workspace_id
+            self.backends = self.workspaces[workspace_id]["backends"]
+            self.refresh_sessions()
+            self._restore_last_session()
+        else:
+            self._restore_workspace(self.workspaces[self.active_workspace_id])
+        self._save_active_workspace()
+        self._render_workspace_tabs()
+        self.win.after(50, self.drain_events)
+        self.win.after(500, self.poll_external_session)
+
+    def _create_backend_set(self, workspace_id):
+        backends = {
+            "codex": CodexBackend(self.events, workspace_id),
+            "claude": ClaudeBackend(self.events, workspace_id),
+            "gemini": GeminiBackend(self.events, workspace_id),
         }
         for client in self.custom_clients:
             key = clean_text(client.get("key"))
             if key in self.agent_map:
-                self.backends[key] = CustomCliBackend(self.events, client)
-        self.terminal_shell = TerminalShell(self.events)
-        if shutil.which("codex"):
-            self.backends["codex"].start(self.cwd.get())
-        self.terminal_shell.start(self.cwd.get())
+                backends[key] = CustomCliBackend(self.events, client, workspace_id)
+        return backends
 
-        self.refresh_sessions()
-        self._restore_last_session()
-        self.win.after(50, self.drain_events)
-        self.win.after(500, self.poll_external_session)
+    def _create_workspace(self, title=""):
+        workspace_id = str(uuid.uuid4())
+        workspace = {
+            "id": workspace_id,
+            "title": clean_text(title) or f"Tab {len(self.workspace_order) + 1}",
+            "agent": self.active_agent.get(),
+            "cwd": self.cwd.get(),
+            "model": self.selected_model.get(),
+            "effort": self.selected_effort.get(),
+            "status": "Ready",
+            "activity_state": "idle",
+            "activity_text": "Ready",
+            "busy": False,
+            "live_speaker": None,
+            "transfer_source_session_id": None,
+            "pending_user_input": None,
+            "live_source_signature": None,
+            "latest_agent_text": "",
+            "pending_attachments": [],
+            "current_session": None,
+            "current_turn": None,
+            "session_backend_id": None,
+            "sessions": [],
+            "local_sessions": [],
+            "external_sessions": [],
+            "input_text": "",
+            "backends": self._create_backend_set(workspace_id),
+        }
+        self.workspaces[workspace_id] = workspace
+        self.workspace_order.append(workspace_id)
+        return workspace_id
+
+    def _restore_saved_workspaces(self):
+        saved = self.config.get("workspace_tabs")
+        if not isinstance(saved, list) or not saved:
+            return False
+        for spec in saved[:8]:
+            if not isinstance(spec, dict):
+                continue
+            agent = clean_text(spec.get("agent"))
+            if agent not in self.agent_map:
+                agent = "codex"
+            cwd = os.path.abspath(
+                os.path.expanduser(clean_text(spec.get("cwd")) or os.path.expanduser("~"))
+            )
+            workspace_id = self._create_workspace(clean_text(spec.get("title")))
+            workspace = self.workspaces[workspace_id]
+            settings = self.agent_settings.get(
+                agent,
+                DEFAULT_AGENT_SETTINGS.get(
+                    agent, {"model": "Default", "effort": "Default"}
+                ),
+            )
+            workspace["agent"] = agent
+            workspace["cwd"] = cwd
+            workspace["model"] = clean_text(spec.get("model")) or settings["model"]
+            workspace["effort"] = clean_text(spec.get("effort")) or settings["effort"]
+            workspace["local_sessions"] = self.store.list_for(cwd, agent)
+            workspace["external_sessions"] = discover_external_sessions(cwd, agent)
+            workspace["sessions"] = self._merge_session_lists(
+                workspace["local_sessions"], workspace["external_sessions"]
+            )
+            selected_id = clean_text(spec.get("session_id"))
+            workspace["current_session"] = next(
+                (
+                    deepcopy(session)
+                    for session in workspace["sessions"]
+                    if session.get("id") == selected_id
+                ),
+                deepcopy(workspace["sessions"][0]) if workspace["sessions"] else None,
+            )
+        if not self.workspace_order:
+            return False
+        active_index = int(self.config.get("active_workspace_index") or 0)
+        active_index = min(max(active_index, 0), len(self.workspace_order) - 1)
+        self.active_workspace_id = self.workspace_order[active_index]
+        return True
+
+    def _workspace_specs(self):
+        specs = []
+        for workspace_id in self.workspace_order:
+            workspace = self.workspaces[workspace_id]
+            session = workspace.get("current_session") or {}
+            specs.append(
+                {
+                    "title": workspace.get("title"),
+                    "agent": workspace.get("agent"),
+                    "cwd": workspace.get("cwd"),
+                    "model": workspace.get("model"),
+                    "effort": workspace.get("effort"),
+                    "session_id": session.get("id"),
+                }
+            )
+        return specs
+
+    def _save_active_workspace(self):
+        workspace = self.workspaces.get(self.active_workspace_id)
+        if not workspace:
+            return
+        workspace.update(
+            {
+                "agent": self.active_agent.get(),
+                "cwd": self.cwd.get(),
+                "model": self.selected_model.get(),
+                "effort": self.selected_effort.get(),
+                "status": self.status.get(),
+                "activity_state": self.activity_state,
+                "activity_text": self.activity_text.get(),
+                "busy": self.busy,
+                "live_speaker": self.live_speaker,
+                "transfer_source_session_id": self.transfer_source_session_id,
+                "pending_user_input": self.pending_user_input,
+                "live_source_signature": self.live_source_signature,
+                "latest_agent_text": self.latest_agent_text,
+                "pending_attachments": list(self.pending_attachments),
+                "current_session": self.current_session,
+                "current_turn": self.current_turn,
+                "session_backend_id": self.session_backend_id,
+                "sessions": self.sessions,
+                "local_sessions": self.local_sessions,
+                "external_sessions": self.external_sessions,
+                "input_text": self.input.get("1.0", "end-1c"),
+            }
+        )
+
+    def _restore_workspace(self, workspace):
+        self.backends = workspace["backends"]
+        self.active_agent.set(workspace["agent"])
+        self.cwd.set(workspace["cwd"])
+        self.selected_model.set(workspace["model"])
+        self.selected_effort.set(workspace["effort"])
+        self.status.set(workspace["status"])
+        self.activity_state = workspace["activity_state"]
+        self.set_activity(
+            workspace["activity_state"],
+            workspace["activity_text"],
+        )
+        self.busy = workspace["busy"]
+        self.live_speaker = workspace["live_speaker"]
+        self.transfer_source_session_id = workspace["transfer_source_session_id"]
+        self.pending_user_input = workspace["pending_user_input"]
+        self.live_source_signature = workspace["live_source_signature"]
+        self.latest_agent_text = workspace["latest_agent_text"]
+        self.pending_attachments = list(workspace["pending_attachments"])
+        self.current_session = workspace["current_session"]
+        self.current_turn = workspace["current_turn"]
+        self.session_backend_id = workspace["session_backend_id"]
+        self.sessions = workspace["sessions"]
+        self.local_sessions = workspace["local_sessions"]
+        self.external_sessions = workspace["external_sessions"]
+        self.refresh_agent_controls()
+        self.apply_agent_theme(self.active_agent.get())
+        self._render_session_list()
+        self._clear_views(clear_attachments=False)
+        if self.current_session:
+            self._render_session(self.current_session)
+            self.refresh_artifacts_view(self.current_session)
+            self.update_context_indicator(self.current_session.get("context"))
+            title = self._display_session_title(self.current_session)
+            self.session_title.set(shorten(title, 110))
+            self.session_label.set(
+                f"{self._agent_spec(self.current_session.get('agent')).get('label')} · "
+                f"{project_label(self.current_session.get('cwd'))}"
+            )
+        else:
+            self.session_title.set(APP_NAME)
+            self.session_label.set("No session")
+            self.update_context_indicator({})
+            self.refresh_artifacts_view(None)
+        self.input.delete("1.0", "end")
+        self.input.insert("1.0", workspace["input_text"])
+        self._update_attachment_bar()
+        self.send_btn.configure(
+            text="Reply" if self.pending_user_input else "Send",
+            state="disabled" if self.busy and not self.pending_user_input else "normal",
+        )
+        if self.busy:
+            self.stop_btn.configure(state="normal")
+            self.stop_btn.pack(side="right", padx=(0, 6))
+        else:
+            self.stop_btn.pack_forget()
+
+    def switch_workspace(self, workspace_id):
+        if workspace_id == self.active_workspace_id or workspace_id not in self.workspaces:
+            return
+        self._save_active_workspace()
+        self.active_workspace_id = workspace_id
+        self._restore_workspace(self.workspaces[workspace_id])
+        self._render_workspace_tabs()
+
+    def new_workspace(self):
+        self._save_active_workspace()
+        title = simpledialog.askstring(
+            "New workspace tab",
+            "Session title (leave blank to title it from your first prompt):",
+            parent=self.win,
+        )
+        workspace_id = self._create_workspace(clean_text(title))
+        self.active_workspace_id = workspace_id
+        self._restore_workspace(self.workspaces[workspace_id])
+        session = self.store.new_session(
+            self.active_agent.get(),
+            self.cwd.get(),
+            title=clean_text(title),
+        )
+        self.current_session = session
+        self.local_sessions = [session]
+        self.external_sessions = discover_external_sessions(
+            self.cwd.get(), self.active_agent.get()
+        )
+        self.sessions = self._combined_sessions()
+        self.open_session(session["id"], remember=False)
+        self._save_active_workspace()
+        self._render_workspace_tabs()
+        self.input.focus_set()
+
+    def close_workspace(self, workspace_id):
+        if len(self.workspace_order) == 1:
+            return
+        workspace = self.workspaces.get(workspace_id)
+        if not workspace:
+            return
+        if workspace.get("busy") and not messagebox.askyesno(
+            "Close working tab",
+            "This agent is still working. Stop it and close the tab?",
+            parent=self.win,
+        ):
+            return
+        for backend in workspace["backends"].values():
+            backend.close()
+        was_active = workspace_id == self.active_workspace_id
+        closing_index = self.workspace_order.index(workspace_id)
+        self.workspace_order.remove(workspace_id)
+        self.workspaces.pop(workspace_id, None)
+        if was_active:
+            next_index = min(closing_index, len(self.workspace_order) - 1)
+            self.active_workspace_id = self.workspace_order[next_index]
+            self._restore_workspace(self.workspaces[self.active_workspace_id])
+        self._render_workspace_tabs()
+
+    def cycle_workspace(self, direction):
+        if len(self.workspace_order) < 2:
+            return "break"
+        index = self.workspace_order.index(self.active_workspace_id)
+        target = self.workspace_order[(index + direction) % len(self.workspace_order)]
+        self.switch_workspace(target)
+        return "break"
+
+    def _workspace_label(self, workspace):
+        session = workspace.get("current_session") or {}
+        title = clean_text(session.get("title")) or workspace.get("title") or "New session"
+        agent = self._agent_spec(workspace.get("agent", "codex")).get("label", "Agent")
+        marker = " •" if workspace.get("busy") else ""
+        return shorten(f"{agent}: {title}{marker}", 34)
+
+    def _render_workspace_tabs(self):
+        if not hasattr(self, "workspace_tabs_frame"):
+            return
+        for child in self.workspace_tabs_frame.winfo_children():
+            child.destroy()
+        for workspace_id in self.workspace_order:
+            workspace = self.workspaces[workspace_id]
+            selected = workspace_id == self.active_workspace_id
+            frame = tk.Frame(
+                self.workspace_tabs_frame,
+                bg=SIDEBAR_SEL if selected else PANEL,
+            )
+            frame.pack(side="left", padx=(4, 0), pady=4)
+            tk.Button(
+                frame,
+                text=self._workspace_label(workspace),
+                command=lambda wid=workspace_id: self.switch_workspace(wid),
+                bg=SIDEBAR_SEL if selected else PANEL,
+                fg=TEXT,
+                activebackground=SIDEBAR_SEL,
+                activeforeground=TEXT,
+                relief="flat",
+                padx=10,
+                pady=5,
+                cursor="hand2",
+            ).pack(side="left")
+            tk.Button(
+                frame,
+                text="×",
+                command=lambda wid=workspace_id: self.close_workspace(wid),
+                bg=SIDEBAR_SEL if selected else PANEL,
+                fg=MUTED,
+                activebackground="#7f1d1d",
+                activeforeground="white",
+                relief="flat",
+                padx=5,
+                pady=5,
+                cursor="hand2",
+            ).pack(side="left")
 
     def _build_style(self):
         style = ttk.Style(self.win)
@@ -2083,6 +2408,24 @@ class App:
         right = tk.Frame(outer, bg=BORDER)
         right.pack(side="right", fill="both", expand=True, padx=(3, 0))
 
+        workspace_bar = tk.Frame(right, bg=BG)
+        workspace_bar.pack(fill="x", pady=(0, 3))
+        self.workspace_tabs_frame = tk.Frame(workspace_bar, bg=BG)
+        self.workspace_tabs_frame.pack(side="left", fill="x", expand=True)
+        tk.Button(
+            workspace_bar,
+            text="+",
+            command=self.new_workspace,
+            bg=PANEL_ALT,
+            fg=TEXT,
+            activebackground=SIDEBAR_SEL,
+            activeforeground=TEXT,
+            relief="flat",
+            padx=12,
+            pady=6,
+            cursor="hand2",
+        ).pack(side="right", padx=4, pady=4)
+
         topbar = tk.Frame(right, bg=BG)
         topbar.pack(fill="x", pady=(0, 3))
         tk.Label(
@@ -2120,21 +2463,6 @@ class App:
             font=("Sans", 9, "bold"),
         )
         self.context_badge.pack(side="right", padx=(0, 4))
-        self.copy_latest_btn = tk.Button(
-            topbar,
-            text="Copy latest",
-            command=self.copy_latest_response,
-            bg=PANEL_ALT,
-            fg=TEXT,
-            activebackground=SIDEBAR_SEL,
-            activeforeground=TEXT,
-            relief="flat",
-            padx=9,
-            pady=4,
-            cursor="hand2",
-        )
-        self.copy_latest_btn.pack(side="right", padx=(0, 4))
-
         content = tk.Frame(right, bg=BORDER)
         content.pack(fill="both", expand=True)
         content.grid_rowconfigure(1, weight=1)
@@ -2166,6 +2494,8 @@ class App:
             bg=PANEL,
             fg=TEXT,
             insertbackground=TEXT,
+            selectbackground="#315a86",
+            selectforeground="#ffffff",
             relief="flat",
             borderwidth=0,
             padx=24,
@@ -2227,6 +2557,10 @@ class App:
         self.chat.tag_config("chat_bold", foreground="#f8fafc", font=("Sans", 11, "bold"))
         self.chat.bind("<Configure>", self.update_chat_margins)
         self.chat.bind("<Button-3>", lambda event: self.show_text_menu(event, self.chat))
+        self.chat.bind(
+            "<Control-c>",
+            lambda _event: self.copy_widget_selection(self.chat),
+        )
         self.chat.configure(state="disabled")
 
         self.work = ScrolledText(
@@ -2652,6 +2986,14 @@ class App:
         self.win.clipboard_append(text)
         self.win.update_idletasks()
         self.status.set("Copied to clipboard.")
+
+    def copy_widget_selection(self, widget):
+        try:
+            text = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+        self.copy_text(text)
+        return "break"
 
     def copy_latest_response(self):
         if not self.latest_agent_text:
@@ -3123,6 +3465,24 @@ class App:
         )
         self.session_search.pack(side="left", fill="x", expand=True)
         self.session_search.bind("<KeyRelease>", lambda _e: self._render_session_list())
+        for label, command in (
+            ("↑", lambda: self.move_selected_session(-1)),
+            ("↓", lambda: self.move_selected_session(1)),
+            ("×", self.delete_selected_session),
+        ):
+            tk.Button(
+                sess_tools,
+                text=label,
+                command=command,
+                bg=PANEL_ALT,
+                fg=TEXT if label != "×" else "#fca5a5",
+                activebackground=SIDEBAR_SEL,
+                activeforeground="white",
+                relief="flat",
+                padx=7,
+                pady=2,
+                cursor="hand2",
+            ).pack(side="left", padx=(4, 0))
         self.session_list = tk.Listbox(
             sess_frame,
             bg=PANEL,
@@ -3137,6 +3497,7 @@ class App:
         self.session_list.bind("<Double-Button-1>", lambda _e: self.input.focus_set())
         self.session_list.bind("<Button-3>", self.show_session_menu)
         self.session_list.bind("<F2>", lambda _e: self.rename_selected_session())
+        self.session_list.bind("<Delete>", lambda _e: self.delete_selected_session())
         self.session_list.bind("<Motion>", self._schedule_session_tooltip)
         self.session_list.bind("<Leave>", lambda _e: self._hide_session_tooltip())
         self.session_list.bind("<Button>", lambda _e: self._hide_session_tooltip())
@@ -3148,6 +3509,11 @@ class App:
         self.session_list.configure(yscrollcommand=sess_scroll.set)
         self.session_menu = tk.Menu(self.win, tearoff=False)
         self.session_menu.add_command(label="Rename session", command=self.rename_selected_session)
+        self.session_menu.add_separator()
+        self.session_menu.add_command(label="Move up", command=lambda: self.move_selected_session(-1))
+        self.session_menu.add_command(label="Move down", command=lambda: self.move_selected_session(1))
+        self.session_menu.add_separator()
+        self.session_menu.add_command(label="Delete session", command=self.delete_selected_session)
 
         self._refresh_project_list()
 
@@ -3360,7 +3726,10 @@ class App:
         self.agent_specs.append(spec)
         self.agent_map[key] = spec
         self.agent_settings[key] = {"model": "Default", "effort": "Default"}
-        self.backends[key] = CustomCliBackend(self.events, client)
+        for workspace_id, workspace in self.workspaces.items():
+            workspace["backends"][key] = CustomCliBackend(
+                self.events, client, workspace_id
+            )
         self.agent_picker.configure(values=[item["key"] for item in self.agent_specs])
         self.config["custom_clients"] = self.custom_clients
         save_json(CONFIG_FILE, self.config)
@@ -3377,9 +3746,10 @@ class App:
                 parent=parent,
             )
             return
-        backend = self.backends.pop(key, None)
-        if backend:
-            backend.close()
+        for workspace in self.workspaces.values():
+            backend = workspace["backends"].pop(key, None)
+            if backend:
+                backend.close()
         self.custom_clients = [
             client for client in self.custom_clients if client.get("key") != key
         ]
@@ -3620,6 +3990,8 @@ class App:
         self.refresh_agent_controls()
         self.apply_agent_theme(self.active_agent.get())
         self.refresh_sessions()
+        self._save_active_workspace()
+        self._render_workspace_tabs()
 
     def refresh_agent_controls(self):
         agent_key = self.active_agent.get()
@@ -3675,21 +4047,39 @@ class App:
             self.restart_terminal()
         self.local_sessions = self.store.list_for(self.cwd.get(), self.active_agent.get())
         self.external_sessions = discover_external_sessions(self.cwd.get(), self.active_agent.get())
-        if self.active_agent.get() == "claude":
-            self.sessions = list(self.external_sessions)
-        else:
-            self.sessions = list(self.local_sessions) + list(self.external_sessions)
+        self.sessions = self._combined_sessions()
         if not self.sessions:
             self.current_session = self.store.new_session(self.active_agent.get(), self.cwd.get())
             self.local_sessions = [self.current_session]
-            if self.active_agent.get() != "claude":
-                self.sessions = list(self.local_sessions)
+            self.sessions = list(self.local_sessions)
             self.transfer_source_session_id = None
         self._render_session_list()
         if self.sessions:
             self.open_session(self.sessions[0]["id"], remember=False)
         else:
             self.open_session(self.current_session["id"], remember=False)
+
+    def _combined_sessions(self):
+        return self._merge_session_lists(
+            self.local_sessions, self.external_sessions
+        )
+
+    def _merge_session_lists(self, local_sessions, external_sessions):
+        external_backend_ids = {
+            clean_text(session.get("source_session_id"))
+            for session in external_sessions
+            if clean_text(session.get("source_session_id"))
+        }
+        local = []
+        for session in local_sessions:
+            backend = session.get("backend") or {}
+            backend_id = clean_text(
+                backend.get("session_id") or backend.get("thread_id")
+            )
+            if backend_id and backend_id in external_backend_ids:
+                continue
+            local.append(session)
+        return local + list(external_sessions)
 
     def _render_session_list(self):
         self._hide_session_tooltip()
@@ -3698,6 +4088,18 @@ class App:
         query = clean_text(self.session_filter.get()).lower()
         self.visible_sessions = list(self.sessions)
         self.visible_sessions.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
+        fallback_index = {
+            session.get("id"): index
+            for index, session in enumerate(self.visible_sessions)
+        }
+        order = self.session_order.get(self._session_order_key(), [])
+        order_index = {session_id: index for index, session_id in enumerate(order)}
+        self.visible_sessions.sort(
+            key=lambda session: order_index.get(
+                session.get("id"),
+                len(order) + fallback_index.get(session.get("id"), 0),
+            )
+        )
         if query:
             self.visible_sessions = [
                 session
@@ -3719,6 +4121,83 @@ class App:
             )
             self.session_list.selection_set(selected_idx)
             self.session_list.see(selected_idx)
+
+    def _session_order_key(self):
+        return f"{self.active_agent.get()}|{os.path.abspath(self.cwd.get())}"
+
+    def move_selected_session(self, direction):
+        selection = self.session_list.curselection()
+        if not selection or clean_text(self.session_filter.get()):
+            self.status.set("Clear session search before reordering.")
+            return
+        index = selection[0]
+        target = index + direction
+        if target < 0 or target >= len(self.visible_sessions):
+            return
+        ordered = [session.get("id") for session in self.visible_sessions]
+        ordered[index], ordered[target] = ordered[target], ordered[index]
+        self.session_order[self._session_order_key()] = ordered
+        self.config["session_order"] = self.session_order
+        save_json(CONFIG_FILE, self.config)
+        selected_id = ordered[target]
+        self._render_session_list()
+        for row, session in enumerate(self.visible_sessions):
+            if session.get("id") == selected_id:
+                self.session_list.selection_clear(0, "end")
+                self.session_list.selection_set(row)
+                self.session_list.see(row)
+                break
+
+    def delete_selected_session(self):
+        selection = self.session_list.curselection()
+        if not selection or selection[0] >= len(self.visible_sessions):
+            self.status.set("Select a session to delete.")
+            return
+        session = self.visible_sessions[selection[0]]
+        if (
+            self.busy
+            and self.current_session
+            and self.current_session.get("id") == session.get("id")
+        ):
+            self.status.set("Stop the active turn before deleting this session.")
+            return
+        title = self._display_session_title(session)
+        terminal_backed = session.get("origin") in {
+            "claude-terminal",
+            "codex-terminal",
+            "gemini-terminal",
+        }
+        detail = (
+            "\n\nThis also removes it from the agent client's resume history."
+            if terminal_backed
+            else ""
+        )
+        if not messagebox.askyesno(
+            "Delete session",
+            f"Delete '{title}'?{detail}",
+            parent=self.win,
+        ):
+            return
+        source_path = clean_text(session.get("source_path"))
+        if terminal_backed and source_path:
+            try:
+                os.unlink(source_path)
+            except OSError as exc:
+                messagebox.showerror("Delete session", str(exc), parent=self.win)
+                return
+        if session.get("origin", "local") == "local":
+            self.store.delete(session.get("id"))
+        order_key = self._session_order_key()
+        self.session_order[order_key] = [
+            item for item in self.session_order.get(order_key, []) if item != session.get("id")
+        ]
+        self.config["session_order"] = self.session_order
+        save_json(CONFIG_FILE, self.config)
+        if self.current_session and self.current_session.get("id") == session.get("id"):
+            self.current_session = None
+            self.current_turn = None
+        self.refresh_sessions()
+        self.status.set(f"Deleted {title}.")
 
     def open_session_finder(self):
         self.session_search.focus_set()
@@ -3767,6 +4246,8 @@ class App:
             self.session_title.set(alias)
         self._render_session_list()
         self.open_session(session["id"], remember=False)
+        self._save_active_workspace()
+        self._render_workspace_tabs()
         if source_updated:
             agent = self._agent_spec(session.get("agent", ""))["label"]
             self.status.set(f"Renamed session to '{alias}' in {agent} and Workbench.")
@@ -3838,7 +4319,7 @@ class App:
         loading_transcript = origin == "claude-terminal" and not session.get("transcript_loaded")
         if loading_transcript:
             self._show_transcript_loading(session)
-            self._load_external_session(session)
+            self._load_external_session(session, self.active_workspace_id)
         else:
             self._render_session(session)
         self.refresh_artifacts_view(session)
@@ -3868,12 +4349,13 @@ class App:
         self.status.set("Loading complete Claude conversation…")
         self.set_activity("starting", "Loading")
 
-    def _load_external_session(self, session):
+    def _load_external_session(self, session, workspace_id=None):
         session_id = session.get("id")
         path = session.get("source_path")
-        if not session_id or not path or session_id in self.loading_external_sessions:
+        load_key = f"{workspace_id or 'active'}:{session_id}"
+        if not session_id or not path or load_key in self.loading_external_sessions:
             return
-        self.loading_external_sessions.add(session_id)
+        self.loading_external_sessions.add(load_key)
         origin = session.get("origin")
 
         def load():
@@ -3894,6 +4376,8 @@ class App:
                     "title": title,
                     "context": context,
                     "signature": self._source_signature(path),
+                    "workspace_id": workspace_id,
+                    "load_key": load_key,
                 }
             )
 
@@ -3910,19 +4394,32 @@ class App:
 
     def poll_external_session(self):
         try:
-            session = self.current_session
-            if session and session.get("origin") in {"codex-terminal", "claude-terminal"}:
+            self._save_active_workspace()
+            for workspace_id, workspace in self.workspaces.items():
+                session = workspace.get("current_session")
+                if not session or session.get("origin") not in {
+                    "codex-terminal",
+                    "claude-terminal",
+                }:
+                    continue
                 path = session.get("source_path")
                 signature = self._source_signature(path)
-                if signature and signature != self.live_source_signature:
-                    self.live_source_signature = signature
-                    self._load_external_session(session)
+                if signature and signature != workspace.get("live_source_signature"):
+                    workspace["live_source_signature"] = signature
+                    self._load_external_session(session, workspace_id)
         finally:
             self.win.after(500, self.poll_external_session)
 
-    def _clear_views(self):
+    def _clear_views(self, clear_attachments=True):
         self.render_generation += 1
-        self.clear_attachments()
+        if clear_attachments:
+            self.clear_attachments()
+        for control in self.response_controls:
+            try:
+                control.destroy()
+            except tk.TclError:
+                pass
+        self.response_controls = []
         for card in self.report_cards:
             try:
                 card["frame"].destroy()
@@ -4050,9 +4547,31 @@ class App:
             widget.insert("end", text.rstrip() + "\n\n", tag)
         content_end = widget.index("end-1c")
         self._linkify_chat_range(content_start, content_end)
+        if speaker != "YOU":
+            self._append_response_copy_button(text)
         widget.configure(state="disabled")
         if at_bottom:
             widget.see("end")
+
+    def _append_response_copy_button(self, text):
+        frame = tk.Frame(self.chat, bg=self.chat.cget("bg"))
+        tk.Button(
+            frame,
+            text="Copy",
+            command=lambda value=text: self.copy_text(value),
+            bg=PANEL_ALT,
+            fg=MUTED,
+            activebackground=SIDEBAR_SEL,
+            activeforeground=TEXT,
+            relief="flat",
+            padx=9,
+            pady=3,
+            cursor="hand2",
+            font=("Sans", 8),
+        ).pack(side="left")
+        self.response_controls.append(frame)
+        self.chat.window_create("end", window=frame, padx=0, pady=6)
+        self.chat.insert("end", "\n")
 
     def append_report(self, title, text):
         if not text:
@@ -4249,10 +4768,7 @@ class App:
             title=clean_text(title),
         )
         self.local_sessions.insert(0, session)
-        if self.active_agent.get() == "claude":
-            self.sessions = list(self.external_sessions)
-        else:
-            self.sessions = list(self.local_sessions) + list(self.external_sessions)
+        self.sessions = self._combined_sessions()
         self.transfer_source_session_id = None
         self._render_session_list()
         self.open_session(session["id"], remember=False)
@@ -4368,10 +4884,7 @@ class App:
             self.transfer_source_session_id = self.current_session.get("source_session_id") or self.current_session.get("id")
             self.current_session = self.store.clone_for_continuation(self.current_session)
             self.local_sessions.insert(0, self.current_session)
-            if self.active_agent.get() == "claude":
-                self.sessions = list(self.external_sessions)
-            else:
-                self.sessions = list(self.local_sessions) + list(self.external_sessions)
+            self.sessions = self._combined_sessions()
             self._render_session_list()
         backend_settings = self.current_session.setdefault("backend", {})
         backend_settings["model"] = self.selected_model.get()
@@ -4428,6 +4941,8 @@ class App:
             context_text=context_text,
         )
         self.transfer_source_session_id = None
+        self._save_active_workspace()
+        self._render_workspace_tabs()
 
     def stop(self):
         self._current_backend().interrupt()
@@ -4466,7 +4981,127 @@ class App:
                 items[-1]["text"] = clean_text(items[-1].get("text", "") + text)
                 self.store.save(self.current_session)
 
+    def _handle_background_event(self, workspace, event):
+        kind = event.get("kind")
+        session = workspace.get("current_session")
+        turn = workspace.get("current_turn")
+        if kind == "external_session_loaded":
+            self.loading_external_sessions.discard(
+                event.get("load_key") or event.get("session_id")
+            )
+            session_id = event.get("session_id")
+            turns = event.get("turns") or []
+            title = clean_text(event.get("title"))
+            context = event.get("context") or {}
+            for candidate in workspace.get("external_sessions") or []:
+                if candidate.get("id") == session_id:
+                    candidate["turns"] = turns
+                    candidate["transcript_loaded"] = True
+                    if title:
+                        candidate["title"] = title
+                    if context:
+                        candidate["context"] = context
+            if session and session.get("id") == session_id:
+                session["turns"] = turns
+                session["transcript_loaded"] = True
+                if title:
+                    session["title"] = title
+                if context:
+                    session["context"] = context
+                workspace["live_source_signature"] = event.get("signature")
+                workspace["status"] = "Live terminal mirror updated."
+        elif kind == "status":
+            workspace["status"] = event.get("text", "Ready")
+        elif kind == "work" and session and turn:
+            self.store.add_item(
+                session,
+                turn,
+                {
+                    "type": "system",
+                    "text": event.get("text", ""),
+                    "tag": event.get("tag", "system"),
+                },
+            )
+        elif kind in {"assistant_delta", "assistant"} and session and turn:
+            text = event.get("text", "")
+            if text:
+                items = turn.setdefault("items", [])
+                if workspace.get("live_speaker") and items and items[-1].get("type") == "agentMessage":
+                    items[-1]["text"] = clean_text(items[-1].get("text", "") + text)
+                    self.store.save(session)
+                else:
+                    workspace["live_speaker"] = event.get("speaker") or "AGENT"
+                    self.store.add_item(
+                        session, turn, {"type": "agentMessage", "text": text}
+                    )
+        elif kind == "assistant_message" and session and turn:
+            text = clean_text(event.get("text"))
+            if text:
+                workspace["latest_agent_text"] = text
+                self.store.add_item(
+                    session, turn, {"type": "agentMessage", "text": text}
+                )
+        elif kind == "assistant_done":
+            workspace["live_speaker"] = None
+        elif kind == "user_input_request":
+            questions = (event.get("params") or {}).get("questions") or []
+            text = "\n".join(
+                clean_text(question.get("question")) for question in questions
+            )
+            workspace["pending_user_input"] = {
+                "request_id": event.get("request_id"),
+                "questions": questions,
+            }
+            workspace["status"] = "Codex is waiting for your answer."
+            workspace["activity_state"] = "input"
+            workspace["activity_text"] = "Needs input"
+            if session and turn and text:
+                self.store.add_item(
+                    session, turn, {"type": "agentMessage", "text": text}
+                )
+        elif kind == "turn_done":
+            status = event.get("status", "completed")
+            if session and turn:
+                self.store.finish_turn(session, turn, status=status)
+            workspace["busy"] = False
+            workspace["pending_user_input"] = None
+            workspace["live_speaker"] = None
+            workspace["status"] = "Ready" if status == "completed" else f"Turn {status}"
+            workspace["activity_state"] = "idle"
+            workspace["activity_text"] = "Ready"
+        elif kind == "error":
+            text = event.get("text", "Error")
+            if session and turn:
+                self.store.add_item(
+                    session, turn, {"type": "note", "text": "ERROR: " + text}
+                )
+                self.store.finish_turn(session, turn, status="error")
+            workspace["busy"] = False
+            workspace["pending_user_input"] = None
+            workspace["status"] = "Error: " + text
+            workspace["activity_state"] = "error"
+            workspace["activity_text"] = "Error"
+        elif kind == "backend_exit":
+            workspace["status"] = event.get("text", "Backend stopped")
+            workspace["busy"] = False
+            workspace["activity_state"] = "error"
+            workspace["activity_text"] = "Error"
+        elif kind == "context_usage" and session:
+            context = event.get("context") or {}
+            if context:
+                previous = session.get("context") or {}
+                context["compact_count"] = previous.get("compact_count", 0)
+                session["context"] = context
+                self.store.save(session)
+        self._render_workspace_tabs()
+
     def handle_event(self, event):
+        workspace_id = event.get("workspace_id")
+        if workspace_id and workspace_id != self.active_workspace_id:
+            workspace = self.workspaces.get(workspace_id)
+            if workspace:
+                self._handle_background_event(workspace, event)
+            return
         kind = event.get("kind")
         if kind == "status":
             self.status.set(event.get("text", "Ready"))
@@ -4503,6 +5138,13 @@ class App:
                 widget = self.chat
                 widget.configure(state="normal")
                 widget.insert("end", "\n\n")
+                response_text = ""
+                if self.current_turn:
+                    items = self.current_turn.get("items") or []
+                    if items and items[-1].get("type") == "agentMessage":
+                        response_text = clean_text(items[-1].get("text"))
+                if response_text:
+                    self._append_response_copy_button(response_text)
                 widget.configure(state="disabled")
                 widget.see("end")
             self.live_speaker = None
@@ -4584,7 +5226,9 @@ class App:
                 self.update_context_indicator(context)
         elif kind == "external_session_loaded":
             session_id = event.get("session_id")
-            self.loading_external_sessions.discard(session_id)
+            self.loading_external_sessions.discard(
+                event.get("load_key") or session_id
+            )
             turns = event.get("turns") or []
             source_title = clean_text(event.get("title"))
             context = event.get("context") or {}
@@ -4611,7 +5255,7 @@ class App:
                     self.update_context_indicator(context)
                 self.current_session["updated_at"] = now_iso()
                 self.live_source_signature = event.get("signature")
-                self._clear_views()
+                self._clear_views(clear_attachments=False)
                 self._render_session(self.current_session)
                 self._render_session_list()
                 self.refresh_artifacts_view(self.current_session)
@@ -4634,12 +5278,15 @@ class App:
             while True:
                 event = self.events.get_nowait()
                 self.handle_event(event)
+                self._save_active_workspace()
+                self._render_workspace_tabs()
         except queue.Empty:
             pass
         self.win.after(50, self.drain_events)
 
     def close(self):
         self._hide_session_tooltip()
+        self._save_active_workspace()
         self.config.update(
             {
                 "cwd": self.cwd.get(),
@@ -4649,16 +5296,22 @@ class App:
                 "agent_settings": self.agent_settings,
                 "last_session_id": self.current_session.get("id") if self.current_session else None,
                 "session_aliases": self.session_aliases,
+                "session_order": self.session_order,
                 "custom_clients": self.custom_clients,
+                "workspace_tabs": self._workspace_specs(),
+                "active_workspace_index": self.workspace_order.index(
+                    self.active_workspace_id
+                ),
             }
         )
         save_json(CONFIG_FILE, self.config)
         self._persist_current()
-        for backend in self.backends.values():
-            try:
-                backend.close()
-            except Exception:
-                pass
+        for workspace in self.workspaces.values():
+            for backend in workspace["backends"].values():
+                try:
+                    backend.close()
+                except Exception:
+                    pass
         self.terminal_shell.close()
         self.win.destroy()
 
