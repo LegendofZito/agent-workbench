@@ -4,6 +4,20 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
 config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  printf 'Missing Python 3. On Fedora, run: sudo dnf install python3 python3-tkinter xdg-utils\n' >&2
+  exit 1
+fi
+if ! python3 -c 'import tkinter' >/dev/null 2>&1; then
+  printf 'Missing Tkinter. On Fedora, run: sudo dnf install python3-tkinter xdg-utils\n' >&2
+  exit 1
+fi
+if ! command -v xdg-open >/dev/null 2>&1; then
+  printf 'Missing xdg-utils. On Fedora, run: sudo dnf install xdg-utils\n' >&2
+  exit 1
+fi
+
 install -d "${HOME}/.local/bin" "${data_home}/applications" "${data_home}/icons"
 install -d "${config_home}/agent-workbench"
 install -m 0755 "${root}/agent-workbench" \

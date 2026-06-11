@@ -39,9 +39,7 @@ Send prompts with `Ctrl+Enter`.
 
 ## Install
 
-Download the latest Linux archive from:
-
-https://github.com/LegendofZito/agent-workbench/releases/latest
+Download the latest Linux archive from this repository's **Releases** page.
 
 Extract it, then run:
 
