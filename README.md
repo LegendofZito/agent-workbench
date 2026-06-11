@@ -8,6 +8,10 @@ Selected Codex terminal sessions are mirrored live. Conversation messages keep
 readable headings, lists, checklists, emphasis, and inline code while
 implementation output stays in Work Log.
 
+The sidebar provides per-agent model and effort controls. Defaults favor
+responsive general use: Codex GPT-5.5 at medium effort, Claude Sonnet at medium
+effort, and Gemini Auto. Preferences are remembered separately for each agent.
+
 The built-in Terminal tab provides a persistent PTY shell in the selected
 project. It loads the user's normal interactive shell configuration and
 supports command history, interactive line input, `Ctrl+C`, and shell restart.

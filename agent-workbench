@@ -55,6 +55,21 @@ AGENT_ACCENTS = {
     "claude": ("#8f3f2b", "#b85c3f", "#d97757", "#f0a17f"),
     "gemini": ("#4285f4", "#9b72cb", "#d96570", "#f9ab00"),
 }
+MODEL_OPTIONS = {
+    "codex": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"),
+    "claude": ("sonnet", "opus", "haiku"),
+    "gemini": ("Auto", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"),
+}
+EFFORT_OPTIONS = {
+    "codex": ("low", "medium", "high", "xhigh"),
+    "claude": ("low", "medium", "high", "xhigh", "max"),
+    "gemini": ("Default",),
+}
+DEFAULT_AGENT_SETTINGS = {
+    "codex": {"model": "gpt-5.5", "effort": "medium"},
+    "claude": {"model": "sonnet", "effort": "medium"},
+    "gemini": {"model": "Auto", "effort": "Default"},
+}
 WORK = "#f59e0b"
 USER = "#79c0ff"
 ACCENT = "#2f81f7"
@@ -980,6 +995,9 @@ class CodexBackend(BaseBackend):
             "sandbox": "danger-full-access",
             "personality": "pragmatic",
         }
+        model = clean_text(backend.get("model"))
+        if model:
+            params["model"] = model
         method = "thread/start"
         if existing_thread_id:
             method = "thread/resume"
@@ -1022,13 +1040,19 @@ class CodexBackend(BaseBackend):
             self.emit("error", text=text)
             done.set()
 
+        request = {
+            "threadId": self.thread_id,
+            "cwd": session["cwd"],
+            "input": [{"type": "text", "text": payload_text}],
+        }
+        backend = session.get("backend") or {}
+        if clean_text(backend.get("model")):
+            request["model"] = backend["model"]
+        if clean_text(backend.get("effort")):
+            request["effort"] = backend["effort"]
         self.request(
             "turn/start",
-            {
-                "threadId": self.thread_id,
-                "cwd": session["cwd"],
-                "input": [{"type": "text", "text": payload_text}],
-            },
+            request,
             on_turn,
             on_error,
         )
@@ -1217,6 +1241,12 @@ class ClaudeBackend(StreamCliBackend):
                 "bypassPermissions",
                 "--dangerously-skip-permissions",
             ]
+            model = clean_text(session["backend"].get("model"))
+            effort = clean_text(session["backend"].get("effort"))
+            if model:
+                cmd += ["--model", model]
+            if effort:
+                cmd += ["--effort", effort]
             if first_turn:
                 cmd += ["--session-id", session_id]
             else:
@@ -1251,7 +1281,7 @@ class ClaudeBackend(StreamCliBackend):
                         self.emit("work", text=line, tag="system")
                         continue
                     etype = event.get("type")
-                    if etype == "init":
+                    if etype == "system" and event.get("subtype") == "init":
                         sid = event.get("session_id")
                         if sid:
                             session.setdefault("backend", {})["session_id"] = sid
@@ -1260,22 +1290,32 @@ class ClaudeBackend(StreamCliBackend):
                             text=f"claude session {sid or session_id}",
                             tag="system",
                         )
-                    elif etype == "message":
-                        role = event.get("role")
-                        content = clean_text(event.get("content"))
-                        if role == "assistant" and content:
-                            if not buffer:
-                                self.emit("assistant_begin", speaker="CLAUDE")
-                            buffer.append(content)
-                            self.emit("assistant_delta", text=content, speaker="CLAUDE")
-                        elif role == "user":
-                            self.emit("user", text=content)
+                    elif etype == "assistant":
+                        message = event.get("message") or {}
+                        for block in message.get("content") or []:
+                            if not isinstance(block, dict):
+                                continue
+                            block_type = block.get("type")
+                            content = clean_text(block.get("text"))
+                            if block_type == "text" and content:
+                                if not buffer:
+                                    self.emit("assistant_begin", speaker="CLAUDE")
+                                buffer.append(content)
+                                self.emit("assistant_delta", text=content, speaker="CLAUDE")
+                            elif block_type == "tool_use":
+                                self.emit(
+                                    "work",
+                                    text=f"Tool: {clean_text(block.get('name'))}",
+                                    tag="tool",
+                                )
+                    elif etype == "user":
+                        self.emit("work", text=line, tag="system")
                     elif etype == "result":
                         result = event.get("result") or ""
                         if result and not buffer:
                             self.emit("assistant_begin", speaker="CLAUDE")
                             self.emit("assistant_delta", text=clean_text(result), speaker="CLAUDE")
-                        status = event.get("status") or "success"
+                        status = event.get("subtype") or "success"
                         stats = event.get("usage") or {}
                         self.emit(
                             "work",
@@ -1326,6 +1366,9 @@ class GeminiBackend(StreamCliBackend):
                 "--yolo",
                 "--skip-trust",
             ]
+            model = clean_text(session["backend"].get("model"))
+            if model and model != "Auto":
+                cmd += ["--model", model]
             if first_turn:
                 cmd += ["--session-id", session_id]
             else:
@@ -1457,10 +1500,18 @@ class App:
             {"key": "gemini", "label": "Gemini", "color": GEMINI},
         ]
         self.agent_map = {spec["key"]: spec for spec in self.agent_specs}
+        saved_agent_settings = self.config.get("agent_settings") or {}
+        self.agent_settings = deepcopy(DEFAULT_AGENT_SETTINGS)
+        for agent_key, settings in saved_agent_settings.items():
+            if agent_key in self.agent_settings and isinstance(settings, dict):
+                self.agent_settings[agent_key].update(settings)
         self.cwd = tk.StringVar(master=self.win, value=self.config.get("cwd", os.path.expanduser("~")))
         self.active_agent = tk.StringVar(master=self.win, value=self.config.get("active_agent", "codex"))
         if self.active_agent.get() not in self.agent_map:
             self.active_agent.set("codex")
+        initial_settings = self.agent_settings[self.active_agent.get()]
+        self.selected_model = tk.StringVar(master=self.win, value=initial_settings["model"])
+        self.selected_effort = tk.StringVar(master=self.win, value=initial_settings["effort"])
         self.status = tk.StringVar(master=self.win, value="Starting…")
         self.activity_text = tk.StringVar(master=self.win, value="Starting")
         self.session_title = tk.StringVar(master=self.win, value=APP_NAME)
@@ -1945,6 +1996,28 @@ class App:
         self.agent_picker.pack(fill="x", pady=(4, 0))
         self.agent_picker.bind("<<ComboboxSelected>>", lambda _e: self.on_agent_changed())
 
+        tk.Label(agent_box, text="Model", bg=SIDEBAR, fg=MUTED).pack(anchor="w", pady=(9, 0))
+        self.model_picker = ttk.Combobox(
+            agent_box,
+            textvariable=self.selected_model,
+            state="readonly",
+            style="Agent.TCombobox",
+        )
+        self.model_picker.pack(fill="x", pady=(4, 0))
+        self.model_picker.bind("<<ComboboxSelected>>", lambda _e: self.on_agent_setting_changed())
+
+        self.effort_label = tk.Label(agent_box, text="Effort", bg=SIDEBAR, fg=MUTED)
+        self.effort_label.pack(anchor="w", pady=(9, 0))
+        self.effort_picker = ttk.Combobox(
+            agent_box,
+            textvariable=self.selected_effort,
+            state="readonly",
+            style="Agent.TCombobox",
+        )
+        self.effort_picker.pack(fill="x", pady=(4, 0))
+        self.effort_picker.bind("<<ComboboxSelected>>", lambda _e: self.on_agent_setting_changed())
+        self.refresh_agent_controls()
+
         cwd_box = tk.Frame(sidebar, bg=SIDEBAR)
         cwd_box.pack(fill="x", padx=14, pady=(0, 12))
         tk.Label(cwd_box, text="Project", bg=SIDEBAR, fg=MUTED).pack(anchor="w")
@@ -2185,8 +2258,44 @@ class App:
         self._refresh_project_list()
 
     def on_agent_changed(self):
+        settings = self.agent_settings[self.active_agent.get()]
+        self.selected_model.set(settings["model"])
+        self.selected_effort.set(settings["effort"])
+        self.refresh_agent_controls()
         self.apply_agent_theme(self.active_agent.get())
         self.refresh_sessions()
+
+    def refresh_agent_controls(self):
+        agent_key = self.active_agent.get()
+        self.model_picker.configure(values=MODEL_OPTIONS[agent_key])
+        self.effort_picker.configure(values=EFFORT_OPTIONS[agent_key])
+        if self.selected_model.get() not in MODEL_OPTIONS[agent_key]:
+            self.selected_model.set(DEFAULT_AGENT_SETTINGS[agent_key]["model"])
+        if self.selected_effort.get() not in EFFORT_OPTIONS[agent_key]:
+            self.selected_effort.set(DEFAULT_AGENT_SETTINGS[agent_key]["effort"])
+        if agent_key == "gemini":
+            self.effort_label.configure(text="Effort (managed by Gemini)")
+        else:
+            self.effort_label.configure(text="Effort")
+
+    def on_agent_setting_changed(self):
+        agent_key = self.active_agent.get()
+        self.agent_settings[agent_key] = {
+            "model": self.selected_model.get(),
+            "effort": self.selected_effort.get(),
+        }
+        if self.current_session and self.current_session.get("agent") == agent_key:
+            backend = self.current_session.setdefault("backend", {})
+            backend["model"] = self.selected_model.get()
+            effort = self.selected_effort.get()
+            if agent_key == "gemini" or effort == "Default":
+                backend.pop("effort", None)
+            else:
+                backend["effort"] = effort
+            self._persist_current()
+        self.status.set(
+            f"{self._agent_spec(agent_key)['label']}: {self.selected_model.get()} · {self.selected_effort.get()}"
+        )
 
     def apply_agent_theme(self, agent_key):
         background = AGENT_BACKGROUNDS.get(agent_key, PANEL)
@@ -2312,6 +2421,16 @@ class App:
         if remember and self.current_session and self.current_session.get("id") != session_id:
             self.transfer_source_session_id = self.current_session.get("id")
         self.current_session = deepcopy(session)
+        agent_key = session.get("agent", self.active_agent.get())
+        settings = self.agent_settings.get(agent_key, DEFAULT_AGENT_SETTINGS[agent_key])
+        backend = session.get("backend") or {}
+        model = backend.get("model") or settings["model"]
+        effort = backend.get("effort") or settings["effort"]
+        if model in MODEL_OPTIONS[agent_key]:
+            self.selected_model.set(model)
+        if effort in EFFORT_OPTIONS[agent_key]:
+            self.selected_effort.set(effort)
+        self.refresh_agent_controls()
         self.apply_agent_theme(session.get("agent", self.active_agent.get()))
         self.live_source_signature = self._source_signature(
             self.current_session.get("source_path")
@@ -2551,7 +2670,7 @@ class App:
         session = self.store.new_session(self.active_agent.get(), self.cwd.get())
         self.local_sessions.insert(0, session)
         self.sessions = list(self.local_sessions) + list(self.external_sessions)
-        self.transfer_source_session_id = self.current_session.get("id") if self.current_session else None
+        self.transfer_source_session_id = None
         self._render_session_list()
         self.open_session(session["id"], remember=False)
 
@@ -2637,6 +2756,13 @@ class App:
             self.local_sessions.insert(0, self.current_session)
             self.sessions = list(self.local_sessions) + list(self.external_sessions)
             self._render_session_list()
+        backend_settings = self.current_session.setdefault("backend", {})
+        backend_settings["model"] = self.selected_model.get()
+        effort = self.selected_effort.get()
+        if self.active_agent.get() == "gemini" or effort == "Default":
+            backend_settings.pop("effort", None)
+        else:
+            backend_settings["effort"] = effort
         self._remember_project(self.cwd.get())
         self.input.delete("1.0", "end")
         self.busy = True
@@ -2840,6 +2966,7 @@ class App:
                 "geometry": self.win.geometry(),
                 "recent_projects": self.recent_projects,
                 "active_agent": self.active_agent.get(),
+                "agent_settings": self.agent_settings,
                 "last_session_id": self.current_session.get("id") if self.current_session else None,
                 "session_aliases": self.session_aliases,
             }
