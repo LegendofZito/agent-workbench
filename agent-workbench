@@ -229,6 +229,160 @@ def first_text_from_claude_jsonl(path):
     return ""
 
 
+def title_from_claude_jsonl(path):
+    for obj in read_jsonl_lines(path, limit=120):
+        if isinstance(obj, dict) and obj.get("type") == "ai-title":
+            title = clean_text(obj.get("aiTitle"))
+            if title:
+                return title
+    return ""
+
+
+def claude_jsonl_turns(path):
+    turns = []
+    current = None
+    pending_text = []
+    seen = set()
+
+    def ensure_turn(timestamp=""):
+        nonlocal current
+        if current is None:
+            current = {
+                "id": str(uuid.uuid4()),
+                "created_at": clean_text(timestamp) or now_iso(),
+                "status": "completed",
+                "items": [],
+            }
+            turns.append(current)
+        return current
+
+    def flush_assistant_text(final=False):
+        nonlocal pending_text
+        if not pending_text:
+            return
+        turn = ensure_turn()
+        for text in pending_text[:-1] if final else pending_text:
+            turn["items"].append({"type": "system", "text": text, "tag": "progress"})
+        if final:
+            turn["items"].append({"type": "agentMessage", "text": pending_text[-1]})
+        pending_text = []
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                record_id = clean_text(obj.get("uuid"))
+                if record_id and record_id in seen:
+                    continue
+                if record_id:
+                    seen.add(record_id)
+                if obj.get("isSidechain"):
+                    continue
+                record_type = obj.get("type")
+                if record_type not in {"user", "assistant"}:
+                    continue
+                message = obj.get("message") or {}
+                content = message.get("content")
+                blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+
+                if record_type == "user":
+                    text_parts = [
+                        clean_text(block.get("text"))
+                        for block in blocks
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    ]
+                    prompt = "\n".join(part for part in text_parts if part)
+                    tool_results = [
+                        block
+                        for block in blocks
+                        if isinstance(block, dict) and block.get("type") == "tool_result"
+                    ]
+                    if prompt:
+                        flush_assistant_text(final=True)
+                        current = {
+                            "id": record_id or str(uuid.uuid4()),
+                            "created_at": clean_text(obj.get("timestamp")) or now_iso(),
+                            "status": "completed",
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "content": [{"type": "text", "text": prompt}],
+                                }
+                            ],
+                        }
+                        turns.append(current)
+                    for result in tool_results:
+                        output = result.get("content")
+                        if isinstance(output, list):
+                            output = "\n".join(
+                                clean_text(bit.get("text"))
+                                for bit in output
+                                if isinstance(bit, dict) and bit.get("type") == "text"
+                            )
+                        text = clean_text(output)
+                        if text:
+                            ensure_turn(obj.get("timestamp"))["items"].append(
+                                {
+                                    "type": "system",
+                                    "text": text,
+                                    "tag": "system",
+                                }
+                            )
+                    continue
+
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type")
+                    if block_type == "text":
+                        text = clean_text(block.get("text"))
+                        if text:
+                            pending_text.append(text)
+                    elif block_type == "thinking":
+                        summary = clean_text(block.get("thinking"))
+                        if summary:
+                            ensure_turn(obj.get("timestamp"))["items"].append(
+                                {"type": "reasoning", "summary": [summary]}
+                            )
+                    elif block_type == "tool_use":
+                        flush_assistant_text(final=False)
+                        name = clean_text(block.get("name"))
+                        tool_input = block.get("input") or {}
+                        if name == "Bash":
+                            command = clean_text(tool_input.get("command"))
+                            if command:
+                                ensure_turn(obj.get("timestamp"))["items"].append(
+                                    {"type": "commandExecution", "command": command}
+                                )
+                        elif name in {"Edit", "Write", "NotebookEdit"}:
+                            path_value = clean_text(
+                                tool_input.get("file_path")
+                                or tool_input.get("notebook_path")
+                                or tool_input.get("path")
+                            )
+                            changes = [{"path": path_value}] if path_value else []
+                            ensure_turn(obj.get("timestamp"))["items"].append(
+                                {"type": "fileChange", "changes": changes, "tool": name}
+                            )
+                        else:
+                            detail = clean_text(
+                                tool_input.get("description")
+                                or tool_input.get("query")
+                                or tool_input.get("file_path")
+                            )
+                            label = f"Tool: {name}" + (f" — {detail}" if detail else "")
+                            ensure_turn(obj.get("timestamp"))["items"].append(
+                                {"type": "system", "text": label, "tag": "tool"}
+                            )
+        flush_assistant_text(final=True)
+    except OSError:
+        return []
+    return [turn for turn in turns if turn.get("items")]
+
+
 def codex_history_prompts():
     path = os.path.expanduser("~/.codex/history.jsonl")
     prompts = {}
@@ -462,6 +616,7 @@ def claude_sessions_for_cwd(cwd):
     for path in sorted(Path(root).glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
         sid = path.stem
         preview = first_text_from_claude_jsonl(str(path))
+        generated_title = title_from_claude_jsonl(str(path))
         try:
             mtime = path.stat().st_mtime
         except OSError:
@@ -473,24 +628,14 @@ def claude_sessions_for_cwd(cwd):
                 "agent": "claude",
                 "origin": "claude-terminal",
                 "cwd": cwd,
-                "title": preview or path.stem,
+                "title": generated_title or preview or path.stem,
                 "preview": preview or path.stem,
                 "created_at": iso_from_unix(mtime),
                 "updated_at": iso_from_unix(mtime),
+                "source_path": str(path),
                 "backend": {"session_id": sid},
-                "turns": [
-                    {
-                        "id": sid,
-                        "created_at": iso_from_unix(mtime),
-                        "status": "completed",
-                        "items": [
-                            {
-                                "type": "userMessage",
-                                "content": [{"type": "text", "text": preview or path.stem}],
-                            }
-                        ],
-                    }
-                ],
+                "turns": [],
+                "transcript_loaded": False,
             }
         )
     return sessions
@@ -1479,6 +1624,8 @@ class App:
         self.activity_state = "starting"
         self.activity_frame = 0
         self.live_source_signature = None
+        self.loading_external_sessions = set()
+        self.render_generation = 0
 
         self.win = tk.Tk(className="AgentWorkbench")
         self.win.title(APP_NAME)
@@ -2115,6 +2262,16 @@ class App:
             return alias
         return clean_text(session.get("title") or session.get("preview") or "Untitled")
 
+    def _session_list_label(self, session):
+        title = shorten(self._display_session_title(session), 48)
+        timestamp = clean_text(session.get("updated_at"))
+        try:
+            moment = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone()
+            stamp = moment.strftime("%b %d %H:%M")
+        except (ValueError, TypeError):
+            stamp = ""
+        return f"{stamp} · {title}" if stamp else title
+
     def _session_source_label(self, session):
         origin = session.get("origin", "local")
         if origin == "local":
@@ -2338,7 +2495,7 @@ class App:
                 if query in session_search_blob(session, self._session_alias(session))
             ]
         for session in self.visible_sessions:
-            title = self._display_session_title(session)
+            title = self._session_list_label(session)
             self.session_list.insert("end", title)
         if self.visible_sessions:
             self.session_list.selection_clear(0, "end")
@@ -2399,7 +2556,10 @@ class App:
             return
         idx = selection[0]
         if idx < len(self.visible_sessions):
-            self.open_session(self.visible_sessions[idx]["id"], remember=True)
+            selected_id = self.visible_sessions[idx]["id"]
+            if self.current_session and self.current_session.get("id") == selected_id:
+                return
+            self.open_session(selected_id, remember=True)
 
     def _restore_last_session(self):
         last_id = self.config.get("last_session_id")
@@ -2441,20 +2601,67 @@ class App:
         title = self._display_session_title(session)
         if origin != "local" and not self._session_alias(session):
             title = f"{title} (imported)"
-        self.session_title.set(title)
+        self.session_title.set(shorten(title, 110))
         self.session_label.set(
             f"{self._agent_spec(session.get('agent')).get('label', session.get('agent'))} · {project_label(session.get('cwd'))}"
         )
         self._clear_views()
-        self._render_session(session)
+        loading_transcript = origin == "claude-terminal" and not session.get("transcript_loaded")
+        if loading_transcript:
+            self._show_transcript_loading(session)
+            self._load_external_session(session)
+        else:
+            self._render_session(session)
         self.refresh_artifacts_view(session)
         self.scroll_chat_to_latest()
-        if origin == "local":
+        if loading_transcript:
+            pass
+        elif origin == "local":
             self.status.set("Ready. Send a prompt to continue this session.")
         else:
             self.status.set("Live terminal mirror. Send a prompt to create a continuation.")
-        self.set_activity("idle", "Live mirror" if origin == "codex-terminal" else None)
+        if not loading_transcript:
+            self.set_activity(
+                "idle",
+                "Live mirror" if origin in {"codex-terminal", "claude-terminal"} else None,
+            )
         self._persist_current()
+
+    def _show_transcript_loading(self, session):
+        self.chat.configure(state="normal")
+        self.chat.insert(
+            "end",
+            "Loading conversation…\n\n"
+            "The complete Claude transcript is being reconstructed in the background.",
+            "assistant",
+        )
+        self.chat.configure(state="disabled")
+        self.status.set("Loading complete Claude conversation…")
+        self.set_activity("starting", "Loading")
+
+    def _load_external_session(self, session):
+        session_id = session.get("id")
+        path = session.get("source_path")
+        if not session_id or not path or session_id in self.loading_external_sessions:
+            return
+        self.loading_external_sessions.add(session_id)
+        origin = session.get("origin")
+
+        def load():
+            if origin == "claude-terminal":
+                turns = claude_jsonl_turns(path)
+            else:
+                turns = codex_rollout_turns(path)
+            self.events.put(
+                {
+                    "kind": "external_session_loaded",
+                    "session_id": session_id,
+                    "turns": turns,
+                    "signature": self._source_signature(path),
+                }
+            )
+
+        threading.Thread(target=load, daemon=True).start()
 
     def _source_signature(self, path):
         if not path:
@@ -2468,41 +2675,38 @@ class App:
     def poll_external_session(self):
         try:
             session = self.current_session
-            if session and session.get("origin") == "codex-terminal":
+            if session and session.get("origin") in {"codex-terminal", "claude-terminal"}:
                 path = session.get("source_path")
                 signature = self._source_signature(path)
                 if signature and signature != self.live_source_signature:
                     self.live_source_signature = signature
-                    chat_at_bottom = self.chat.yview()[1] >= 0.995
-                    work_at_bottom = self.work.yview()[1] >= 0.995
-                    chat_position = self.chat.yview()[0]
-                    work_position = self.work.yview()[0]
-                    session["turns"] = codex_rollout_turns(path)
-                    session["updated_at"] = now_iso()
-                    self._clear_views()
-                    self._render_session(session)
-                    if chat_at_bottom:
-                        self.chat.see("end")
-                    else:
-                        self.chat.yview_moveto(chat_position)
-                    if work_at_bottom:
-                        self.work.see("end")
-                    else:
-                        self.work.yview_moveto(work_position)
-                    self.status.set("Live terminal mirror updated.")
-                    self.set_activity("idle", "Live mirror")
+                    self._load_external_session(session)
         finally:
             self.win.after(500, self.poll_external_session)
 
     def _clear_views(self):
+        self.render_generation += 1
         for widget in (self.chat, self.work):
             widget.configure(state="normal")
             widget.delete("1.0", "end")
             widget.configure(state="disabled")
 
     def _render_session(self, session):
-        for turn in session.get("turns") or []:
-            self._render_turn(turn, session.get("agent", "agent"))
+        self.render_generation += 1
+        generation = self.render_generation
+        turns = list(session.get("turns") or [])
+        agent = session.get("agent", "agent")
+
+        def render_batch(index=0):
+            if generation != self.render_generation:
+                return
+            end = min(index + 12, len(turns))
+            for turn in turns[index:end]:
+                self._render_turn(turn, agent)
+            if end < len(turns):
+                self.win.after(1, lambda: render_batch(end))
+
+        render_batch()
 
     def _render_turn(self, turn, agent_key):
         for item in turn.get("items") or []:
@@ -2941,6 +3145,33 @@ class App:
                 self.send_btn.configure(text="Send", state="normal")
                 self.stop_btn.pack_forget()
                 self.set_activity("error")
+        elif kind == "external_session_loaded":
+            session_id = event.get("session_id")
+            self.loading_external_sessions.discard(session_id)
+            turns = event.get("turns") or []
+            for session in self.external_sessions:
+                if session.get("id") == session_id:
+                    session["turns"] = turns
+                    session["transcript_loaded"] = True
+                    break
+            if self.current_session and self.current_session.get("id") == session_id:
+                chat_at_bottom = self.chat.yview()[1] >= 0.995
+                work_at_bottom = self.work.yview()[1] >= 0.995
+                chat_position = self.chat.yview()[0]
+                work_position = self.work.yview()[0]
+                self.current_session["turns"] = turns
+                self.current_session["transcript_loaded"] = True
+                self.current_session["updated_at"] = now_iso()
+                self.live_source_signature = event.get("signature")
+                self._clear_views()
+                self._render_session(self.current_session)
+                self.refresh_artifacts_view(self.current_session)
+                if not chat_at_bottom:
+                    self.chat.yview_moveto(chat_position)
+                if not work_at_bottom:
+                    self.work.yview_moveto(work_position)
+                self.status.set("Live Claude terminal mirror updated.")
+                self.set_activity("idle", "Live mirror")
         elif kind == "terminal_output":
             self.append_terminal(event.get("text", ""))
         elif kind == "terminal_clear":

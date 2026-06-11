@@ -4,9 +4,9 @@ Linux desktop workbench for Codex, Claude Code, and Gemini CLI sessions. It
 keeps the conversation readable while putting commands, file changes, tools,
 plans, and progress in a separate work log.
 
-Selected Codex terminal sessions are mirrored live. Conversation messages keep
-readable headings, lists, checklists, emphasis, and inline code while
-implementation output stays in Work Log.
+Selected Codex and Claude terminal sessions are mirrored live. Conversation
+messages keep readable headings, lists, checklists, emphasis, and inline code
+while implementation output stays in Work Log.
 
 The sidebar provides per-agent model and effort controls. Defaults favor
 responsive general use: Codex GPT-5.5 at medium effort, Claude Sonnet at medium
