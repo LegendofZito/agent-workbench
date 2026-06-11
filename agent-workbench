@@ -212,9 +212,16 @@ def first_text_from_claude_jsonl(path):
             continue
         if obj.get("type") != "user":
             continue
+        if obj.get("isMeta"):
+            continue
         message = obj.get("message") or {}
         content = message.get("content")
         if isinstance(content, str):
+            command = re.search(r"<command-name>(.*?)</command-name>", content, re.DOTALL)
+            if command:
+                text = clean_text(command.group(1))
+                if text:
+                    return text
             text = clean_text(content)
             if text:
                 return text
@@ -227,6 +234,12 @@ def first_text_from_claude_jsonl(path):
             if text:
                 return text
     return ""
+
+
+def claude_session_is_resumable(path):
+    for obj in read_jsonl_lines(path, limit=1):
+        return isinstance(obj, dict) and obj.get("type") != "queue-operation"
+    return False
 
 
 def title_from_claude_jsonl(path):
@@ -682,6 +695,8 @@ def claude_sessions_for_cwd(cwd):
     if not os.path.isdir(root):
         return sessions
     for path in sorted(Path(root).glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not claude_session_is_resumable(str(path)):
+            continue
         sid = path.stem
         preview = first_text_from_claude_jsonl(str(path))
         generated_title = title_from_claude_jsonl(str(path))
@@ -2736,6 +2751,8 @@ class App:
         return clean_text(self.session_aliases.get(session_alias_key(session), ""))
 
     def _display_session_title(self, session):
+        if session.get("origin") == "claude-terminal":
+            return clean_text(session.get("title") or session.get("preview") or "Untitled")
         alias = self._session_alias(session)
         if alias:
             return alias
@@ -2959,15 +2976,21 @@ class App:
             self.restart_terminal()
         self.local_sessions = self.store.list_for(self.cwd.get(), self.active_agent.get())
         self.external_sessions = discover_external_sessions(self.cwd.get(), self.active_agent.get())
-        self.sessions = list(self.local_sessions) + list(self.external_sessions)
+        if self.active_agent.get() == "claude":
+            self.sessions = list(self.external_sessions)
+        else:
+            self.sessions = list(self.local_sessions) + list(self.external_sessions)
         if not self.sessions:
             self.current_session = self.store.new_session(self.active_agent.get(), self.cwd.get())
             self.local_sessions = [self.current_session]
-            self.sessions = list(self.local_sessions)
-            self.external_sessions = []
+            if self.active_agent.get() != "claude":
+                self.sessions = list(self.local_sessions)
             self.transfer_source_session_id = None
         self._render_session_list()
-        self.open_session(self.sessions[0]["id"], remember=False)
+        if self.sessions:
+            self.open_session(self.sessions[0]["id"], remember=False)
+        else:
+            self.open_session(self.current_session["id"], remember=False)
 
     def _render_session_list(self):
         self._hide_session_tooltip()
@@ -3105,7 +3128,7 @@ class App:
         self.session_backend_id = session.get("backend", {}).get("thread_id") or session.get("backend", {}).get("session_id")
         origin = session.get("origin", "local")
         title = self._display_session_title(session)
-        if origin != "local" and not self._session_alias(session):
+        if origin != "local" and origin != "claude-terminal" and not self._session_alias(session):
             title = f"{title} (imported)"
         self.session_title.set(shorten(title, 110))
         self.session_label.set(
@@ -3465,7 +3488,10 @@ class App:
             return
         session = self.store.new_session(self.active_agent.get(), self.cwd.get())
         self.local_sessions.insert(0, session)
-        self.sessions = list(self.local_sessions) + list(self.external_sessions)
+        if self.active_agent.get() == "claude":
+            self.sessions = list(self.external_sessions)
+        else:
+            self.sessions = list(self.local_sessions) + list(self.external_sessions)
         self.transfer_source_session_id = None
         self._render_session_list()
         self.open_session(session["id"], remember=False)
@@ -3581,7 +3607,10 @@ class App:
             self.transfer_source_session_id = self.current_session.get("source_session_id") or self.current_session.get("id")
             self.current_session = self.store.clone_for_continuation(self.current_session)
             self.local_sessions.insert(0, self.current_session)
-            self.sessions = list(self.local_sessions) + list(self.external_sessions)
+            if self.active_agent.get() == "claude":
+                self.sessions = list(self.external_sessions)
+            else:
+                self.sessions = list(self.local_sessions) + list(self.external_sessions)
             self._render_session_list()
         backend_settings = self.current_session.setdefault("backend", {})
         backend_settings["model"] = self.selected_model.get()
