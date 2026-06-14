@@ -7,3 +7,4 @@ tmp/
 buildinstructions1.md
 BUILD-SPEC-*.md
 WORKBENCH-SOURCE-OF-TRUTH.md
+secrets.json

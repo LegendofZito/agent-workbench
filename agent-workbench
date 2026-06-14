@@ -50,6 +50,7 @@ UPDATE_REQUEST_FILE = os.path.join(CONFIG_DIR, "update-request.json")
 GEMINI_TITLE_CACHE_FILE = os.path.join(CONFIG_DIR, "gemini-titles.json")
 SESSIONS_DIR = os.path.join(CONFIG_DIR, "sessions")
 ARTIFACTS_DIR = os.path.join(CONFIG_DIR, "artifacts")
+SECRETS_FILE = os.path.join(CONFIG_DIR, "secrets.json")
 
 BG = "#0b0f16"
 PANEL = "#121925"
@@ -107,6 +108,41 @@ TURN_STALE_NOTICE_SECONDS = 120
 TURN_STALLED_SECONDS = 300
 TURN_ORPHAN_GRACE_SECONDS = 8
 HANDOFF_SEQUENCE_SLOTS = 5
+# ---------------------------------------------------------------------------
+# API key provider registry
+# (label, env_var, prefix_regex_or_None, inject_default)
+# inject_default=False for LLM providers that have their own CLI login so we
+# don't override the user's account session unless they explicitly opt in.
+# ---------------------------------------------------------------------------
+API_PROVIDERS = [
+    ("Anthropic (Claude)", "ANTHROPIC_API_KEY", r"^sk-ant-", False),
+    ("OpenAI", "OPENAI_API_KEY", r"^sk-(proj-[A-Za-z0-9_-]{12}|[A-Za-z0-9]{20})", False),
+    ("Google Gemini", "GEMINI_API_KEY", r"^AIza[0-9A-Za-z_\-]{30,}$", False),
+    ("OpenRouter", "OPENROUTER_API_KEY", r"^sk-or-", True),
+    ("Groq", "GROQ_API_KEY", r"^gsk_[A-Za-z0-9]{40,}", True),
+    ("Finnhub", "FINNHUB_API_KEY", r"^[a-z0-9]{20}$", True),
+    ("Tavily", "TAVILY_API_KEY", r"^tvly-", True),
+    ("Hugging Face", "HF_TOKEN", r"^hf_[A-Za-z0-9]{30,}", True),
+    ("GitHub Token", "GITHUB_TOKEN", r"^gh[ps]_[A-Za-z0-9]{36}", True),
+    ("Alpaca Key ID", "APCA_API_KEY_ID", r"^(PK|AK)[A-Z0-9]{16,}", True),
+    ("Alpaca Secret", "APCA_API_SECRET_KEY", None, True),
+    ("Custom (enter env var)", "", None, True),
+]
+_LLM_PROVIDER_LABELS = {"Anthropic (Claude)", "OpenAI", "Google Gemini"}
+
+
+def detect_provider(key):
+    """Return the first matching API_PROVIDERS tuple for *key*, or None."""
+    key = key.strip() if key else ""
+    if not key:
+        return None
+    for entry in API_PROVIDERS:
+        label, env_var, pattern, inject_default = entry
+        if pattern and re.search(pattern, key):
+            return entry
+    return None
+
+
 PREFERRED_WORKER_MODELS = {
     "codex": ("gpt-5.4-mini", "gpt-5.4", "gpt-5.5"),
     "claude": ("sonnet", "haiku", "Default", "fable", "opus"),
@@ -3621,6 +3657,8 @@ class App:
     def __init__(self):
         migrate_legacy_config()
         self.config = load_json(CONFIG_FILE, {})
+        self._load_secrets()
+        self._apply_secrets_env()
         self.install_info = load_json(INSTALL_INFO_FILE, {})
         ensure_dir(CONFIG_DIR)
         ensure_dir(SESSIONS_DIR)
@@ -3897,6 +3935,47 @@ class App:
         self.win.after(1000, self.poll_update_request)
         self.win.after(1500, self.watchdog)
         self.win.after(1800, self.poll_usage)
+
+    # ------------------------------------------------------------------
+    # Secrets storage and env-injection helpers
+    # ------------------------------------------------------------------
+
+    def _load_secrets(self):
+        """Load secrets.json into self.secrets; initialise tracking set."""
+        self.secrets = load_json(SECRETS_FILE, {"keys": [], "mcp": []})
+        if "keys" not in self.secrets:
+            self.secrets["keys"] = []
+        if "mcp" not in self.secrets:
+            self.secrets["mcp"] = []
+        if not hasattr(self, "_injected_env"):
+            self._injected_env = set()
+
+    def _save_secrets(self):
+        """Persist self.secrets to SECRETS_FILE with mode 0600."""
+        save_json(SECRETS_FILE, self.secrets)
+        try:
+            os.chmod(SECRETS_FILE, 0o600)
+        except OSError:
+            pass
+
+    def _apply_secrets_env(self):
+        """Inject/un-inject env vars based on current self.secrets[keys]."""
+        if not hasattr(self, "_injected_env"):
+            self._injected_env = set()
+        # Build the desired inject map
+        desired = {}
+        for entry in self.secrets.get("keys", []):
+            if entry.get("inject") and entry.get("env") and entry.get("value"):
+                desired[entry["env"]] = entry["value"]
+        # Remove vars we previously set that are no longer inject=True
+        for env_var in list(self._injected_env):
+            if env_var not in desired:
+                os.environ.pop(env_var, None)
+                self._injected_env.discard(env_var)
+        # Set/update desired vars
+        for env_var, value in desired.items():
+            os.environ[env_var] = value
+            self._injected_env.add(env_var)
 
     def _create_backend_set(self, workspace_id):
         backends = {
@@ -9607,8 +9686,633 @@ class App:
         menu.add_command(label="Handoff target...", command=self.open_handoff_dialog)
         menu.add_command(label="Auto handoff sequence...", command=self.open_handoff_options_dialog)
         menu.add_separator()
+        menu.add_command(label="API Keys & MCP…", command=self.open_keys_dialog)
+        menu.add_separator()
         menu.add_command(label="Refresh now", command=self.refresh_workspace)
         menu.tk_popup(self.options_btn.winfo_rootx(), self.options_btn.winfo_rooty() + self.options_btn.winfo_height())
+
+    # ------------------------------------------------------------------
+    # API Keys & MCP dialog
+    # ------------------------------------------------------------------
+
+    def open_keys_dialog(self):
+        """Open the API Keys & MCP manager dialog."""
+        if hasattr(self, "_keys_dialog") and self._keys_dialog and self._keys_dialog.winfo_exists():
+            self._keys_dialog.lift()
+            self._keys_dialog.focus_force()
+            return
+
+        dialog = tk.Toplevel(self.win)
+        self._keys_dialog = dialog
+        dialog.title("API Keys & MCP")
+        dialog.configure(bg=BG)
+        dialog.transient(self.win)
+        dialog.resizable(True, True)
+        dialog.grab_set()
+        dialog.minsize(640, 520)
+
+        # ── outer scroll canvas so the dialog is scrollable on small screens ──
+        outer = tk.Frame(dialog, bg=BG)
+        outer.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0, bd=0)
+        vscroll = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        body = tk.Frame(canvas, bg=BG, padx=18, pady=16)
+        body_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _on_resize(event):
+            canvas.itemconfig(body_id, width=event.width)
+
+        def _on_body_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        canvas.bind("<Configure>", _on_resize)
+        body.bind("<Configure>", _on_body_configure)
+
+        # ── header ──
+        tk.Label(
+            body,
+            text="API Keys & MCP",
+            bg=BG,
+            fg=TEXT,
+            font=("Sans", 14, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            body,
+            text=(
+                "Store API keys and inject them into agent environment variables. "
+                "MCP servers are registered with Claude Code (user scope)."
+            ),
+            bg=BG,
+            fg=MUTED,
+            justify="left",
+            wraplength=580,
+        ).pack(anchor="w", pady=(2, 10))
+
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=(0, 10))
+
+        # ── Section A: paste & auto-detect ──
+        tk.Label(
+            body,
+            text="Paste a key — auto-detect provider",
+            bg=BG,
+            fg=TEXT,
+            font=("Sans", 10, "bold"),
+        ).pack(anchor="w")
+
+        paste_row = tk.Frame(body, bg=BG)
+        paste_row.pack(fill="x", pady=(4, 0))
+        paste_var = tk.StringVar(master=dialog)
+        paste_entry = tk.Entry(
+            paste_row,
+            textvariable=paste_var,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            font=("Sans", 10),
+        )
+        paste_entry.pack(side="left", fill="x", expand=True, ipady=4)
+        paste_hint = tk.Label(
+            body,
+            text="",
+            bg=BG,
+            fg=MUTED,
+            font=("Sans", 9),
+            anchor="w",
+        )
+        paste_hint.pack(anchor="w", pady=(2, 6))
+
+        def _do_paste_add():
+            raw = paste_var.get().strip()
+            if not raw:
+                paste_hint.configure(text="Enter a key first.", fg="#e57373")
+                return
+            matched = detect_provider(raw)
+            if matched:
+                label, env_var, pattern, inject_default = matched
+                # Overwrite if same env already stored
+                keys = self.secrets["keys"]
+                for k in keys:
+                    if k.get("env") == env_var:
+                        k["value"] = raw
+                        k["inject"] = inject_default
+                        break
+                else:
+                    keys.append({
+                        "provider": label,
+                        "env": env_var,
+                        "value": raw,
+                        "inject": inject_default,
+                    })
+                self._save_secrets()
+                self._apply_secrets_env()
+                paste_var.set("")
+                paste_hint.configure(text=f"Detected: {label} — saved.", fg="#4caf50")
+                self._refresh_keys_dialog()
+            else:
+                paste_hint.configure(
+                    text="Couldn't auto-detect — pick a provider below.",
+                    fg=MUTED,
+                )
+                provider_var.set("Custom (enter env var)")
+                _on_provider_change()
+
+        paste_add_btn = tk.Button(
+            paste_row,
+            text="Add",
+            bg=PANEL_ALT,
+            fg=TEXT,
+            activebackground=SIDEBAR_SEL,
+            activeforeground=TEXT,
+            relief="flat",
+            padx=12,
+            pady=4,
+            cursor="hand2",
+            command=_do_paste_add,
+        )
+        paste_add_btn.pack(side="left", padx=(6, 0))
+        paste_entry.bind("<Return>", lambda _e: _do_paste_add())
+
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=(4, 10))
+
+        # ── Section B: manual provider pick ──
+        tk.Label(
+            body,
+            text="Or pick a provider",
+            bg=BG,
+            fg=TEXT,
+            font=("Sans", 10, "bold"),
+        ).pack(anchor="w")
+
+        provider_labels = [p[0] for p in API_PROVIDERS]
+        provider_var = tk.StringVar(master=dialog, value=provider_labels[0])
+
+        prow = tk.Frame(body, bg=BG)
+        prow.pack(fill="x", pady=(4, 0))
+
+        import tkinter.ttk as ttk
+        provider_combo = ttk.Combobox(
+            prow,
+            textvariable=provider_var,
+            values=provider_labels,
+            state="readonly",
+            width=26,
+            font=("Sans", 10),
+        )
+        provider_combo.pack(side="left")
+
+        manual_key_var = tk.StringVar(master=dialog)
+        manual_key_entry = tk.Entry(
+            prow,
+            textvariable=manual_key_var,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            font=("Sans", 10),
+            width=28,
+        )
+        manual_key_entry.pack(side="left", padx=(6, 0), ipady=4, fill="x", expand=True)
+
+        # Custom env var row (visible only for "Custom")
+        env_row = tk.Frame(body, bg=BG)
+        env_row.pack(fill="x", pady=(4, 0))
+        env_label_lbl = tk.Label(env_row, text="Env var name:", bg=BG, fg=MUTED, font=("Sans", 9))
+        env_label_lbl.pack(side="left")
+        custom_env_var = tk.StringVar(master=dialog)
+        custom_env_entry = tk.Entry(
+            env_row,
+            textvariable=custom_env_var,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            font=("Sans", 10),
+            width=24,
+        )
+        custom_env_entry.pack(side="left", padx=(6, 0), ipady=4)
+
+        manual_hint = tk.Label(body, text="", bg=BG, fg=MUTED, font=("Sans", 9), anchor="w")
+        manual_hint.pack(anchor="w", pady=(2, 2))
+
+        def _on_provider_change(*_args):
+            is_custom = provider_var.get() == "Custom (enter env var)"
+            env_label_lbl.configure(fg=TEXT if is_custom else PANEL)
+            custom_env_entry.configure(state="normal" if is_custom else "disabled",
+                                       fg=TEXT if is_custom else PANEL)
+
+        provider_combo.bind("<<ComboboxSelected>>", _on_provider_change)
+        _on_provider_change()
+
+        def _do_manual_add():
+            chosen = provider_var.get()
+            raw = manual_key_var.get().strip()
+            if not raw:
+                manual_hint.configure(text="Enter a key value first.", fg="#e57373")
+                return
+            if chosen == "Custom (enter env var)":
+                env_var = custom_env_var.get().strip()
+                if not env_var:
+                    manual_hint.configure(text="Enter an env var name.", fg="#e57373")
+                    return
+                inject_default = True
+                label = f"Custom ({env_var})"
+            else:
+                entry = next((p for p in API_PROVIDERS if p[0] == chosen), None)
+                if not entry:
+                    return
+                label, env_var, _pat, inject_default = entry
+            keys = self.secrets["keys"]
+            for k in keys:
+                if k.get("env") == env_var:
+                    k["value"] = raw
+                    k["inject"] = inject_default
+                    break
+            else:
+                keys.append({
+                    "provider": label,
+                    "env": env_var,
+                    "value": raw,
+                    "inject": inject_default,
+                })
+            self._save_secrets()
+            self._apply_secrets_env()
+            manual_key_var.set("")
+            custom_env_var.set("")
+            manual_hint.configure(text=f"Saved {label}.", fg="#4caf50")
+            self._refresh_keys_dialog()
+
+        manual_add_btn = tk.Button(
+            prow,
+            text="Add",
+            bg=PANEL_ALT,
+            fg=TEXT,
+            activebackground=SIDEBAR_SEL,
+            activeforeground=TEXT,
+            relief="flat",
+            padx=12,
+            pady=4,
+            cursor="hand2",
+            command=_do_manual_add,
+        )
+        manual_add_btn.pack(side="left", padx=(6, 0))
+        manual_key_entry.bind("<Return>", lambda _e: _do_manual_add())
+
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=(8, 10))
+
+        # ── Section C: saved keys list ──
+        tk.Label(
+            body,
+            text="Saved keys",
+            bg=BG,
+            fg=TEXT,
+            font=("Sans", 10, "bold"),
+        ).pack(anchor="w")
+
+        keys_list_frame = tk.Frame(body, bg=BG)
+        keys_list_frame.pack(fill="x", pady=(4, 0))
+
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=(8, 10))
+
+        # ── Section D: MCP servers ──
+        tk.Label(
+            body,
+            text="MCP Servers",
+            bg=BG,
+            fg=TEXT,
+            font=("Sans", 10, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            body,
+            text="Registers with Claude Code (user scope). Codex/Gemini MCP is configured separately.",
+            bg=BG,
+            fg=MUTED,
+            font=("Sans", 9),
+            anchor="w",
+            wraplength=580,
+        ).pack(anchor="w", pady=(1, 6))
+
+        mcp_list_frame = tk.Frame(body, bg=BG)
+        mcp_list_frame.pack(fill="x", pady=(0, 6))
+
+        # Add MCP row
+        add_mcp_row = tk.Frame(body, bg=BG)
+        add_mcp_row.pack(fill="x")
+        mcp_name_var = tk.StringVar(master=dialog)
+        mcp_cmd_var = tk.StringVar(master=dialog)
+        tk.Label(add_mcp_row, text="Name:", bg=BG, fg=MUTED, font=("Sans", 9), width=6, anchor="e").pack(side="left")
+        mcp_name_entry = tk.Entry(
+            add_mcp_row,
+            textvariable=mcp_name_var,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            font=("Sans", 10),
+            width=18,
+        )
+        mcp_name_entry.pack(side="left", padx=(4, 8), ipady=4)
+        tk.Label(add_mcp_row, text="Command:", bg=BG, fg=MUTED, font=("Sans", 9)).pack(side="left")
+        mcp_cmd_entry = tk.Entry(
+            add_mcp_row,
+            textvariable=mcp_cmd_var,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            font=("Sans", 10),
+            width=30,
+        )
+        mcp_cmd_entry.pack(side="left", padx=(4, 8), ipady=4, fill="x", expand=True)
+
+        mcp_status = tk.Label(body, text="", bg=BG, fg=MUTED, font=("Sans", 9), anchor="w")
+        mcp_status.pack(anchor="w", pady=(2, 0))
+
+        def _do_add_mcp():
+            name = mcp_name_var.get().strip()
+            command = mcp_cmd_var.get().strip()
+            if not name or not command:
+                mcp_status.configure(text="Name and command are required.", fg="#e57373")
+                return
+            # Check for duplicate name
+            existing_names = {m.get("name") for m in self.secrets.get("mcp", [])}
+            if name in existing_names:
+                mcp_status.configure(text=f"MCP server '{name}' already exists.", fg="#e57373")
+                return
+            self.secrets["mcp"].append({"name": name, "command": command, "scope": "user"})
+            self._save_secrets()
+            # Register with Claude Code
+            try:
+                parts = shlex.split(command)
+                result = subprocess.run(
+                    ["claude", "mcp", "add", "-s", "user", name, "--"] + parts,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0:
+                    mcp_status.configure(text=f"Registered '{name}' with Claude Code.", fg="#4caf50")
+                else:
+                    err = (result.stderr or result.stdout or "").strip()[:120]
+                    mcp_status.configure(text=f"Saved but Claude returned: {err}", fg="#e57373")
+            except FileNotFoundError:
+                mcp_status.configure(text=f"Saved '{name}'. Register manually: claude mcp add -s user {name} -- {command}", fg=MUTED)
+            except Exception as exc:
+                mcp_status.configure(text=f"Saved '{name}'; register error: {exc}", fg="#e57373")
+            mcp_name_var.set("")
+            mcp_cmd_var.set("")
+            self._refresh_keys_dialog()
+
+        add_mcp_btn = tk.Button(
+            add_mcp_row,
+            text="Add",
+            bg=PANEL_ALT,
+            fg=TEXT,
+            activebackground=SIDEBAR_SEL,
+            activeforeground=TEXT,
+            relief="flat",
+            padx=12,
+            pady=4,
+            cursor="hand2",
+            command=_do_add_mcp,
+        )
+        add_mcp_btn.pack(side="left")
+        mcp_name_entry.bind("<Return>", lambda _e: _do_add_mcp())
+        mcp_cmd_entry.bind("<Return>", lambda _e: _do_add_mcp())
+
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=(10, 10))
+
+        # ── Close button ──
+        close_row = tk.Frame(body, bg=BG)
+        close_row.pack(fill="x")
+        tk.Button(
+            close_row,
+            text="Close",
+            bg=PANEL_ALT,
+            fg=TEXT,
+            activebackground=SIDEBAR_SEL,
+            activeforeground=TEXT,
+            relief="flat",
+            padx=18,
+            pady=5,
+            cursor="hand2",
+            command=dialog.destroy,
+        ).pack(side="right")
+
+        # ── attach the state needed by _refresh_keys_dialog ──
+        self._keys_dialog_refs = {
+            "keys_list_frame": keys_list_frame,
+            "mcp_list_frame": mcp_list_frame,
+            "dialog": dialog,
+        }
+
+        self._refresh_keys_dialog()
+        dialog.bind("<Destroy>", lambda _e: self._on_keys_dialog_close())
+
+    def _on_keys_dialog_close(self):
+        """Clean up dialog refs when the keys dialog is closed."""
+        self._keys_dialog_refs = {}
+
+    def _refresh_keys_dialog(self):
+        """Rebuild the saved-keys list and MCP list in the open dialog."""
+        refs = getattr(self, "_keys_dialog_refs", {})
+        if not refs:
+            return
+        dialog = refs.get("dialog")
+        if not dialog or not dialog.winfo_exists():
+            return
+
+        # ── Keys list (Section C) ──
+        kf = refs.get("keys_list_frame")
+        if kf and kf.winfo_exists():
+            for child in kf.winfo_children():
+                child.destroy()
+            keys = self.secrets.get("keys", [])
+            if not keys:
+                tk.Label(kf, text="No keys saved yet.", bg=BG, fg=MUTED, font=("Sans", 9)).pack(anchor="w")
+            for idx, entry in enumerate(keys):
+                provider = entry.get("provider", "Unknown")
+                env_var = entry.get("env", "")
+                raw_val = entry.get("value", "")
+                # Masked value: first 6 + "…" + last 4
+                if len(raw_val) > 12:
+                    masked = raw_val[:6] + "…" + raw_val[-4:]
+                elif len(raw_val) > 4:
+                    masked = raw_val[:3] + "…" + raw_val[-2:]
+                else:
+                    masked = "••••"
+                inject_var = tk.BooleanVar(master=dialog, value=bool(entry.get("inject", False)))
+
+                row = tk.Frame(kf, bg=PANEL, pady=3)
+                row.pack(fill="x", pady=2)
+
+                tk.Label(
+                    row,
+                    text=provider,
+                    bg=PANEL,
+                    fg=TEXT,
+                    font=("Sans", 9, "bold"),
+                    width=22,
+                    anchor="w",
+                ).pack(side="left", padx=(8, 0))
+                tk.Label(
+                    row,
+                    text=env_var,
+                    bg=PANEL,
+                    fg=MUTED,
+                    font=("Monospace", 8),
+                    width=26,
+                    anchor="w",
+                ).pack(side="left", padx=(4, 0))
+                tk.Label(
+                    row,
+                    text=masked,
+                    bg=PANEL,
+                    fg=MUTED,
+                    font=("Monospace", 8),
+                    width=16,
+                    anchor="w",
+                ).pack(side="left", padx=(4, 0))
+
+                # LLM override warning
+                if provider in _LLM_PROVIDER_LABELS:
+                    tk.Label(
+                        row,
+                        text="(overrides account login)",
+                        bg=PANEL,
+                        fg=MUTED,
+                        font=("Sans", 8),
+                        anchor="w",
+                    ).pack(side="left", padx=(2, 0))
+
+                def _make_inject_toggle(i, ivar):
+                    def _toggle():
+                        self.secrets["keys"][i]["inject"] = ivar.get()
+                        self._save_secrets()
+                        self._apply_secrets_env()
+                    return _toggle
+
+                inject_cb = tk.Checkbutton(
+                    row,
+                    text="inject at launch",
+                    variable=inject_var,
+                    bg=PANEL,
+                    fg=TEXT,
+                    selectcolor=PANEL,
+                    activebackground=PANEL,
+                    activeforeground=TEXT,
+                    font=("Sans", 9),
+                    command=_make_inject_toggle(idx, inject_var),
+                )
+                inject_cb.pack(side="left", padx=(4, 0))
+
+                def _make_remove_key(i):
+                    def _remove():
+                        removed_env = self.secrets["keys"][i].get("env", "")
+                        del self.secrets["keys"][i]
+                        # un-inject if currently injected
+                        if removed_env and removed_env in self._injected_env:
+                            os.environ.pop(removed_env, None)
+                            self._injected_env.discard(removed_env)
+                        self._save_secrets()
+                        self._apply_secrets_env()
+                        self._refresh_keys_dialog()
+                    return _remove
+
+                tk.Button(
+                    row,
+                    text="Remove",
+                    bg=PANEL,
+                    fg="#e57373",
+                    activebackground=PANEL_ALT,
+                    activeforeground="#e57373",
+                    relief="flat",
+                    padx=6,
+                    pady=2,
+                    cursor="hand2",
+                    command=_make_remove_key(idx),
+                ).pack(side="right", padx=(0, 6))
+
+        # ── MCP list (Section D) ──
+        mf = refs.get("mcp_list_frame")
+        if mf and mf.winfo_exists():
+            for child in mf.winfo_children():
+                child.destroy()
+            mcp_list = self.secrets.get("mcp", [])
+            if not mcp_list:
+                tk.Label(mf, text="No MCP servers saved.", bg=BG, fg=MUTED, font=("Sans", 9)).pack(anchor="w")
+            for idx, srv in enumerate(mcp_list):
+                name = srv.get("name", "")
+                cmd = srv.get("command", "")
+                row = tk.Frame(mf, bg=PANEL, pady=3)
+                row.pack(fill="x", pady=2)
+                tk.Label(
+                    row,
+                    text=name,
+                    bg=PANEL,
+                    fg=TEXT,
+                    font=("Sans", 9, "bold"),
+                    width=18,
+                    anchor="w",
+                ).pack(side="left", padx=(8, 0))
+                tk.Label(
+                    row,
+                    text=cmd,
+                    bg=PANEL,
+                    fg=MUTED,
+                    font=("Monospace", 8),
+                    anchor="w",
+                ).pack(side="left", padx=(6, 0), fill="x", expand=True)
+
+                def _make_remove_mcp(i, sname):
+                    def _remove():
+                        del self.secrets["mcp"][i]
+                        self._save_secrets()
+                        # Best-effort deregister from Claude Code
+                        try:
+                            subprocess.run(
+                                ["claude", "mcp", "remove", "-s", "user", sname],
+                                capture_output=True,
+                                timeout=8,
+                            )
+                        except Exception:
+                            pass
+                        self._refresh_keys_dialog()
+                    return _remove
+
+                tk.Button(
+                    row,
+                    text="Remove",
+                    bg=PANEL,
+                    fg="#e57373",
+                    activebackground=PANEL_ALT,
+                    activeforeground="#e57373",
+                    relief="flat",
+                    padx=6,
+                    pady=2,
+                    cursor="hand2",
+                    command=_make_remove_mcp(idx, name),
+                ).pack(side="right", padx=(0, 6))
 
     def open_claude_orchestration_dialog(self):
         dialog = tk.Toplevel(self.win)

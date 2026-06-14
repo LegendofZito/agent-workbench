@@ -183,6 +183,21 @@ Agent Workbench sends the prompt through standard input. Custom definitions are
 stored only in the current user's local configuration and never include or copy
 the client's credentials.
 
+## API keys and MCP servers
+
+Open **Options → API Keys & MCP…** to connect optional providers (such as
+OpenRouter or Groq) and MCP servers. Paste a key and Agent Workbench
+auto-detects the provider from its prefix, or pick one from the list and add it
+manually.
+
+Keys are stored locally in `~/.config/agent-workbench/secrets.json` (mode
+`0600`), never logged, and never leave your machine. They are injected as
+environment variables when agents launch. The `claude`, `codex`, and `gemini`
+clients use their own account sign-in, so their provider keys stay **off by
+default** — enable one only if you intentionally want to use API billing.
+
+MCP servers added here are registered with Claude Code at user scope.
+
 ## Security
 
 This prototype starts agent CLIs in their unrestricted automation modes:
