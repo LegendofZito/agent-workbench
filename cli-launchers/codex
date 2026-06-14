@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+real_bin="${CODEX_REAL_BIN:-${HOME}/.npm-global/bin/codex}"
+if [[ ! -x "${real_bin}" ]]; then
+  printf 'Codex launcher: missing executable at %s\n' "${real_bin}" >&2
+  exit 1
+fi
+
+args=("$@")
+if [[ -z "${AGENT_WORKBENCH_SAFE_PERMISSIONS:-}" ]]; then
+  has_bypass=0
+  for arg in "${args[@]}"; do
+    [[ "${arg}" == "--dangerously-bypass-approvals-and-sandbox" ]] && has_bypass=1
+  done
+  (( has_bypass )) || args=("--dangerously-bypass-approvals-and-sandbox" "${args[@]}")
+fi
+
+exec "${real_bin}" "${args[@]}"

@@ -18,28 +18,55 @@ Open tabs, selected sessions, agents, projects, models, and effort settings are
 restored after restart. Use `Ctrl+T` for a new tab, `Ctrl+W` to close one, and
 `Ctrl+Tab` to switch.
 
+Messages sent while an agent is working are queued on that tab and submitted in
+order when the current turn finishes. Claude-backed Workbench sessions reload
+their full Claude transcript after restart. A down-arrow in Conversation jumps
+directly to the newest message in long discussions. When new output arrives
+while you are reading earlier messages, Workbench preserves your scroll position
+and changes the arrow to **New** instead of interrupting your review.
+
+Closing Agent Workbench while a turn is running queues the close until all
+active turns finish. Installing an update uses the same safe point, then
+restarts the newly installed build automatically. If the process is forcibly
+terminated or crashes, the next launch identifies sessions whose last turn was
+interrupted so unfinished work is not silently forgotten.
+
 Codex and Claude sessions show their active context usage in the top bar. The
 conversation scrollbar is green below 40%, yellow from 40-60%, orange from
 60-80%, and red above 80%. Claude's meter follows automatic compaction and
 labels compacted sessions, so transcript length is not mistaken for active
-context usage.
+context usage. **Hand Off** stays visible in the top bar and becomes available
+at 70% active context or after the first compaction, when older details already
+depend on a generated summary.
+
+The separate **Limits** badge reports account rate-limit usage rather than
+conversation context. Click it to refresh and show reset times. Codex reads the
+five-hour and weekly windows from its native session telemetry; Claude queries
+the same five-hour, weekly, and Sonnet-only usage data exposed by Claude Code.
 
 The sidebar provides per-agent model and effort controls. Claude choices
-include Fable, Opus, Sonnet, and Haiku. Defaults favor
-responsive general use: Codex GPT-5.5 at medium effort, the installed Claude
-client's default model at medium effort, and Gemini Auto. Resumed Claude
+include Fable, Opus, Sonnet, and Haiku. Defaults follow the installed clients:
+Codex uses the model configured by the local Codex CLI at medium effort, Claude
+uses the installed client's default model at medium effort, and Gemini uses Auto. Resumed Claude
 terminal sessions retain their detected Fable, Opus, Sonnet, or Haiku model family.
 Preferences are remembered separately for each agent.
 
-Newly named sessions appear immediately, including empty drafts. Claude session
+Newly named sessions appear immediately. Only the newest untouched session is
+shown, preventing abandoned empty sessions from filling the sidebar. Claude session
 names are passed into Claude Code so they also appear in its `/resume` picker.
 Sessions can be renamed, moved up or down with persistent ordering, or deleted
-from the sidebar. Deleting a terminal-backed session also removes it from that
-agent client's resume history after confirmation.
+from the sidebar. Workbench presents the connected client's native history as
+one session list; it does not label sessions as imported or create a separate
+visible transcript type. Continuing a listed session resumes that same native
+Codex, Claude, or Gemini session ID. After confirmation, deleting a connected
+session also removes it from that client's history.
+Codex uses its native archive operation; Claude and Gemini use their native
+session deletion storage/commands.
 
 The Artifacts tab stores screenshots, images, text files, and other documents in
 a local folder dedicated to the selected session. Drop a file directly into
-Conversation to store it and attach it to the next message, or use **Attach**.
+Conversation to store it and attach it to the next message, use **Attach**, or
+press `Ctrl+V` in the composer to attach an image from the Wayland clipboard.
 Images and text files have built-in previews. Adding a file from the Artifacts
 tab stores it without sending it; secondary actions are available by
 right-clicking the file. A queued attachment can be sent without typing a
@@ -49,12 +76,28 @@ Conversation text supports click-drag selection, `Ctrl+C`, right-click copy,
 clickable web links, and clickable existing local paths. Right-clicking selected
 text opens a compact **Copy** menu. New sessions ask for an optional title and
 automatically derive one from the first prompt when the title is left blank.
-Unsent sessions are marked as drafts; once Claude creates the real session,
-Workbench keeps its title synchronized with Claude Code's `/resume` history.
+Once Claude creates the real session, Workbench keeps its title synchronized
+with Claude Code's `/resume` history. Workbench also normalizes print-mode
+Claude transcripts into Claude's standard CLI history shape, so sessions
+created in Workbench appear in the terminal picker and resume by their title.
 
 The built-in Terminal tab provides a persistent PTY shell in the selected
 project. It loads the user's normal interactive shell configuration and
 supports command history, interactive line input, `Ctrl+C`, and shell restart.
+
+Claude orchestration is non-modal. With **Options → Claude orchestration →
+Smart routing**, Claude announces a concise routing plan only for substantial
+actionable work, then uses its native subagents inside the current session:
+Haiku for bounded read-only research, Sonnet at low/medium/high effort for
+implementation based on complexity, and Opus at high effort for architecture,
+high-risk decisions, and final review. Haiku does not expose an effort setting.
+It does not ask after every prompt or create a separate Workbench worker unless
+you explicitly use the Workers controls.
+
+The **Workers** dialog is reserved for explicitly started manual worker
+sessions. It shows active workers by default; completed and interrupted history
+is optional and can be cleared. Native Claude subagents remain part of the
+current Claude conversation rather than creating duplicate Workbench tabs.
 
 ![Agent Workbench icon](assets/agent-workbench.png)
 
@@ -75,6 +118,47 @@ supports command history, interactive line input, `Ctrl+C`, and shell restart.
 ```
 
 Send prompts with `Ctrl+Enter`.
+
+The installer also places managed `claude`, `codex`, and `gemini` launchers in
+`~/.local/share/agent-workbench/cli` and adds that directory to interactive
+Bash sessions. These launchers use the same no-approval modes as Agent
+Workbench. Set `AGENT_WORKBENCH_SAFE_PERMISSIONS=1` for a single command when
+you intentionally want the client to use its normal approval prompts.
+
+## Context handoff
+
+Agent Workbench tracks each client's active context window separately from
+account usage limits. At 70% it displays a context-quality warning; at 85% the
+warning becomes critical.
+
+Use **Hand Off** to create a fresh client session without copying text or
+managing a handoff file. The new session:
+
+- receives a local `HANDOFF.md` artifact covering user goals, decisions,
+  upgrades, failures, technical details, and unresolved follow-ups
+- starts with a fresh backend session and context window
+- continues automatically with the same client, project, model, and effort
+- receives the next numbered title, such as `Project`, `Project 2`, `Project 3`
+
+Once the warning threshold is reached, Workbench updates `HANDOFF.md` only when
+the saved conversation state changes. The staged file remains available in
+Artifacts even if the client later stops responding.
+
+Failed client turns remain visibly failed and include the client's diagnostic
+message when available instead of immediately returning the status badge to
+Ready.
+
+## Recovery and refresh
+
+Use **Refresh** or press `F5` to reconcile Workbench with the clients and local
+session files. Refresh preserves an active turn, rescans session history,
+reloads transcript and context data, and restarts an idle Codex service if its
+local app server stopped.
+
+A watchdog verifies client-process health every two seconds. It does not cancel
+long-running work. After two minutes without an event it changes the status to
+**Still working** and explains that Refresh is safe. A turn is failed
+automatically only when its underlying client process is confirmed gone.
 
 ## Install
 

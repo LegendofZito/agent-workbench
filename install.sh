@@ -4,6 +4,11 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
 config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+launcher_home="${data_home}/agent-workbench/cli"
+running_pid="$(
+  pgrep -o -f "^(/usr/bin/)?python3 ${HOME}/.local/bin/agent-workbench$" \
+    2>/dev/null || true
+)"
 
 if ! command -v python3 >/dev/null 2>&1; then
   printf 'Missing Python 3. On Fedora, run: sudo dnf install python3 python3-tkinter xdg-utils\n' >&2
@@ -30,6 +35,7 @@ then
 fi
 
 install -d "${HOME}/.local/bin" "${data_home}/applications" "${data_home}/icons"
+install -d "${launcher_home}"
 install -d "${config_home}/agent-workbench"
 install -m 0755 "${root}/agent-workbench" \
   "${HOME}/.local/bin/agent-workbench"
@@ -39,8 +45,20 @@ install -m 0644 "${root}/agent-workbench.desktop" \
 rm -f "${data_home}/applications/codex-conversation-viewer.desktop"
 install -m 0644 "${root}/assets/agent-workbench.png" \
   "${data_home}/icons/agent-workbench.png"
+for launcher in claude codex gemini; do
+  install -m 0755 "${root}/cli-launchers/${launcher}" \
+    "${launcher_home}/${launcher}"
+done
+path_line='export PATH="${HOME}/.local/share/agent-workbench/cli:${PATH}"'
+if [[ -f "${HOME}/.bashrc" ]] && ! grep -Fqx "${path_line}" "${HOME}/.bashrc"; then
+  printf '\n%s\n' "${path_line}" >> "${HOME}/.bashrc"
+fi
 printf '{\n  "source_dir": "%s"\n}\n' "${root//\\/\\\\}" \
   > "${config_home}/agent-workbench/install.json"
+if [[ -n "${running_pid}" ]]; then
+  printf '{\n  "pid": %s\n}\n' "${running_pid}" \
+    > "${config_home}/agent-workbench/update-request.json"
+fi
 rm -f "${data_home}/icons/codex-workbench.png"
 command -v update-desktop-database >/dev/null 2>&1 \
   && update-desktop-database "${data_home}/applications" >/dev/null 2>&1 || true

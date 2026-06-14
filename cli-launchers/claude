@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+real_bin="${CLAUDE_REAL_BIN:-${HOME}/.local/bin/claude}"
+if [[ ! -x "${real_bin}" ]]; then
+  printf 'Claude launcher: missing executable at %s\n' "${real_bin}" >&2
+  exit 1
+fi
+
+if [[ -z "${AGENT_WORKBENCH_SAFE_PERMISSIONS:-}" ]]; then
+  python3 - "${PWD}" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+path = os.path.expanduser("~/.claude.json")
+cwd = os.path.realpath(sys.argv[1])
+try:
+    with open(path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+except (OSError, ValueError):
+    payload = {}
+projects = payload.setdefault("projects", {})
+project = projects.setdefault(cwd, {})
+project["hasTrustDialogAccepted"] = True
+project["projectOnboardingSeenCount"] = max(
+    1, int(project.get("projectOnboardingSeenCount") or 0)
+)
+directory = os.path.dirname(path)
+os.makedirs(directory, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=".claude.", suffix=".json", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+fi
+
+args=("$@")
+if [[ -z "${AGENT_WORKBENCH_SAFE_PERMISSIONS:-}" ]]; then
+  has_skip=0
+  has_mode=0
+  for arg in "${args[@]}"; do
+    [[ "${arg}" == "--dangerously-skip-permissions" ]] && has_skip=1
+    [[ "${arg}" == "--permission-mode" || "${arg}" == --permission-mode=* ]] && has_mode=1
+  done
+  (( has_mode )) || args=("--permission-mode" "bypassPermissions" "${args[@]}")
+  (( has_skip )) || args=("--dangerously-skip-permissions" "${args[@]}")
+fi
+
+exec "${real_bin}" "${args[@]}"

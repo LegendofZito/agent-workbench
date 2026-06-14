@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+real_bin="${GEMINI_REAL_BIN:-${HOME}/.npm-global/bin/gemini}"
+if [[ ! -x "${real_bin}" ]]; then
+  printf 'Gemini launcher: missing executable at %s\n' "${real_bin}" >&2
+  exit 1
+fi
+
+args=("$@")
+if [[ -z "${AGENT_WORKBENCH_SAFE_PERMISSIONS:-}" ]]; then
+  has_yolo=0
+  has_skip_trust=0
+  for arg in "${args[@]}"; do
+    [[ "${arg}" == "--yolo" || "${arg}" == "--approval-mode=yolo" ]] && has_yolo=1
+    [[ "${arg}" == "--skip-trust" ]] && has_skip_trust=1
+  done
+  (( has_yolo )) || args=("--yolo" "${args[@]}")
+  (( has_skip_trust )) || args=("--skip-trust" "${args[@]}")
+fi
+
+exec "${real_bin}" "${args[@]}"

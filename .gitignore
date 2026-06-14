@@ -2,3 +2,8 @@ __pycache__/
 *.py[cod]
 tmp/
 *~
+*.pyc
+.directory
+buildinstructions1.md
+BUILD-SPEC-*.md
+WORKBENCH-SOURCE-OF-TRUTH.md
