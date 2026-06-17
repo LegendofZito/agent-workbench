@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-workbench"
+version = "1.0.0"
+description = "Unified Linux desktop workbench for Codex, Claude Code, and Gemini CLI sessions"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Legend of Zito"},
+]
+keywords = ["claude-code", "codex", "gemini-cli", "linux-desktop", "tkinter", "agent", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    # No external dependencies - uses only Python stdlib and Tkinter
+]
+
+[project.optional-dependencies]
+imaging = ["Pillow>=9.0.0"]  # For image previews
+dnd = []  # tkdnd support depends on system packages
+
+[project.urls]
+Homepage = "https://github.com/LegendofZito/agent-workbench"
+Documentation = "https://github.com/LegendofZito/agent-workbench#readme"
+Repository = "https://github.com/LegendofZito/agent-workbench"
+Issues = "https://github.com/LegendofZito/agent-workbench/issues"
+
+[project.scripts]
+agent-workbench = "agent_workbench.cli:main"
+
+[tool.setuptools]
+packages = ["agent_workbench"]
+
+[tool.setuptools.package-data]
+agent_workbench = ["assets/*"]
