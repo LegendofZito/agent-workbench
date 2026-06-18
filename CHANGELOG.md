@@ -8,6 +8,20 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Handoff cross-session audit + strict session-isolation guard
+- **Audit result (a Pig Farm 7→8 handoff referenced Agent Workbench work):** the handoff machinery is NOT
+  at fault — `structured_handoff_packet` and the whole stage/deploy path read only from the source
+  session's own turns, every backend/app event stamps `workspace_id`, and no two sessions share a backend
+  session-id. The Agent Workbench text was genuinely present in Pig Farm 7's stored turns (real
+  `userMessage`s sent into that tab — all sessions share `cwd=/home/zito`, so nothing flagged it as
+  off-project), and the handoff faithfully carried it forward.
+- **Defense-in-depth guard:** `handle_event` could previously let an event with **no `workspace_id`** fall
+  through and write into whatever session was in the foreground. Added `SESSION_MUTATING_KINDS`; any
+  unattributed session-mutating event (assistant/work/user/turn_done/external_session_loaded/subagent/…)
+  is now **dropped and logged** instead of applied to the active session — one session can no longer bleed
+  into another even on a future regression. (No behavior change today; nothing currently emits
+  unattributed mutating events.)
+
 ### Bottom bar: one status indicator, smaller input, corner buffer
 - **No more two "Ready"s.** The green status badge moved from the far left to the **right** (just left of
   the token readout), and the white prompt-state no longer prints a redundant "Ready" — it now shows only
