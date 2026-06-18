@@ -8,6 +8,29 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Spawned tab now shows real sub-agents (running + finished history)
+- **The complaint:** the "Spawned" tab was always empty and nothing showed "which agents are up and
+  running," even when Claude fanned work out to sub-agents. Root cause: the Spawned tab only listed
+  workbench-launched *worker sessions* (`worker_parent_session_id`) — never in-turn Agent/Task sub-agents —
+  and the in-turn ones only flickered in the "Sub-agents N" counter, getting deleted the instant they
+  finished (no history).
+- **Fix:** the backend now parses Claude Code's explicit sub-agent lifecycle events
+  (`system/task_started`, `task_updated`, `task_notification`) — far richer than inferring from tool
+  blocks: they carry `subagent_type`, description, status, summary, token usage, and duration. Each
+  workspace keeps a **durable registry** of every sub-agent spawned this session, upserted idempotently by
+  `tool_use_id` (so the older tool_use/tool_result fallback and the new task events don't double-count).
+- The **Spawned tab** (relabeled "Agents & sessions spawned from this session") now renders two groups:
+  **Sub-agents (this session)** — live ● running (yellow), ✓ completed (green) with duration + tokens +
+  summary, ✗ failed (red), newest first — and **Worker sessions** below. It refreshes live on every
+  sub-agent event. The "Sub-agents N" counter and popover still show **running only** (unchanged).
+- Finished sub-agents now **persist across turns** (turn-end only clears stale still-"running" entries,
+  not history). "✓ Sub-agent finished" logs exactly once, on the running→done transition.
+- **Latent bug fixed:** a non-matching `tool_result` used to pop the last running sub-agent (any normal
+  tool result could erase a live background agent). Stops now act only on an exact id match.
+- Verified: `py_compile` clean + a logic simulation driven by real captured stream events
+  (idempotency, count semantics, finish-once, history persistence, no-erase). Touches the stream parser,
+  the `subagent_*` event handlers, `_live_subagents`/`_session_subagents`, and `_refresh_spawned_tab`.
+
 ### Footer consolidated from three bars to two
 - The bottom area had three rows (Sub-agents/Ready · Skills · Active%/status/Send). Merged the two
   status rows into ONE: now it's just **Skills bar** + a single **status/controls bar** carrying —

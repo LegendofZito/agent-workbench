@@ -4002,15 +4002,37 @@ class ClaudeBackend(StreamCliBackend):
                         self.emit("work", text=line, tag="system")
                         continue
                     etype = event.get("type")
-                    if etype == "system" and event.get("subtype") == "init":
-                        sid = event.get("session_id")
-                        if sid:
-                            session.setdefault("backend", {})["session_id"] = sid
-                        self.emit(
-                            "work",
-                            text=f"claude session {sid or session_id}",
-                            tag="system",
-                        )
+                    if etype == "system":
+                        subtype = event.get("subtype")
+                        if subtype == "init":
+                            sid = event.get("session_id")
+                            if sid:
+                                session.setdefault("backend", {})["session_id"] = sid
+                            self.emit(
+                                "work",
+                                text=f"claude session {sid or session_id}",
+                                tag="system",
+                            )
+                        elif subtype == "task_started":
+                            self.emit("subagent_start",
+                                agent_id=clean_text(event.get("tool_use_id")),
+                                task_id=clean_text(event.get("task_id")),
+                                name=clean_text(event.get("subagent_type") or event.get("description") or "sub-agent"),
+                                detail=clean_text(event.get("description") or event.get("prompt")))
+                        elif subtype == "task_updated":
+                            patch = event.get("patch") or {}
+                            self.emit("subagent_update",
+                                task_id=clean_text(event.get("task_id")),
+                                status=clean_text(patch.get("status")))
+                        elif subtype == "task_notification":
+                            usage = event.get("usage") or {}
+                            self.emit("subagent_done",
+                                agent_id=clean_text(event.get("tool_use_id")),
+                                task_id=clean_text(event.get("task_id")),
+                                status=clean_text(event.get("status")) or "completed",
+                                summary=clean_text(event.get("summary")),
+                                total_tokens=int(usage.get("total_tokens") or 0),
+                                duration_ms=int(usage.get("duration_ms") or 0))
                     elif etype == "assistant":
                         message = event.get("message") or {}
                         context = context_from_usage(
@@ -5886,7 +5908,7 @@ class App:
         spawned_header.pack(fill="x", padx=8, pady=(8, 4))
         tk.Label(
             spawned_header,
-            text="Sessions spawned from this session",
+            text="Agents & sessions spawned from this session",
             bg=BG,
             fg=MUTED,
             font=("Sans", 9),
@@ -5925,6 +5947,7 @@ class App:
         spawned_scroll.pack(side="right", fill="y")
         self.spawned_list.configure(yscrollcommand=spawned_scroll.set)
         self._spawned_sessions = []
+        self._spawned_rows = []
 
         composer = tk.Frame(content, bg=BG)
         self.composer = composer
@@ -6764,7 +6787,12 @@ class App:
             return
 
     def _live_subagents(self):
-        return self.workspaces.get(self.active_workspace_id, {}).get("live_subagents", [])
+        subs = self.workspaces.get(self.active_workspace_id, {}).get("live_subagents", [])
+        return [s for s in subs if s.get("status", "running") == "running"]
+
+    def _session_subagents(self):
+        subs = self.workspaces.get(self.active_workspace_id, {}).get("live_subagents", [])
+        return [s for s in subs if not s.get("model_inferred")]
 
     def _update_worker_indicator(self):
         workspace = self.workspaces.get(self.active_workspace_id) or {}
@@ -7021,7 +7049,7 @@ class App:
                     running += 1
                 status = clean_text(ws.get("activity_text")) or ("Working" if busy else "Idle")
                 sess = clean_text((ws.get("current_session") or {}).get("title")) or "(new session)"
-                subs = ws.get("live_subagents") or []
+                subs = [s for s in (ws.get("live_subagents") or []) if s.get("status", "running") == "running"]
                 sub_txt = f"  +{len(subs)} sub-agent{'s' if len(subs) != 1 else ''}" if subs else ""
                 here = "   ◀ current tab" if wid == self.active_workspace_id else ""
                 model_txt = f" · {model}" if model and model != "Default" else ""
@@ -10081,36 +10109,67 @@ class App:
                 self.open_session(sid)
 
     def _refresh_spawned_tab(self):
-        """Populate the Spawned tab with sessions spawned from the current session."""
+        """Populate the Spawned tab: in-turn sub-agents + worker sessions for the current session."""
         if not hasattr(self, "spawned_list"):
             return
-        parent_id = (self.current_session or {}).get("id")
-        if not parent_id:
-            self._spawned_sessions = []
-            self.spawned_list.delete(0, "end")
-            self.spawned_list.insert("end", "(No session selected)")
-            return
-        # Find all local sessions whose worker_parent_session_id matches
-        spawned = [
-            s for s in self.local_sessions
-            if s.get("worker_parent_session_id") == parent_id
-        ]
-        spawned.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
-        self._spawned_sessions = spawned
         self.spawned_list.delete(0, "end")
+        self._spawned_rows = []
+        subs = list(reversed(self._session_subagents()))  # newest first
+
+        def _add(text, row, color=None):
+            i = self.spawned_list.size()
+            self.spawned_list.insert("end", text)
+            if color:
+                try: self.spawned_list.itemconfig(i, foreground=color)
+                except Exception: pass
+            self._spawned_rows.append(row)
+
+        # --- Sub-agents group ---
+        _add("— Sub-agents (this session) —", {"type": "header"}, MUTED)
+        if not subs:
+            _add("   (none yet)", {"type": "blank"}, MUTED)
+        else:
+            for s in subs:
+                name = clean_text(s.get("name")) or "sub-agent"
+                status = clean_text(s.get("status")) or "running"
+                detail = clean_text(s.get("detail")) or ""
+                running = status in ("running", "in_progress", "pending")
+                icon = "●" if running else ("✓" if status in ("completed", "success", "done") else "✗")
+                meta = ""
+                if not running:
+                    dur = s.get("duration_ms") or 0
+                    tok = s.get("total_tokens") or 0
+                    bits = []
+                    if dur: bits.append(f"{dur/1000:.0f}s")
+                    if tok: bits.append(f"{tok} tok")
+                    if bits: meta = "  ·  " + " · ".join(bits)
+                summary = clean_text(s.get("summary")) or detail
+                line = f"{icon} {name} — {status}{meta}"
+                if summary:
+                    line += f"  ·  {shorten(summary, 80)}"
+                color = "#facc15" if running else ("#4ade80" if icon == "✓" else "#f87171")
+                _add(line, {"type": "subagent"}, color)
+
+        # --- Worker sessions group ---
+        parent_id = (self.current_session or {}).get("id")
+        spawned = []
+        if parent_id:
+            spawned = [s for s in self.local_sessions if s.get("worker_parent_session_id") == parent_id]
+            spawned.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
+        self._spawned_sessions = spawned
+        _add("— Worker sessions —", {"type": "header"}, MUTED)
         if not spawned:
-            self.spawned_list.insert("end", "(No spawned sessions)")
-            return
-        for s in spawned:
-            title = self._session_list_label(s)
-            status = ""
-            if s.get("worker_job_id"):
-                # Check if the worker job is still active
-                for job in self._active_worker_jobs():
-                    if job.get("session_id") == s.get("id"):
-                        status = "  [running]"
-                        break
-            self.spawned_list.insert("end", title + status)
+            _add("   (none)", {"type": "blank"}, MUTED)
+        else:
+            for s in spawned:
+                title = self._session_list_label(s)
+                status = ""
+                if s.get("worker_job_id"):
+                    for job in self._active_worker_jobs():
+                        if job.get("session_id") == s.get("id"):
+                            status = "  [running]"
+                            break
+                _add(title + status, {"type": "session", "session": s})
 
     def _open_selected_spawned(self):
         """Open the session selected in the Spawned tab."""
@@ -10118,8 +10177,9 @@ class App:
         if not sel:
             return
         idx = sel[0]
-        if idx < len(self._spawned_sessions):
-            sid = self._spawned_sessions[idx].get("id")
+        rows = getattr(self, "_spawned_rows", [])
+        if idx < len(rows) and rows[idx].get("type") == "session":
+            sid = (rows[idx].get("session") or {}).get("id")
             if sid:
                 self.open_session_in_new_tab(sid)
 
@@ -13239,7 +13299,12 @@ class App:
             workspace["turn_started_at"] = 0.0
             workspace["pending_user_input"] = None
             workspace["live_speaker"] = None
-            workspace["live_subagents"] = []
+            # Preserve finished sub-agents for the Spawned tab; only clear
+            # entries that are still "running" (stale state from aborted turns).
+            workspace["live_subagents"] = [
+                s for s in (workspace.get("live_subagents") or [])
+                if s.get("status", "running") not in ("running", "in_progress", "pending")
+            ]
             workspace["primary_model"] = ""
             workspace["session_context_active"] = False
             workspace["session_context_buffer"] = ""
@@ -13395,43 +13460,77 @@ class App:
             self.live_model = model
         elif kind == "subagent_start":
             if active_workspace:
-                subagent = {
-                    "id": event.get("agent_id") or "",
-                    "name": event.get("name") or "sub-agent",
-                    "detail": event.get("detail") or "",
-                    "started_at": now_iso(),
-                }
                 live = active_workspace.setdefault("live_subagents", [])
-                live.append(subagent)
-                if len(live) > 20:
-                    active_workspace["live_subagents"] = live[-20:]
+                aid = event.get("agent_id") or ""
+                existing = next((s for s in live if aid and s.get("id") == aid and not s.get("model_inferred")), None)
+                if existing:
+                    if event.get("name"): existing["name"] = event.get("name")
+                    if event.get("detail"): existing["detail"] = event.get("detail")
+                    if event.get("task_id"): existing["task_id"] = event.get("task_id")
+                else:
+                    live.append({
+                        "id": aid,
+                        "task_id": event.get("task_id") or "",
+                        "name": event.get("name") or "sub-agent",
+                        "detail": event.get("detail") or "",
+                        "status": "running",
+                        "started_at": now_iso(),
+                    })
+                    if len(live) > 50:
+                        active_workspace["live_subagents"] = live[-50:]
                 self._update_worker_indicator()
+                self._refresh_spawned_tab()
+        elif kind == "subagent_update":
+            if active_workspace:
+                live = active_workspace.get("live_subagents") or []
+                tid = event.get("task_id") or ""
+                status = event.get("status") or ""
+                if tid and status:
+                    for s in live:
+                        if s.get("task_id") == tid:
+                            was_running = s.get("status", "running") in ("running", "in_progress", "pending")
+                            s["status"] = status
+                            if status not in ("running", "in_progress", "pending"):
+                                s["ended_at"] = now_iso()
+                                # task_updated usually reports completion before
+                                # task_notification, so log the finish here on the
+                                # running→done transition (subagent_done/_stop guard
+                                # against a duplicate line).
+                                if was_running:
+                                    self.append_work(f"✓ Sub-agent finished: {clean_text(s.get('name')) or 'sub-agent'}", "done")
+                            break
+                self._update_worker_indicator()
+                self._refresh_spawned_tab()
+        elif kind == "subagent_done":
+            if active_workspace:
+                live = active_workspace.get("live_subagents") or []
+                aid = event.get("agent_id") or ""
+                tid = event.get("task_id") or ""
+                target = next((s for s in live if (aid and s.get("id") == aid) or (tid and s.get("task_id") == tid)), None)
+                if target:
+                    already_done = target.get("status", "running") not in ("running", "in_progress", "pending")
+                    target["status"] = event.get("status") or "completed"
+                    target["ended_at"] = now_iso()
+                    if event.get("summary"): target["summary"] = event.get("summary")
+                    target["total_tokens"] = event.get("total_tokens") or 0
+                    target["duration_ms"] = event.get("duration_ms") or 0
+                    if not already_done:
+                        self.append_work(f"✓ Sub-agent finished: {clean_text(target.get('name')) or 'sub-agent'}", "done")
+                self._update_worker_indicator()
+                self._refresh_spawned_tab()
         elif kind == "subagent_stop":
             if active_workspace:
                 live = active_workspace.get("live_subagents") or []
-                target = event.get("agent_id") or ""
-                removed = False
-                if target:
-                    # Remove the subagent whose Agent tool_use id matches this
-                    # tool_result, so nested results don't clear the wrong one.
-                    for i in range(len(live) - 1, -1, -1):
-                        if live[i].get("id") == target:
-                            done = live.pop(i)
-                            removed = True
-                            # Durable "finished" note in the Work Log — only on an
-                            # exact id match (regular tool results never match a
-                            # sub-agent id, so this won't misfire on normal tools).
-                            self.append_work(
-                                f"✓ Sub-agent finished: {clean_text(done.get('name')) or 'sub-agent'}",
-                                "done",
-                            )
-                            break
-                if not removed:
-                    for i in range(len(live) - 1, -1, -1):
-                        if not live[i].get("model_inferred"):
-                            live.pop(i)
+                target_id = event.get("agent_id") or ""
+                if target_id:
+                    for s in live:
+                        if s.get("id") == target_id and s.get("status", "running") == "running":
+                            s["status"] = "completed"
+                            s["ended_at"] = now_iso()
+                            self.append_work(f"✓ Sub-agent finished: {clean_text(s.get('name')) or 'sub-agent'}", "done")
                             break
                 self._update_worker_indicator()
+                self._refresh_spawned_tab()
         elif kind == "assistant_begin":
             pass
         elif kind == "assistant_delta":
