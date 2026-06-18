@@ -506,13 +506,38 @@ def strip_session_context(text):
     return raw, stripped
 
 
+def _strip_attachment_injection(text):
+    """Strip the AWB attachment injection wrapper, returning only the user request text.
+
+    AWB wraps file attachments as:
+        The user attached the following local files. Inspect each relevant file
+        with the appropriate file or image-reading tool before answering:
+        - /path/to/file
+
+        User request:
+        <actual user prompt>
+
+    When Codex echoes back the full request payload that wrapper is visible in the
+    stored transcript; this strips it so only the real message shows.
+    """
+    if not text:
+        return text
+    if not text.lstrip().lower().startswith("the user attached the following local files"):
+        return text
+    marker = "\n\nuser request:\n"
+    idx = text.lower().find(marker)
+    if idx != -1:
+        return clean_text(text[idx + len(marker):])
+    return ""
+
+
 def visible_user_prompt_text(text):
     """Return only the user-authored part of a backend user echo.
 
     Codex and some CLIs persist the full request payload as a userMessage. That
-    payload can include Workbench-only project state and handoff context before
-    the actual prompt; the conversation pane should only ever show what the user
-    typed.
+    payload can include Workbench-only project state, handoff context, time blocks,
+    and file-attachment injection before the actual prompt; the conversation pane
+    should only ever show what the user typed.
     """
     raw = clean_text(text)
     if not raw:
@@ -529,10 +554,16 @@ def visible_user_prompt_text(text):
         if SESSION_CONTEXT_CLOSE in raw:
             suffix = raw.rsplit(SESSION_CONTEXT_CLOSE, 1)[1]
             _, visible = strip_session_context(suffix)
-            return clean_text(visible or suffix)
-        return ""
-    _, visible = strip_session_context(raw)
-    return visible
+            result = clean_text(visible or suffix)
+        else:
+            return ""
+    else:
+        _, visible = strip_session_context(raw)
+        result = visible
+    # After stripping PROJECT SHARED STATE and session_context time blocks, the
+    # remaining text may still begin with the AWB file-attachment injection wrapper.
+    # Strip that too so only the real user message reaches the conversation pane.
+    return _strip_attachment_injection(result)
 
 
 def _session_context_carry_suffix(text, markers):
@@ -3196,6 +3227,7 @@ def structured_handoff_packet(session, max_chars=HANDOFF_MAX_CHARS):
             return ""
         if raw.lstrip().startswith("# Agent State"):
             return ""
+        raw = _strip_attachment_injection(raw)
         kept_lines = []
         for raw_line in raw.splitlines():
             line = clean_text(raw_line).lstrip("- ").strip()

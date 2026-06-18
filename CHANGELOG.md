@@ -8,6 +8,19 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Attachment injection + AGENT_STATE no longer visible in conversation
+- **Root cause:** `visible_user_prompt_text` stripped `PROJECT SHARED STATE` headers and
+  `<session_context>` time blocks but NOT the AWB file-attachment injection wrapper
+  (`"The user attached the following local files..."`) that follows them. Codex echoes the
+  full request payload (context + time block + attachment injection + real message) as a
+  `userMessage` stored in its JSONL; AWB was rendering that echo as a visible YOU bubble.
+- **Fix:** added `_strip_attachment_injection()` which recognises the attachment wrapper prefix
+  and extracts only the text after `"User request:\n"`. Applied at the end of
+  `visible_user_prompt_text` (all paths) so every rendered user message in the conversation —
+  both live and from stored/external transcripts — is clean.
+- Applied the same strip in `handoff_summary_text` so attachment wrapper text can't leak
+  into handoff packets as fake "user requests".
+
 ### GPU overload / freeze / tab-blink fixes
 - **Ollama concurrency cap (fixes GPU overloading + system shutdowns):** `local_project_state_summary`
   now acquires a module-level `threading.Semaphore(1)` before calling Ollama. If another inference is
