@@ -8,6 +8,18 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Usage badge updates in real time; relabels; Hand Off beside Context Limit
+- **Real-time 5h/weekly usage:** the badge refreshed only every 5 min (or on click). Now it also refreshes
+  **immediately after every turn completes** (when usage actually changes) and the background poll dropped
+  from 5 min → **90 s**. (`refresh_usage` on `turn_done`; `poll_usage` interval.)
+- **Fixed stuck green "Starting":** when a **local** Claude session finished syncing it set the status to
+  "synchronized" but never reset the activity badge, so it sat on the initial "Starting." It now goes to
+  **Ready** (idle) when not busy — matching the non-local sync path.
+- **Hand Off moved to the RIGHT of the Skills bar, beside Context Limit %** (they go hand in hand). Order is
+  now `✦ Skills · …chips… · Hand Off · Context Limit %`.
+- **Relabels:** the context badge "Active …" → **"Context Limit …"**, and the top usage badge "Limits" →
+  **"Usage"** (popover header "Account Limits" → "Account Usage") to avoid confusing the two.
+
 ### Renaming a chat no longer wipes the window (esp. mid-turn)
 - Renaming a session called `open_session()`, which clears the views and re-renders the conversation from
   the **saved** copy. If a turn was still streaming, that live content wasn't saved yet → "everything in the

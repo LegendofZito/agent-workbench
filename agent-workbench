@@ -4572,8 +4572,8 @@ class App:
         self.activity_text = tk.StringVar(master=self.win, value="Starting")
         self.worker_text = tk.StringVar(master=self.win, value="Worker --")
         self.queue_text = tk.StringVar(master=self.win, value="")
-        self.context_text = tk.StringVar(master=self.win, value="Active context --")
-        self.usage_text = tk.StringVar(master=self.win, value="Limits --")
+        self.context_text = tk.StringVar(master=self.win, value="Context Limit --")
+        self.usage_text = tk.StringVar(master=self.win, value="Usage --")
         self.usage_last_updated = {}
         self.prompt_state_text = tk.StringVar(master=self.win, value="Ready")
         self.context_warning_text = tk.StringVar(master=self.win, value="")
@@ -6052,7 +6052,7 @@ class App:
                 self._enable_text_zoom(_zoom_widget)
 
         # ── Footer: TWO bars ────────────────────────────────────────────────
-        # (1) Skills bar (upper): [✦ Skills][Hand Off] … skill chips … [Active%]
+        # (1) Skills bar (upper): [✦ Skills] … skill chips … [Hand Off][Context Limit %]
         # (2) status + controls row (lower): Sub-agents, activity, status, Send…
         self.skills_bar = tk.Frame(composer, bg=PANEL)
         self.skills_bar.pack(fill="x", padx=8, pady=(4, 0))
@@ -6068,7 +6068,18 @@ class App:
             cursor="hand2",
             font=("Sans", 9, "bold"),
         ).pack(side="left")
-        # Hand Off: far left of the Skills bar, just right of the ✦ Skills button.
+        # Context Limit % at the far right of the Skills bar (above Send), with
+        # Hand Off directly to its left — they go hand in hand.
+        self.context_badge = tk.Label(
+            self.skills_bar,
+            textvariable=self.context_text,
+            bg="#1a2432",
+            fg="#dbeafe",
+            padx=10,
+            pady=4,
+            font=("Sans", 9, "bold"),
+        )
+        self.context_badge.pack(side="right")
         self.topbar_handoff_btn = tk.Button(
             self.skills_bar,
             text="Hand Off",
@@ -6084,18 +6095,7 @@ class App:
             cursor="arrow",
             state="disabled",
         )
-        self.topbar_handoff_btn.pack(side="left", padx=(6, 0))
-        # Active context %: far right of the Skills bar (sits above the Send button).
-        self.context_badge = tk.Label(
-            self.skills_bar,
-            textvariable=self.context_text,
-            bg="#1a2432",
-            fg="#dbeafe",
-            padx=10,
-            pady=4,
-            font=("Sans", 9, "bold"),
-        )
-        self.context_badge.pack(side="right")
+        self.topbar_handoff_btn.pack(side="right", padx=(0, 6))
         # chips fill the middle (packed last so expand takes the leftover space).
         chips_wrap = tk.Frame(self.skills_bar, bg=PANEL)
         chips_wrap.pack(side="left", fill="x", expand=True)
@@ -7742,7 +7742,7 @@ class App:
         limit = int(context.get("limit") or 0)
         compact_count = int(context.get("compact_count") or 0)
         if used <= 0 or limit <= 0:
-            self.context_text.set("Active context --")
+            self.context_text.set("Context Limit --")
             bg, fg, thumb = "#24303c", "#cbd5e1", "#64748b"
         else:
             percent = min(100, round(used * 100 / limit))
@@ -7750,7 +7750,7 @@ class App:
             limit_label = f"{limit // 1_000_000}M" if limit >= 1_000_000 else f"{limit // 1000}K"
             compact_label = f" · compacted {compact_count}×" if compact_count else ""
             self.context_text.set(
-                f"Active {percent}% · {used_label}/{limit_label}{compact_label}"
+                f"Context Limit {percent}% · {used_label}/{limit_label}{compact_label}"
             )
             if percent < 40:
                 bg, fg, thumb = "#16351f", "#bbf7d0", "#22c55e"
@@ -7810,7 +7810,7 @@ class App:
     def _display_usage(self, usage):
         windows = usage.get("windows") or []
         if not windows:
-            self.usage_text.set("Limits: --")
+            self.usage_text.set("Usage: --")
             self.usage_badge.configure(bg="#1a2432", fg="#dbeafe")
             return
         shown = [
@@ -7823,7 +7823,7 @@ class App:
                 f"{int(window.get('used_percent') or 0)}% {window.get('label')}"
                 for window in windows[:2]
             ]
-        self.usage_text.set("Limits: " + " · ".join(shown))
+        self.usage_text.set("Usage: " + " · ".join(shown))
         peak = max(int(window.get("used_percent") or 0) for window in windows)
         if peak >= 90:
             colors = ("#4a1d1d", "#fecaca")
@@ -7896,7 +7896,7 @@ class App:
         if self.finalizing_close:
             return
         self.refresh_usage(manual=False)
-        self.win.after(300000, self.poll_usage)
+        self.win.after(90000, self.poll_usage)
 
     def _open_limits_popover(self):
         """Open a small popover below the Limits badge showing reset times."""
@@ -7912,7 +7912,7 @@ class App:
 
         tk.Label(
             pop,
-            text="Account Limits",
+            text="Account Usage",
             bg=PANEL,
             fg=TEXT,
             font=("Sans", 10, "bold"),
@@ -13847,6 +13847,7 @@ class App:
                 event.get("error"),
             )
             self.busy = False
+            self.refresh_usage(manual=False)  # refresh 5h/weekly usage right after a turn
             active_workspace = self.workspaces.get(self.active_workspace_id)
             if active_workspace:
                 active_workspace["turn_started_at"] = 0.0
@@ -13969,6 +13970,8 @@ class App:
                         self.chat_updates_pending = True
                         self._update_chat_update_indicator()
                     self.status.set("Claude session synchronized.")
+                    if not self.busy:
+                        self.set_activity("idle", "Ready")
                     return
                 chat_anchor = self.chat.index("@0,0")
                 work_anchor = self.work.index("@0,0")
