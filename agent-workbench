@@ -10381,10 +10381,18 @@ class App:
             save_json(CONFIG_FILE, self.config)
         elif origin != "local":
             self._set_session_alias(session, alias)
-        if origin == "local":
-            self.session_title.set(alias)
+        # Update the new label everywhere it's shown WITHOUT reloading the
+        # session. open_session() re-renders the conversation from the saved
+        # copy, which erases a turn that is still streaming — renaming a chat
+        # while it was processing made "everything in the window disappear".
+        for ws in self.workspaces.values():
+            cs = ws.get("current_session")
+            if cs and cs.get("id") == session["id"]:
+                cs["title"] = alias
+        if self.current_session and self.current_session.get("id") == session["id"]:
+            self.current_session["title"] = alias
+            self.session_title.set(shorten(self._display_session_title(self.current_session), 110))
         self._render_session_list()
-        self.open_session(session["id"], remember=False)
         self._save_active_workspace()
         self._render_workspace_tabs()
         if source_updated:

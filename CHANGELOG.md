@@ -8,6 +8,12 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Renaming a chat no longer wipes the window (esp. mid-turn)
+- Renaming a session called `open_session()`, which clears the views and re-renders the conversation from
+  the **saved** copy. If a turn was still streaming, that live content wasn't saved yet → "everything in the
+  window disappeared." Rename now updates the label in place (title bar, session list, workspace tab) and
+  **never reloads the conversation**, so it's safe to rename a chat while it's processing. (`rename_selected_session`.)
+
 ### Client update watcher (claude / codex / gemini)
 - New **Options → "Check for client updates…"**. On launch the app checks each wrapped CLI's installed
   version against the latest available (codex/gemini via `npm view`, claude via its native `claude update`),
