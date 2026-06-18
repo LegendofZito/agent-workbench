@@ -8,6 +8,16 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Usage popover no longer clipped; usage auto-shows on every tab
+- **Cut-off fixed:** the limits popover opened with its left edge pinned to the badge's x; since the badge
+  sits near the right of the window, it ran off the right screen edge and clipped the reset times. It's now
+  **right-aligned under the badge and clamped on-screen** (helper `_place_popover`), applied both on open and
+  on the async re-fit when usage arrives — so the reset timestamps are always fully visible.
+- **Auto-display fixed:** `_restore_workspace` only showed *cached* usage on activation, so a freshly
+  opened/switched tab sat on "Usage --" until the 90s poll or a manual click. Now activating a tab also
+  **fetches usage in the background** (cached shows instantly, fresh replaces it) — combined with the
+  persisted per-workspace cache, the badge never sits blank waiting for a click.
+
 ### Handoff cross-session audit + strict session-isolation guard
 - **Audit result (a Pig Farm 7→8 handoff referenced Agent Workbench work):** the handoff machinery is NOT
   at fault — `structured_handoff_packet` and the whole stage/deploy path read only from the source

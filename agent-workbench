@@ -4942,6 +4942,9 @@ class App:
         self.status.set(workspace["status"])
         self._display_usage(workspace.get("usage") or {})
         self.usage_last_updated = clean_text(workspace.get("usage_last_updated")) or ""
+        # Auto-fetch usage whenever a tab becomes active (shows cached instantly,
+        # refreshes in the background) so the badge never sits blank until clicked.
+        self.refresh_usage(manual=False)
         self.activity_state = workspace["activity_state"]
         self.set_activity(
             workspace["activity_state"],
@@ -7933,6 +7936,23 @@ class App:
         pop.configure(bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
         self._limits_popover = pop
 
+        def _place_popover():
+            """Size to content and place it right-aligned under the badge, clamped
+            on-screen so the reset times never get clipped at the window edge."""
+            try:
+                pop.update_idletasks()
+                pw = max(pop.winfo_reqwidth(), 300)
+                ph = pop.winfo_reqheight()
+                screen_w = self.win.winfo_screenwidth()
+                bx = self.usage_badge.winfo_rootx()
+                badge_w = self.usage_badge.winfo_width()
+                by = self.usage_badge.winfo_rooty() + self.usage_badge.winfo_height() + 4
+                x = bx + badge_w - pw  # right edge aligns with the badge's right edge
+                x = max(8, min(x, screen_w - pw - 8))  # never run off either edge
+                pop.geometry(f"{pw}x{ph}+{x}+{by}")
+            except tk.TclError:
+                pass
+
         tk.Label(
             pop,
             text="Account Usage",
@@ -7993,15 +8013,9 @@ class App:
                         font=("Sans", 9),
                         anchor="w",
                     ).pack(side="left", fill="x", expand=True)
-            # Re-fit the popover to its content (usage arrives async, so the body can
-            # grow after the window was first sized — otherwise the buttons get clipped).
-            try:
-                pop.update_idletasks()
-                pop.geometry(
-                    f"{max(pop.winfo_reqwidth(), 300)}x{pop.winfo_reqheight()}"
-                )
-            except tk.TclError:
-                pass
+            # Re-fit + reposition (usage arrives async; keep it on-screen so the
+            # reset times never get clipped at the window edge).
+            _place_popover()
 
         # Store the populator so _display_usage can call it
         self._limits_popover_populate = _populate_limits_body
@@ -8053,13 +8067,9 @@ class App:
             cursor="hand2",
         ).pack(side="right")
 
-        # Position below the badge
+        # Position below the badge, right-aligned and clamped on-screen
         self.win.update_idletasks()
-        bx = self.usage_badge.winfo_rootx()
-        by = self.usage_badge.winfo_rooty() + self.usage_badge.winfo_height() + 4
-        pop.update_idletasks()
-        pw = pop.winfo_reqwidth()
-        pop.geometry(f"{max(pw, 300)}x{pop.winfo_reqheight()}+{bx}+{by}")
+        _place_popover()
         pop.lift()
         pop.focus_force()
 
