@@ -238,6 +238,25 @@ worker only when the work is genuinely sequential. Keep delegation inside the cu
 Claude session, wait for the workers, verify their results, and present one integrated
 answer to the user. Never claim worker work succeeded without checking it.
 """.strip()
+
+# Ultracode = the tier ABOVE max effort. A single max-effort agent is still one agent;
+# ultracode fans the work across many. Reuses the smart routing/cost rules, then tells
+# Claude to default to multi-agent orchestration for substantial work.
+CLAUDE_ULTRACODE_ORCHESTRATION_PROMPT = (
+    CLAUDE_SMART_ORCHESTRATION_PROMPT
+    + "\n\n"
+    + """
+ULTRACODE MODE IS ON. This is the most thorough tier — above any single max-effort run.
+For every SUBSTANTIAL task, default to authoring and running a multi-agent workflow
+(decompose → fan out parallel sub-agents → adversarially verify the findings with
+independent skeptic agents → synthesize), rather than doing it solo. Spin up as many
+parallel sub-agents as the task has independent parts, and verify important results
+before reporting them. Optimize for the most exhaustive, correct outcome — token cost is
+not a constraint in this mode. Still obey the COST DISCIPLINE and LOCAL MODEL rules above
+when choosing each sub-agent's tier. Reserve solo work only for trivial, conversational,
+or already-verified steps.
+""".strip()
+)
 CLAUDE_SMART_AGENTS = {
     "workbench-researcher": {
         "description": (
@@ -3909,10 +3928,12 @@ class ClaudeBackend(StreamCliBackend):
             orchestration_mode = clean_text(
                 session["backend"].get("orchestration_mode") or "smart"
             )
-            if orchestration_mode == "smart":
+            if orchestration_mode in ("smart", "ultra"):
                 cmd += [
                     "--append-system-prompt",
-                    CLAUDE_SMART_ORCHESTRATION_PROMPT,
+                    CLAUDE_ULTRACODE_ORCHESTRATION_PROMPT
+                    if orchestration_mode == "ultra"
+                    else CLAUDE_SMART_ORCHESTRATION_PROMPT,
                     "--agents",
                     CLAUDE_SMART_AGENTS_JSON,
                 ]
@@ -4332,7 +4353,7 @@ class App:
         if not isinstance(self.claude_orchestration, dict):
             self.claude_orchestration = {}
         self.claude_orchestration.setdefault("mode", "smart")
-        if self.claude_orchestration.get("mode") not in {"smart", "direct"}:
+        if self.claude_orchestration.get("mode") not in {"smart", "direct", "ultra"}:
             self.claude_orchestration["mode"] = "smart"
         self.worker_jobs = self.config.get("worker_jobs") or []
         if not isinstance(self.worker_jobs, list):
@@ -5430,15 +5451,6 @@ class App:
             fg=MUTED,
             anchor="e",
         )
-        self.context_badge = tk.Label(
-            topbar,
-            textvariable=self.context_text,
-            bg="#1a2432",
-            fg="#dbeafe",
-            padx=10,
-            pady=5,
-            font=("Sans", 9, "bold"),
-        )
         self.usage_badge = tk.Button(
             topbar,
             textvariable=self.usage_text,
@@ -5498,7 +5510,6 @@ class App:
         self.refresh_btn.pack(side="right", padx=(0, 8))
         self.topbar_handoff_btn.pack(side="right", padx=(0, 4))
         self.usage_badge.pack(side="right", padx=(0, 4))
-        self.context_badge.pack(side="right", padx=(0, 4))
         self.session_source_label.pack(side="right", padx=(6, 10))
         self.session_title_label.pack(
             side="left", fill="x", expand=True, padx=12, pady=10
@@ -5726,6 +5737,7 @@ class App:
         ):
             self.work.tag_config(tag, foreground=color)
         self.work.configure(state="disabled")
+        self.work.bind("<Key>", self._route_key_to_composer)
 
         artifacts_header = tk.Frame(self.artifacts_tab, bg=BG)
         artifacts_header.pack(fill="x", padx=14, pady=(14, 8))
@@ -5821,6 +5833,7 @@ class App:
         self.artifact_preview_text.bind(
             "<Button-3>", lambda event: self.show_text_menu(event, self.artifact_preview_text)
         )
+        self.artifact_preview_text.bind("<Key>", self._route_key_to_composer)
 
         self.terminal = ScrolledText(
             self.terminal_tab,
@@ -5974,6 +5987,8 @@ class App:
         self.input.bind("<Control-z>", self._input_undo)
         self.input.bind("<Control-Z>", self._input_redo)  # Ctrl+Shift+Z = redo
         self.input.bind("<Control-y>", self._input_redo)
+        self.input.bind("<Control-a>", self._input_select_all)
+        self.input.bind("<Control-A>", self._input_select_all)
         self.input.bind("<Button-3>", lambda event: self.show_edit_menu(event, self.input))
         self.input.bind("<<Modified>>", self._on_input_modified)
         self.input.bind("<FocusOut>", lambda _e: self._schedule_workspace_config_save(immediate=True))
@@ -6080,6 +6095,17 @@ class App:
 
         bar = tk.Frame(composer, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
         bar.pack(fill="x", padx=8, pady=(6, 8))
+        # Active-context % sits on the bottom bar, just left of the status/"working" text.
+        self.context_badge = tk.Label(
+            bar,
+            textvariable=self.context_text,
+            bg="#1a2432",
+            fg="#dbeafe",
+            padx=10,
+            pady=4,
+            font=("Sans", 9, "bold"),
+        )
+        self.context_badge.pack(side="left", padx=(0, 8))
         self.hint = tk.Label(bar, textvariable=self.status, bg=PANEL, fg=MUTED, anchor="w")
         self.hint.pack(side="left", fill="x", expand=True)
         self.stop_btn = tk.Button(
@@ -6490,7 +6516,9 @@ class App:
         pop.geometry(f"{pw}x{ph}+{x}+{y}")
         if chip and chip.winfo_exists():
             self._active_skill_chip = chip
-            chip.configure(highlightbackground=accent, highlightthickness=2)
+            # Only recolor the existing 1px border — never change its thickness, or
+            # the chip resizes and the whole composer/background shifts.
+            chip.configure(highlightbackground=accent)
         pop.lift()
         text_widget.focus_set()
 
@@ -6499,7 +6527,7 @@ class App:
         if chip:
             try:
                 if chip.winfo_exists():
-                    chip.configure(highlightbackground=BORDER, highlightthickness=1)
+                    chip.configure(highlightbackground=BORDER)  # recolor only; keep 1px (no shift)
             except tk.TclError:
                 pass
         self._active_skill_chip = None
@@ -7951,6 +7979,9 @@ class App:
             self.terminal.focus_set()
         else:
             self.composer.grid()
+            # Any non-terminal tab (Conversation, Work Log, Artifacts, Spawned): the
+            # composer owns the keyboard so everything you type goes to the conversation.
+            self.input.focus_set()
         if hasattr(self, "spawned_tab") and selected == str(self.spawned_tab):
             self._refresh_spawned_tab()
 
@@ -8225,6 +8256,28 @@ class App:
             self.input.edit_redo()
         except tk.TclError:
             pass  # nothing to redo
+        return "break"
+
+    def _input_select_all(self, _event=None):
+        # Tk's default Ctrl+A is "go to line start"; make it select-all instead.
+        self.input.tag_add("sel", "1.0", "end-1c")
+        self.input.mark_set("insert", "end-1c")
+        self.input.see("insert")
+        return "break"
+
+    def _route_key_to_composer(self, event):
+        """Read-only views (Work Log, Artifacts) must never capture typing — a
+        printable key there is redirected into the composer so everything the user
+        types reaches the conversation, nowhere else. Ctrl combos (copy/find) and
+        navigation keys pass through so selection/scrolling still work."""
+        if event.state & 0x4:  # Ctrl held → let copy / find / select-all through
+            return None
+        ch = event.char
+        if not ch or not ch.isprintable():  # arrows, Enter, F-keys, etc. → leave alone
+            return None
+        self.input.focus_set()
+        self.input.insert("insert", ch)
+        self.input.see("insert")
         return "break"
 
     def paste_into_prompt(self, _event=None):
@@ -12161,6 +12214,29 @@ class App:
         tk.Label(
             body,
             text="The selected Claude model performs the entire request itself.",
+            bg=BG,
+            fg=MUTED,
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=(24, 0), pady=(2, 12))
+        tk.Radiobutton(
+            body,
+            text="Ultracode (max multi-agent)",
+            variable=mode_var,
+            value="ultra",
+            bg=BG,
+            fg=TEXT,
+            selectcolor=BG,
+            activebackground=BG,
+            activeforeground=TEXT,
+        ).pack(anchor="w")
+        tk.Label(
+            body,
+            text=(
+                "The tier above max effort: Claude fans substantial work out to many "
+                "parallel sub-agents / multi-agent workflows and adversarially verifies "
+                "results before reporting. Most thorough; uses the most tokens."
+            ),
             bg=BG,
             fg=MUTED,
             justify="left",

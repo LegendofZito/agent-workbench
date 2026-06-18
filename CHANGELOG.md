@@ -8,6 +8,33 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Ultracode orchestration mode (the tier above max effort)
+- New **Ultracode** option in the Claude-orchestration dialog (alongside Smart / Direct). A single
+  max-effort run is still one agent; Ultracode tells Claude to fan substantial work out to **many parallel
+  sub-agents / multi-agent workflows** and adversarially verify results before reporting — the most
+  thorough, most token-hungry tier. Reuses the Smart routing + cost-discipline + local-model rules.
+  (`CLAUDE_ULTRACODE_ORCHESTRATION_PROMPT`; mode `ultra`.) Note: the model `--effort` scale itself still
+  tops out at `max` (the CLI's ceiling) — Ultracode is "more than max" via orchestration, not effort.
+
+### Active-context % moved to the bottom status bar
+- The active-context percentage badge moved from the top bar down to the bottom bar, just left of the
+  "working…"/status text, so context usage and activity sit together. Still recolors as context fills.
+
+### Skill popover no longer shifts the background
+- Opening a skill nudged the whole composer because the skill's chip border was *thickened* 1px→2px
+  (resizing the chip, reflowing the row). Now opening a skill only **recolors** the chip's existing 1px
+  border (no size change → no shift); the popover still anchors to its chip.
+
+### Typing always goes to the composer / conversation
+- On any non-terminal tab (Conversation, Work Log, Artifacts, Spawned) the composer is auto-focused, and a
+  printable key pressed while a read-only view (Work Log/Artifacts) has focus is redirected into the
+  composer — so everything you type reaches the conversation, nowhere else. Copy/find/scroll still work in
+  those views; the Terminal tab keeps its own input. (`_route_key_to_composer`.)
+
+### Ctrl+A selects all in the prompt box
+- Bound Ctrl+A (and Ctrl+Shift+A) to select-all in the composer (Tk's default Ctrl+A was "go to line
+  start"). (`_input_select_all`.)
+
 ### Ctrl+Z undo in the prompt box (undo a paste)
 - Enabled undo on the composer (`undo=True`): **Ctrl+Z** removes a paste / reverts edits; **Ctrl+Y** or
   **Ctrl+Shift+Z** redoes. Guarded the draft: `edit_reset()` after restoring a tab's saved draft (so undo
