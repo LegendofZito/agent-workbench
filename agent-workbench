@@ -3928,6 +3928,13 @@ class ClaudeBackend(StreamCliBackend):
             orchestration_mode = clean_text(
                 session["backend"].get("orchestration_mode") or "smart"
             )
+            # "Ultracode" is a synthetic Effort tier, not a real --effort value
+            # (the CLI tops out at "max"). Map it to max effort + ultra
+            # multi-agent orchestration. Picking Ultracode in Effort therefore
+            # enables ultracode for the run regardless of the orchestration dialog.
+            if effort == "Ultracode":
+                orchestration_mode = "ultra"
+                effort = "max"
             if orchestration_mode in ("smart", "ultra"):
                 cmd += [
                     "--append-system-prompt",
@@ -6006,8 +6013,9 @@ class App:
             if _zoom_widget is not None:
                 self._enable_text_zoom(_zoom_widget)
 
-        # ── Footer: TWO bars — (1) Skills, (2) one status + controls row ──────
-        # (1) Skills bar (upper)
+        # ── Footer: TWO bars ────────────────────────────────────────────────
+        # (1) Skills bar (upper): [✦ Skills][Hand Off] … skill chips … [Active%]
+        # (2) status + controls row (lower): Sub-agents, activity, status, Send…
         self.skills_bar = tk.Frame(composer, bg=PANEL)
         self.skills_bar.pack(fill="x", padx=8, pady=(4, 0))
         tk.Button(
@@ -6022,6 +6030,35 @@ class App:
             cursor="hand2",
             font=("Sans", 9, "bold"),
         ).pack(side="left")
+        # Hand Off: far left of the Skills bar, just right of the ✦ Skills button.
+        self.topbar_handoff_btn = tk.Button(
+            self.skills_bar,
+            text="Hand Off",
+            command=self.handoff_session,
+            bg="#7c2d12",
+            fg="#fed7aa",
+            disabledforeground="#64748b",
+            activebackground="#ea580c",
+            activeforeground="white",
+            relief="flat",
+            padx=11,
+            pady=5,
+            cursor="arrow",
+            state="disabled",
+        )
+        self.topbar_handoff_btn.pack(side="left", padx=(6, 0))
+        # Active context %: far right of the Skills bar (sits above the Send button).
+        self.context_badge = tk.Label(
+            self.skills_bar,
+            textvariable=self.context_text,
+            bg="#1a2432",
+            fg="#dbeafe",
+            padx=10,
+            pady=4,
+            font=("Sans", 9, "bold"),
+        )
+        self.context_badge.pack(side="right")
+        # chips fill the middle (packed last so expand takes the leftover space).
         chips_wrap = tk.Frame(self.skills_bar, bg=PANEL)
         chips_wrap.pack(side="left", fill="x", expand=True)
         self.skill_chips = tk.Frame(chips_wrap, bg=PANEL)
@@ -6070,32 +6107,8 @@ class App:
             anchor="w",
         )
         self.activity_dots_label.pack(side="left", fill="y")
-        self.context_badge = tk.Label(
-            bar,
-            textvariable=self.context_text,
-            bg="#1a2432",
-            fg="#dbeafe",
-            padx=10,
-            pady=4,
-            font=("Sans", 9, "bold"),
-        )
-        self.context_badge.pack(side="left", padx=(0, 6))
-        self.topbar_handoff_btn = tk.Button(
-            bar,
-            text="Hand Off",
-            command=self.handoff_session,
-            bg="#7c2d12",
-            fg="#fed7aa",
-            disabledforeground="#64748b",
-            activebackground="#ea580c",
-            activeforeground="white",
-            relief="flat",
-            padx=11,
-            pady=5,
-            cursor="arrow",
-            state="disabled",
-        )
-        self.topbar_handoff_btn.pack(side="left", padx=(0, 6))
+        # Active context % and Hand Off now live on the Skills bar (bar 1):
+        # Active% at the far right (above Send), Hand Off at the far left.
         self.hint = tk.Label(bar, textvariable=self.status, bg=PANEL, fg=MUTED, anchor="w")
         self.hint.pack(side="left", fill="x", expand=True)
         self.send_btn = tk.Button(
@@ -6671,7 +6684,13 @@ class App:
         if agent_key == "claude":
             help_text = self.runtime_help.get("claude", "")
             options = parse_effort_options(help_text, EFFORT_OPTIONS.get(agent_key, ("Default",)))
-            return options or tuple(EFFORT_OPTIONS.get(agent_key, ("Default",)))
+            options = tuple(options) or tuple(EFFORT_OPTIONS.get(agent_key, ("Default",)))
+            # "Ultracode" is a synthetic top tier above "max": selecting it maps at
+            # launch to --effort max + ultra multi-agent orchestration (see the
+            # command builder). It is not a real CLI --effort value.
+            if "Ultracode" not in options:
+                options = options + ("Ultracode",)
+            return options
         if agent_key == "gemini":
             return ("Default",)
         return tuple(EFFORT_OPTIONS.get(agent_key, ("Default",)))

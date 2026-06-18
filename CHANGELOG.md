@@ -8,6 +8,21 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### "Ultracode" is now selectable directly in the Effort dropdown
+- It was only reachable from the Claude-orchestration dialog before. Now **Ultracode** appears as the top
+  tier in the **Effort** picker (low · medium · high · xhigh · max · **Ultracode**). It's a synthetic tier:
+  at launch it maps to `--effort max` **+ ultra multi-agent orchestration**, so picking it enables ultracode
+  for the run regardless of the orchestration dialog. (`_effort_options_for` appends it; the command builder
+  maps `effort == "Ultracode"` → `orchestration_mode="ultra"`, `effort="max"`.) The orchestration dialog's
+  Ultracode radio still works too.
+
+### Hand Off + Active% moved up to the Skills bar (bar 1)
+- Decluttered the lower status bar. The **Active context %** badge now sits at the **far right of the Skills
+  bar** (directly above the Send button), and **Hand Off** sits at the **far left** of the Skills bar (just
+  right of the ✦ Skills button). Skill chips fill the middle. The lower bar now carries only Sub-agents ·
+  activity · status · Stop/Attach/Send/queue. (Reverses last entry's "move Hand Off + Active% next to
+  status"; widgets kept their attribute names so context recolor + Hand Off enable/disable still work.)
+
 ### Spawned tab now shows real sub-agents (running + finished history)
 - **The complaint:** the "Spawned" tab was always empty and nothing showed "which agents are up and
   running," even when Claude fanned work out to sub-agents. Root cause: the Spawned tab only listed
