@@ -8,6 +8,193 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### GPU overload / freeze / tab-blink fixes
+- **Ollama concurrency cap (fixes GPU overloading + system shutdowns):** `local_project_state_summary`
+  now acquires a module-level `threading.Semaphore(1)` before calling Ollama. If another inference is
+  already running it returns immediately and falls back to the deterministic state writer. This prevents
+  multiple simultaneous `qwen3:8b` GPU inferences (triggered by many tabs completing turns at once) from
+  stacking up and triggering the AMD DATA FABRIC SYNC FLOOD hard-shutdown.
+- **`poll_external_session` no longer calls `_save_active_workspace` every 500ms (fixes UI freeze):**
+  `_save_active_workspace` reads the entire composer text widget on the Tk main thread; doing that 2×/sec
+  was a primary freeze source. The watchdog still saves every 2s. Poll interval also slowed 500ms → 2000ms.
+- **Tab switch no longer blinks all tabs (fixes glitching):** `_render_workspace_tabs_now` now tracks an
+  `order_sig` (just the tab sequence). Only when the sequence changes (new tab, closed tab, reorder) are
+  frames `pack_forget`+`pack`ed. For color/selection-only changes (e.g. switching active tab), tabs are
+  updated in-place with `configure()` only — no frames disappear and reappear.
+
+### Project-local handoff filesystem + existing-session targets
+- Handoff deployment can now target either a new continuation or an existing same-project session for the
+  selected agent. Existing-session handoffs attach a one-turn pending handoff context, focus/open the target
+  session, and send the continuation prompt without replaying the handoff on future turns.
+- Project memory now has a stronger hard-drive contract: `AGENT_STATE.md` stays at the project root,
+  `.agent-workbench/project.json` stores project identity/related roots/client metadata, and generated
+  handoff packets are written into `.agent-workbench/handoffs/` with timestamped files plus `latest.md`.
+- Hidden shared-state context now includes the absolute project root and registered related roots in addition
+  to the canonical state file, registry file, and project id.
+- The project-scope guard now respects registered related roots from `.agent-workbench/project.json`, so this
+  Agent Workbench session can legitimately hand off work that includes the related Agent Workbench Next repo
+  without being blocked as cross-project contamination.
+
+### OGAWB fixes file follow-up
+- Read the actual `/home/zito/OGAWBfixes.md` file (lowercase `f`), which listed five remaining issues:
+  selector wheel behavior, arrow-key navigation, Work Log find, tab blink, and sub-tab white blink.
+- The Work Log selector now scrolls without a visible scrollbar, matching the requested "scroll the whole set"
+  behavior without selecting pages on wheel movement.
+- Clicking a `Log N` button now focuses that selector item so arrow/page/home/end navigation works immediately.
+- Work Log Find now supports exact matching and fallback all-word phrase matching, then jumps to and highlights
+  the matching page.
+- Workspace tab buttons and Workbench sub-tabs now suppress default focus/highlight borders and keep dark active,
+  pressed, and focus colors to reduce white flashes when clicked.
+
+### Work Log page selector is internally scrollable
+- Fixed the overflow shown in the latest screenshot: when a session has many Work Log pages, the `Log N`
+  selector now scrolls inside its own column instead of extending down into the composer/status area.
+- Mouse wheel over the selector scrolls the selector list; arrow/page/home/end keys still change the
+  selected Work Log page and keep the selected page visible.
+
+### Work Log scroll no longer blinks through pages
+- Fixed the blink shown in `/home/zito/Videos/Screencasts/Screencast_20260618_172958.webm`: mouse-wheel movement over the Work Log page selector no longer rapidly switches `Log N` pages.
+- Work Log page buttons now update their selected/live styles in place instead of destroying and recreating every button on each page change.
+- Re-selecting the already-visible Work Log page no longer clears and reinserts the text pane.
+
+### OG responsiveness + work-log usability pass
+- Added Work Log controls for exporting the full log, exporting the current log page, and finding the log page that contains a search term.
+- Work Log now opens on the newest/live page; wheel over the selector scrolls the selector list, while arrow/page/home/end navigates pages.
+- Workspace tabs now reuse existing tab widgets instead of destroying/recreating the whole tab strip on every selected/status change, reducing blink when switching tabs or streaming work.
+- Composer draft persistence is debounced without snapshotting the active workspace on every keystroke, reducing typing latency.
+- File drag/drop now accepts `file://` drops from desktop file managers and reports when a drop contains no readable files, so Markdown files such as `/home/zito/Documents/OGagentworkbenchfixes.md` can attach normally.
+- Opening a saved session now restores that session's own agent and working directory before the next send, reducing the chance of an old tab launching work in the wrong project.
+- Busy tabs restored from `Starting` now normalize to `Working` once a turn has actually started, including background tabs checked by the watchdog.
+
+### Model selection no longer looks like it changed at send time
+- Confirmed through `debug.jsonl` that some recent Codex turns really launched with `gpt-5.4` while other
+  tabs launched with `gpt-5.5`; this was not just user perception.
+- Turn launch now captures the visible dropdown model/effort into per-workspace `running_model` /
+  `running_effort` before starting the backend, syncs the workspace/session immediately, and logs previous
+  versus launch settings for future audits.
+- The working badge now prefers the captured launch model/effort while a turn is running, so stale
+  session/workspace settings cannot make the footer say the wrong model.
+- Opening a session now shows `Ready. Next turn: <model - effort>.` so per-session model restores are
+  visible before pressing Enter.
+
+### Project registry + handoff validation
+- Added per-project `.agent-workbench/project.json` metadata with a stable project id, root, state file,
+  aliases, and per-client last-session/sequence data. This makes project identity explicit instead of
+  relying only on title/cwd inference.
+- Hidden shared-state context and handoff packets now include the project registry path when available, so
+  new clients can read both human/model state (`AGENT_STATE.md`) and machine-readable project metadata.
+- Handoff deploy now runs a validation pass before creating the continuation. It blocks unresolved project
+  roots, unknown target clients, blank titles, and duplicate target-client titles for the same project; it
+  logs successful validations and non-blocking warnings.
+
+### Single active worker indicator
+- Removed the duplicate routine `model - effort is working...` text from the left footer hint. The
+  right-side working badge remains the single live worker/model indicator with model, effort, elapsed time,
+  and token details; the left hint is reserved for warnings, errors, and other status messages.
+
+### Per-client handoff title sequencing
+- Handoff titles now sequence against the **target client's own sessions** for the inferred project, not the
+  source client's open session list. Example: Claude `Pig Farm 6` handed to fresh Codex becomes `Pig Farm`,
+  Codex `Pig Farm 3` handed back to Claude becomes `Pig Farm 7`, and Claude `Pig Farm 10` handed back to
+  Codex becomes `Pig Farm 4`.
+- Cross-client handoff tabs now initialize with the target agent's cwd/model/effort/session list before
+  opening the continuation session, preventing the new tab from briefly inheriting the source client's
+  picker state.
+
+### Hidden project-state echo suppression
+- Backend `userMessage` echoes from Codex/Gemini are now treated as request echoes, not new user-authored
+  messages, so Workbench no longer creates surprise blue bubbles from the payload it sent internally.
+- Saved transcript rendering now strips Workbench-only `PROJECT SHARED STATE` / handoff bootstrap context
+  and shows only the real prompt after the authoritative time block. Existing native Codex transcripts that
+  already persisted the hidden payload will render cleanly after reload.
+- Handoff summaries and turn summaries now use the same visible-user-text sanitizer, preventing recursive
+  project-state dumps from being inherited into future handoffs.
+- Codex `userMessage` item-start notifications are hidden from the work log; they are backend lifecycle
+  noise, not useful user activity.
+
+### Usage-exhausted tabs + cross-project handoff guard
+- Workspace tabs now turn **red** when that client/workspace reports usage at 100% or no remaining quota.
+  Red takes precedence over working yellow, completed green, and normal ready tabs; matching-agent tabs also
+  inherit the red state when one workspace has account-level telemetry for that agent.
+- The lower running status now shows the actual model/effort instead of the client name, e.g.
+  `gpt-5.4-mini - medium is working...`; the same formatter covers Codex, Claude, Gemini, and connected
+  Ollama/local-model clients.
+- Workspace tab switching is more responsive: config persistence is debounced, transcript redraw starts
+  after the tab has visually switched, redraw batches are smaller, and artifact previews are deferred until
+  selected instead of being read immediately during every tab restore.
+- Project-state fallback updates no longer append the previous `AGENT_STATE.md` as a recursive
+  `Prior State Snapshot`, and the local/Ollama summarizer receives old state with prior snapshots stripped.
+  This stops stale cross-project state from poisoning future project memory.
+- Vertical mouse-wheel events over tab controls are blocked from switching tabs. Horizontal wheel events
+  (including MX Master-style Button-6/Button-7 and Shift+wheel) can still move through tabs, while normal
+  pane scrolling and Ctrl-wheel text zoom remain unchanged.
+- Stale broad roots such as `/home/zito` no longer override a specific project title/root such as
+  `/home/zito/the-pig-farm`, and a handoff is no longer blocked by one old inherited path when the current
+  session evidence overwhelmingly points at the titled project.
+- Automatic handoffs are capped more tightly and ignore inherited `PROJECT SHARED STATE` / "read this
+  previous handoff" bootstrap wrappers when choosing the next session's objective, preventing recursive
+  context growth during model-to-model handoff chains.
+- Generated handoffs rewrite stale `/home/zito/AGENT_STATE.md` references to the inferred project-local
+  state file, so old bad packets do not keep poisoning new Pig Farm continuations.
+- Added a project-scope conflict guard for handoffs and project-state updates. If a session title resolves
+  to one project (for example Pig Farm) but the handoff/session evidence points at another project (for
+  example Agent Workbench Next), Workbench now blocks update/handoff/copy/worker/send-first-handoff actions
+  and shows a scope-mismatch warning instead of launching a contaminated continuation.
+
+### Automatic project-state routing and visible state indicator
+- `AGENT_STATE.md` is now automatic for normal use: completed/error turns, staged handoffs, copied
+  handoffs, worker handoffs, and deployed handoffs refresh the inferred project state without requiring
+  `Options -> Update project state`.
+- Project-state routing now infers the real project root from touched files and commands first, then from
+  session title/project directories, before falling back to the selected cwd. This prevents broad sessions
+  like `/home/zito` from writing Pig Farm context into `/home/zito/AGENT_STATE.md`; Pig Farm resolves to
+  `/home/zito/the-pig-farm/AGENT_STATE.md`.
+- Added a front-row **State** button next to Hand Off/Context showing missing/updating/fresh state. It opens
+  the active session's inferred `AGENT_STATE.md` directly, so evidence that state was written is visible
+  during normal work.
+- The main conversation header now includes the active client (`Codex: Pig Farm`, `Claude: Pig Farm 8`,
+  etc.) so switching tabs makes the current agent obvious.
+
+### Project-state update no longer freezes the UI
+- Fixed **Options → Update project state** blocking the Tk event loop while local Ollama summarized a
+  handoff. Manual project-state refreshes now run in a background thread and report completion in the
+  status bar.
+- Fast handoff/copy/open paths now create/update `AGENT_STATE.md` with the deterministic fallback instead
+  of waiting on a local LLM, so usage-limit handoffs stay responsive even if Ollama is slow, cold-starting,
+  or missing the configured model.
+
+### Shared project state + immediate effort changes
+- Added repo-local **`AGENT_STATE.md`** support for every project: Workbench can update a durable shared
+  project memory file from the current session/handoff, and future turns inject the file path plus a bounded
+  excerpt for Claude, Codex, Gemini, and local-model clients. Handoff packets now include the shared state
+  path too.
+- Project-state updates use **local Ollama** for the mechanical summarization step when available
+  (`qwen3:8b` default), falling back to a deterministic Markdown state if Ollama is offline. This keeps
+  cloud tokens out of routine "compress this handoff into project memory" work.
+- **Effort/model dropdown changes now take immediate effect**: the active workspace, current session backend,
+  saved agent defaults, and persisted workspace config all update in one path, so the next turn/queued turn
+  uses the selected effort instead of a stale one.
+
+### Artifact copy + usage-limit handoff
+- Artifact previews are now true read-only text views instead of disabled text widgets, so selecting text
+  no longer turns the preview unreadable/black. `Ctrl+C`, `Ctrl+A`, right-click Copy/Copy all, and the
+  artifact-list **Copy contents** command now work for handoff files.
+- Added **Copy packet** in the handoff dialog and **Options → Copy current handoff** for manual cross-client
+  continuation without deploying a new tab.
+- The **Hand Off** button now also wakes up when the active client's usage telemetry is near exhausted
+  (90%+ in any reported window), not only when context is 70%+ or compacted. Usage-limit pressure also
+  stages a durable `HANDOFF.md`, so a Claude limit can be handed to Codex/Gemini/Ollama cleanly.
+
+### Codex sidebar shows full native session history again
+- Restored Codex native history in the Workbench sidebar without bringing back the slow all-client scan:
+  Codex sessions are read directly from `~/.codex/state_5.sqlite`, with no 100-row cap and no eager rollout
+  transcript parsing. Opening a native Codex row loads the full rollout on demand.
+- Fixed merge/dedupe so Workbench-local sessions linked to a Codex thread keep their friendly Workbench
+  label (e.g. "Next Agent Workbench") while the matching native row is hidden. Worker/child sessions still
+  stay out of the main picker.
+- Named Workbench Codex sessions now sync their title back to Codex's native thread record and fill
+  `source_session_id`/`source_path`, so the Codex terminal history uses the same label after restart.
+
 ### Per-session scope charter (push back on wrong-chat requests)
 - New **Options → "Session scope / charter…"**: describe what a session is for (e.g. "Pig Farm trading
   only — do NOT edit Agent Workbench"). It's injected into that session's system prompt so the agent
