@@ -8,6 +8,14 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Bottom bar: one status indicator, smaller input, corner buffer
+- **No more two "Ready"s.** The green status badge moved from the far left to the **right** (just left of
+  the token readout), and the white prompt-state no longer prints a redundant "Ready" — it now shows only
+  the token/queue readout (blank when idle and no turn has run). One status indicator, on the right.
+- **Smaller composer** — the prompt input dropped from 3 rows to 2.
+- **Bottom buffer panel** added below the controls bar, plus left/right corner spacing on Sub-agents and
+  Send, so those buttons aren't jammed into the window corners.
+
 ### Usage badge updates in real time; relabels; Hand Off beside Context Limit
 - **Real-time 5h/weekly usage:** the badge refreshed only every 5 min (or on click). Now it also refreshes
   **immediately after every turn completes** (when usage actually changes) and the background poll dropped

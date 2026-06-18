@@ -6017,7 +6017,7 @@ class App:
         self.input = ScrolledText(
             composer,
             wrap="word",
-            height=3,
+            height=2,
             bg=PANEL_ALT,
             fg=TEXT,
             insertbackground=TEXT,
@@ -6121,10 +6121,10 @@ class App:
             cursor="hand2",
             command=self._open_subagents_popover,
         )
-        self.worker_badge.pack(side="left", padx=(0, 6))
+        self.worker_badge.pack(side="left", padx=(8, 6))
         self.activity_badge = tk.Frame(bar, bg="#16351f", width=112, height=30)
         self.activity_badge.pack_propagate(False)
-        self.activity_badge.pack(side="left", padx=(0, 6))
+        # (the green status badge is packed on the RIGHT, below — see prompt_state)
         self.activity_word_label = tk.Label(
             self.activity_badge,
             textvariable=self.activity_word,
@@ -6162,7 +6162,7 @@ class App:
             pady=6,
             cursor="hand2",
         )
-        self.send_btn.pack(side="right")
+        self.send_btn.pack(side="right", padx=(0, 8))
         self.attach_btn = tk.Button(
             bar,
             text="Attach",
@@ -6208,6 +6208,12 @@ class App:
             font=("Sans", 9, "bold"),
         )
         self.prompt_state_label.pack(side="right", padx=(6, 0))
+        # Single status indicator: the green activity badge now lives on the RIGHT,
+        # just left of the prompt-state readout (the redundant left "Ready" is gone).
+        self.activity_badge.pack(side="right", padx=(6, 6))
+        # Buffer panel along the bottom so Send / Sub-agents aren't jammed into the
+        # window corners.
+        tk.Frame(composer, bg=BG, height=18).pack(fill="x")
         self.notebook.bind("<<NotebookTabChanged>>", self.on_notebook_tab_changed)
         self.win.after(250, self.animate_activity)
         self.win.after(1000, self.refresh_prompt_state)
@@ -7718,10 +7724,16 @@ class App:
                 text = f"{model} Working · {elapsed}{token_suffix}{queue_text}"
                 bg, fg = "#3b2c0b", "#facc15"
         else:
+            # The green activity badge already shows "Ready"; don't duplicate the
+            # word here — show only the token / queue readout (blank when idle and
+            # no turn has run yet).
             queued = len(workspace.get("queued_prompts") or [])
-            queue_text = f" · {queued} queued" if queued else ""
-            token_suffix = f" · {token_text}" if token_text else ""
-            text = f"Ready{token_suffix}{queue_text}"
+            parts = []
+            if token_text:
+                parts.append(token_text)
+            if queued:
+                parts.append(f"{queued} queued")
+            text = " · ".join(parts)
             bg, fg = "#101824", "#cbd5e1"
         self.prompt_state_text.set(text)
         self.prompt_state_label.configure(bg=bg, fg=fg)
