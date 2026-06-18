@@ -5465,21 +5465,6 @@ class App:
             font=("Sans", 9, "bold"),
             cursor="hand2",
         )
-        self.topbar_handoff_btn = tk.Button(
-            topbar,
-            text="Hand Off",
-            command=self.handoff_session,
-            bg="#7c2d12",
-            fg="#fed7aa",
-            disabledforeground="#64748b",
-            activebackground="#ea580c",
-            activeforeground="white",
-            relief="flat",
-            padx=11,
-            pady=5,
-            cursor="arrow",
-            state="disabled",
-        )
         self.refresh_btn = tk.Button(
             topbar,
             text="Refresh",
@@ -5508,7 +5493,6 @@ class App:
         )
         self.options_btn.pack(side="right", padx=(0, 4))
         self.refresh_btn.pack(side="right", padx=(0, 8))
-        self.topbar_handoff_btn.pack(side="right", padx=(0, 4))
         self.usage_badge.pack(side="right", padx=(0, 4))
         self.session_source_label.pack(side="right", padx=(6, 10))
         self.session_title_label.pack(
@@ -5999,80 +5983,8 @@ class App:
             if _zoom_widget is not None:
                 self._enable_text_zoom(_zoom_widget)
 
-        composer_state = tk.Frame(composer, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
-        composer_state.pack(fill="x", padx=8, pady=(4, 0))
-        self.activity_badge = tk.Frame(
-            composer_state,
-            bg="#16351f",
-            width=116,
-            height=30,
-        )
-        self.activity_badge.pack_propagate(False)
-        self.activity_word_label = tk.Label(
-            self.activity_badge,
-            textvariable=self.activity_word,
-            bg="#16351f",
-            fg="#86efac",
-            font=("Sans", 9, "bold"),
-            width=10,
-            anchor="e",
-        )
-        self.activity_word_label.pack(side="left", fill="both", expand=True)
-        self.activity_dots_label = tk.Label(
-            self.activity_badge,
-            textvariable=self.activity_dots,
-            bg="#16351f",
-            fg="#86efac",
-            font=("Monospace", 9, "bold"),
-            width=3,
-            anchor="w",
-        )
-        self.activity_dots_label.pack(side="left", fill="y")
-        self.worker_badge = tk.Button(
-            composer_state,
-            textvariable=self.worker_text,
-            bg="#1a2432",
-            fg="#dbeafe",
-            padx=10,
-            pady=5,
-            font=("Sans", 9, "bold"),
-            width=20,
-            anchor="center",
-            relief="flat",
-            cursor="hand2",
-            command=self._open_subagents_popover,
-        )
-        self.worker_badge.pack(side="left", padx=(0, 6))
-        self.queue_badge = tk.Button(
-            composer_state,
-            textvariable=self.queue_text,
-            command=self.open_queue_dialog,
-            bg="#3b2c0b",
-            fg="#fef08a",
-            activebackground="#5a390c",
-            activeforeground="#fef3c7",
-            disabledforeground="#64748b",
-            padx=10,
-            pady=5,
-            font=("Sans", 9, "bold"),
-            relief="flat",
-            cursor="hand2",
-            state="disabled",
-        )
-        self.queue_badge.pack(side="right", padx=(6, 0))
-        self.prompt_state_label = tk.Label(
-            composer_state,
-            textvariable=self.prompt_state_text,
-            bg="#1a2432",
-            fg="#dbeafe",
-            anchor="w",
-            padx=12,
-            pady=6,
-            font=("Sans", 9, "bold"),
-        )
-        self.prompt_state_label.pack(side="right", padx=(6, 0))
-
-        # Skills bar — sits between the composer state and the send bar
+        # ── Footer: TWO bars — (1) Skills, (2) one status + controls row ──────
+        # (1) Skills bar (upper)
         self.skills_bar = tk.Frame(composer, bg=PANEL)
         self.skills_bar.pack(fill="x", padx=8, pady=(4, 0))
         tk.Button(
@@ -6093,9 +6005,48 @@ class App:
         self.skill_chips.pack(anchor="center")
         self._render_skill_chips()
 
+        # (2) Status + controls bar (lower, single row): Sub-agents, activity,
+        # Active%, Hand Off, the ready/working status, then Send/Attach/Stop/queue.
         bar = tk.Frame(composer, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
-        bar.pack(fill="x", padx=8, pady=(6, 8))
-        # Active-context % sits on the bottom bar, just left of the status/"working" text.
+        bar.pack(fill="x", padx=8, pady=(4, 8))
+        self.worker_badge = tk.Button(
+            bar,
+            textvariable=self.worker_text,
+            bg="#1a2432",
+            fg="#dbeafe",
+            padx=10,
+            pady=5,
+            font=("Sans", 9, "bold"),
+            width=16,
+            anchor="center",
+            relief="flat",
+            cursor="hand2",
+            command=self._open_subagents_popover,
+        )
+        self.worker_badge.pack(side="left", padx=(0, 6))
+        self.activity_badge = tk.Frame(bar, bg="#16351f", width=112, height=30)
+        self.activity_badge.pack_propagate(False)
+        self.activity_badge.pack(side="left", padx=(0, 6))
+        self.activity_word_label = tk.Label(
+            self.activity_badge,
+            textvariable=self.activity_word,
+            bg="#16351f",
+            fg="#86efac",
+            font=("Sans", 9, "bold"),
+            width=10,
+            anchor="e",
+        )
+        self.activity_word_label.pack(side="left", fill="both", expand=True)
+        self.activity_dots_label = tk.Label(
+            self.activity_badge,
+            textvariable=self.activity_dots,
+            bg="#16351f",
+            fg="#86efac",
+            font=("Monospace", 9, "bold"),
+            width=3,
+            anchor="w",
+        )
+        self.activity_dots_label.pack(side="left", fill="y")
         self.context_badge = tk.Label(
             bar,
             textvariable=self.context_text,
@@ -6105,25 +6056,25 @@ class App:
             pady=4,
             font=("Sans", 9, "bold"),
         )
-        self.context_badge.pack(side="left", padx=(0, 8))
+        self.context_badge.pack(side="left", padx=(0, 6))
+        self.topbar_handoff_btn = tk.Button(
+            bar,
+            text="Hand Off",
+            command=self.handoff_session,
+            bg="#7c2d12",
+            fg="#fed7aa",
+            disabledforeground="#64748b",
+            activebackground="#ea580c",
+            activeforeground="white",
+            relief="flat",
+            padx=11,
+            pady=5,
+            cursor="arrow",
+            state="disabled",
+        )
+        self.topbar_handoff_btn.pack(side="left", padx=(0, 6))
         self.hint = tk.Label(bar, textvariable=self.status, bg=PANEL, fg=MUTED, anchor="w")
         self.hint.pack(side="left", fill="x", expand=True)
-        self.stop_btn = tk.Button(
-            bar, text="Stop", command=self.stop, bg="#9f2d2d", fg="white", relief="flat", padx=12, pady=6
-        )
-        self.attach_btn = tk.Button(
-            bar,
-            text="Attach",
-            command=lambda: self.choose_artifacts(attach_to_prompt=True),
-            bg="#172131",
-            fg=TEXT,
-            activebackground="#243249",
-            activeforeground=TEXT,
-            relief="flat",
-            padx=12,
-            pady=6,
-            cursor="hand2",
-        )
         self.send_btn = tk.Button(
             bar,
             text="Send",
@@ -6138,7 +6089,51 @@ class App:
             cursor="hand2",
         )
         self.send_btn.pack(side="right")
+        self.attach_btn = tk.Button(
+            bar,
+            text="Attach",
+            command=lambda: self.choose_artifacts(attach_to_prompt=True),
+            bg="#172131",
+            fg=TEXT,
+            activebackground="#243249",
+            activeforeground=TEXT,
+            relief="flat",
+            padx=12,
+            pady=6,
+            cursor="hand2",
+        )
         self.attach_btn.pack(side="right", padx=(0, 6))
+        self.stop_btn = tk.Button(
+            bar, text="Stop", command=self.stop, bg="#9f2d2d", fg="white", relief="flat", padx=12, pady=6
+        )
+        self.queue_badge = tk.Button(
+            bar,
+            textvariable=self.queue_text,
+            command=self.open_queue_dialog,
+            bg="#3b2c0b",
+            fg="#fef08a",
+            activebackground="#5a390c",
+            activeforeground="#fef3c7",
+            disabledforeground="#64748b",
+            padx=10,
+            pady=5,
+            font=("Sans", 9, "bold"),
+            relief="flat",
+            cursor="hand2",
+            state="disabled",
+        )
+        self.queue_badge.pack(side="right", padx=(6, 0))
+        self.prompt_state_label = tk.Label(
+            bar,
+            textvariable=self.prompt_state_text,
+            bg="#1a2432",
+            fg="#dbeafe",
+            anchor="w",
+            padx=12,
+            pady=6,
+            font=("Sans", 9, "bold"),
+        )
+        self.prompt_state_label.pack(side="right", padx=(6, 0))
         self.notebook.bind("<<NotebookTabChanged>>", self.on_notebook_tab_changed)
         self.win.after(250, self.animate_activity)
         self.win.after(1000, self.refresh_prompt_state)

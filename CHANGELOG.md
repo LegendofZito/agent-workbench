@@ -8,6 +8,13 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Footer consolidated from three bars to two
+- The bottom area had three rows (Sub-agents/Ready · Skills · Active%/status/Send). Merged the two
+  status rows into ONE: now it's just **Skills bar** + a single **status/controls bar** carrying —
+  Sub-agents · activity · **Active context %** · **Hand Off** · ready/working status · Stop/Attach/Send.
+  The **Hand Off** button moved down from the top bar to sit next to the status, and **Active %** sits
+  there too. (Removed the separate `composer_state` row.)
+
 ### Ultracode orchestration mode (the tier above max effort)
 - New **Ultracode** option in the Claude-orchestration dialog (alongside Smart / Direct). A single
   max-effort run is still one agent; Ultracode tells Claude to fan substantial work out to **many parallel
