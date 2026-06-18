@@ -47,10 +47,42 @@ LEGACY_CONFIG_DIR = os.path.join(CONFIG_ROOT, "codex-conversation-viewer")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 INSTALL_INFO_FILE = os.path.join(CONFIG_DIR, "install.json")
 UPDATE_REQUEST_FILE = os.path.join(CONFIG_DIR, "update-request.json")
+DEBUG_LOG_FILE = os.path.join(CONFIG_DIR, "debug.jsonl")
+MAX_WORKSPACE_TABS = 10
+WORK_LOG_PAGE_LINES = 300  # roll the work log into a new "Log N" page every ~300 lines
 GEMINI_TITLE_CACHE_FILE = os.path.join(CONFIG_DIR, "gemini-titles.json")
 SESSIONS_DIR = os.path.join(CONFIG_DIR, "sessions")
 ARTIFACTS_DIR = os.path.join(CONFIG_DIR, "artifacts")
 SECRETS_FILE = os.path.join(CONFIG_DIR, "secrets.json")
+# Local-LLM delegation MCP bridge: lets the driving Claude offload cheap subtasks
+# to a free local Ollama model via a `delegate_local` tool, to save tokens.
+LOCAL_DELEGATE_SERVER = os.path.join(CONFIG_DIR, "local_delegate_server.py")
+LOCAL_DELEGATE_MCP_CONFIG = os.path.join(CONFIG_DIR, "local_delegate_mcp.json")
+LOCAL_DELEGATE_DEFAULT_MODEL = "qwen3:8b"
+
+
+def ensure_local_delegate_mcp_config():
+    """Write the MCP config pointing at the local-delegate server and return its
+    path — but only if the server script is actually deployed. Returns None
+    otherwise so the caller skips --mcp-config gracefully (never breaks a turn)."""
+    if not os.path.isfile(LOCAL_DELEGATE_SERVER):
+        return None
+    try:
+        model = LOCAL_DELEGATE_DEFAULT_MODEL
+        config = {
+            "mcpServers": {
+                "local-delegate": {
+                    "command": "python3",
+                    "args": [LOCAL_DELEGATE_SERVER],
+                    "env": {"DELEGATE_MODEL": model},
+                }
+            }
+        }
+        with open(LOCAL_DELEGATE_MCP_CONFIG, "w", encoding="utf-8") as handle:
+            json.dump(config, handle)
+        return LOCAL_DELEGATE_MCP_CONFIG
+    except OSError:
+        return None
 
 BG = "#0b0f16"
 PANEL = "#121925"
@@ -94,7 +126,6 @@ BORDER = "#263244"
 ANSI_ESCAPE = re.compile(
     r"(?:\x1B[@-_][0-?]*[ -/]*[@-~])|(?:\x1B\][^\x07]*(?:\x07|\x1B\\))"
 )
-GEMINI_THOUGHT_MARKER = re.compile(r"(?:\[Thought:\s*true\]\s*)+", re.IGNORECASE)
 SESSION_CONTEXT_BLOCK = re.compile(
     r"<session_context>.*?</session_context>",
     re.IGNORECASE | re.DOTALL,
@@ -188,9 +219,23 @@ Route work as follows:
 - For high-consequence tasks, workers may gather facts or implement a bounded
   plan, but Opus retains the decision and performs the final review.
 
-Use at most one worker by default. Fan out only when independent parallel work
-clearly saves time, and state why. Keep delegation inside the current Claude
-session, wait for the worker, verify its result, and present one integrated
+COST DISCIPLINE — always pick the CHEAPEST capable tier. Never use Opus for what
+Sonnet can do, nor Sonnet for what Haiku can do; escalate only when the cheaper
+tier would genuinely fail or the stakes demand it. Default down, not up.
+
+LOCAL MODEL (free, zero tokens): when a local-model delegation tool is available
+(e.g. an MCP `delegate_local`/`local_llm` tool backed by Ollama), PREFER it over a
+paid Claude subagent for bounded, mechanical, low-stakes, easily-verified subtasks
+— simple file reads, boilerplate or format conversion, grep-style lookups, short
+deterministic shell tasks. Verify its output before relying on it. Keep complex,
+ambiguous, or high-consequence work on Sonnet/Opus — do not offload those to a
+local model just to save tokens.
+
+Fan out to MULTIPLE workers in parallel whenever a task has independent sub-parts
+(e.g. research several areas at once, edit unrelated files, or split investigation
+from implementation) — run up to 3–4 workers concurrently and say why. Use a single
+worker only when the work is genuinely sequential. Keep delegation inside the current
+Claude session, wait for the workers, verify their results, and present one integrated
 answer to the user. Never claim worker work succeeded without checking it.
 """.strip()
 CLAUDE_SMART_AGENTS = {
@@ -551,14 +596,18 @@ def load_json(path, default):
         return default
 
 
-def save_json(path, value):
+def save_json(path, value, durable=True):
+    # durable=False skips fsync — the os.replace is still atomic (no corruption),
+    # we just don't force a disk sync. Used for high-frequency writes (config draft,
+    # session autosave during streaming) so the UI thread never blocks on fsync.
     ensure_dir(os.path.dirname(path))
     temporary = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
     with open(temporary, "w", encoding="utf-8") as handle:
         json.dump(value, handle, indent=2, sort_keys=True)
         handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+        if durable:
+            handle.flush()
+            os.fsync(handle.fileno())
     os.replace(temporary, path)
 
 
@@ -814,10 +863,6 @@ def claude_model_alias(model):
         if alias in value:
             return alias
     return "Default"
-
-
-def title_from_claude_jsonl(path):
-    return claude_session_metadata(path)["title"]
 
 
 def claude_jsonl_turns(path):
@@ -1953,6 +1998,189 @@ def codex_sessions_for_cwd(cwd):
     return sessions
 
 
+BUILTIN_SKILLS = [
+    ("deep-research", "Deep multi-source, fact-checked research report."),
+    ("code-review", "Review the current diff for bugs and cleanups."),
+    ("ultrareview", "Cloud-hosted multi-agent ultra code review of your branch or a PR."),
+    ("security-review", "Security review of pending changes."),
+    ("simplify", "Reuse/simplify/efficiency cleanups on changed code."),
+    ("verify", "Run the app and confirm a change works."),
+    ("run", "Launch and drive the app to see a change working."),
+    ("init", "Initialize a CLAUDE.md for the codebase."),
+    ("review", "Review a pull request."),
+    ("claude-api", "Reference for the Claude API / Anthropic SDK."),
+    ("update-config", "Configure the Claude Code harness via settings.json."),
+    ("keybindings-help", "Customize keyboard shortcuts."),
+    ("fewer-permission-prompts", "Add an allowlist to reduce permission prompts."),
+    ("loop", "Run a prompt/command on a recurring interval."),
+    ("schedule", "Create/manage scheduled cloud agents (routines)."),
+]
+
+# Clear, plain-English blurbs shown in the Skills menu. The raw SKILL.md descriptions
+# are written for the model ("This skill should be used when the user asks to…"), so we
+# override known skills here and strip boilerplate from the rest (see _humanize_skill_desc).
+SKILL_BLURBS = {
+    # Built-ins
+    "deep-research": "Deep, multi-source research that returns a cited report.",
+    "code-review": "Reviews your current code changes for bugs and cleanups.",
+    "ultrareview": "Claude's ultra code review — a cloud-hosted multi-agent review of your branch (or a PR #).",
+    "security-review": "Security review of your pending code changes.",
+    "simplify": "Tidies and simplifies the code you just changed.",
+    "verify": "Runs the app and confirms a change actually works.",
+    "run": "Launches the app so you can see a change in action.",
+    "init": "Writes a CLAUDE.md describing this codebase.",
+    "review": "Reviews a GitHub pull request.",
+    "claude-api": "Reference for the Claude API and Anthropic SDK.",
+    "update-config": "Changes Claude Code settings, hooks, and permissions.",
+    "keybindings-help": "Helps you customize keyboard shortcuts.",
+    "fewer-permission-prompts": "Cuts down repetitive permission pop-ups.",
+    "loop": "Runs a prompt or command on a repeating schedule.",
+    "schedule": "Schedules recurring or one-time automated agent runs.",
+    # Plugin skills
+    "access": "Checks who's allowed to reach you on a chat channel (Discord/iMessage/Telegram).",
+    "configure": "Sets up a messaging-channel connection (Discord/iMessage/Telegram).",
+    "cardputer-buddy": "Builds and iterates MicroPython apps for the M5 Cardputer.",
+    "m5-onboard": "Sets up and provisions an M5 Cardputer device.",
+    "writing-hookify-rules": "Writes automation rules for the Hookify plugin.",
+    "example-command": "Demo plugin command (example only).",
+    "example-skill": "Demo plugin skill (example only).",
+    "claude-automation-recommender": "Suggests automations worth setting up for your workflow.",
+    "claude-md-improver": "Improves and tidies your CLAUDE.md file.",
+    "frontend-design": "Designs polished, production-quality web UI.",
+    "session-report": "Summarizes what happened during a coding session.",
+    "math-olympiad": "Solves competition-level math problems.",
+    "skill-creator": "Helps you create a brand-new Claude skill.",
+    "build-mcp-app": "Builds an MCP app with interactive UI/widgets.",
+    "build-mcp-server": "Builds an MCP server (wraps an API for Claude to use).",
+    "build-mcpb": "Packages an MCP server into a distributable .mcpb bundle.",
+    "playground": "A scratch space to experiment and prototype.",
+    "agent-development": "Helps you create and configure Claude subagents.",
+    "command-development": "Helps you create custom slash commands.",
+    "hook-development": "Helps you create Claude Code hooks.",
+    "mcp-integration": "Adds an MCP server integration to a plugin.",
+    "plugin-settings": "Configures a plugin's settings.",
+    "plugin-structure": "Scaffolds the structure of a Claude Code plugin.",
+    "skill-development": "Helps you build and structure a Claude skill.",
+}
+
+
+def _humanize_skill_desc(raw):
+    """Turn a model-facing SKILL.md description into a short human one: strip the
+    'This skill should be used when…' boilerplate and keep the first sentence."""
+    text = clean_text(raw)
+    if not text:
+        return ""
+    low = text.lower()
+    for prefix in (
+        "this skill should be used when the user asks to",
+        "this skill should be used when the user",
+        "this skill should be used when",
+        "this skill should be used to",
+        "use this skill when the user",
+        "use this skill to",
+        "use this skill when",
+        "use when the user asks",
+        "use when the user",
+        "use when",
+        "use this when",
+    ):
+        if low.startswith(prefix):
+            text = text[len(prefix):].lstrip(" ,:-")
+            break
+    for sep in (". ", ".\n", "; "):
+        idx = text.find(sep)
+        if idx != -1:
+            text = text[: idx + 1]
+            break
+    text = text.strip().strip('"')
+    if text and text[0].islower():
+        text = text[0].upper() + text[1:]
+    return text[:120]
+
+
+def discover_skills(cwd):
+    """Return a sorted, de-duped list of skill dicts {name, description, source}.
+
+    Scans SKILL.md files under personal, project, and plugin directories in
+    addition to the built-in list.  Never raises; returns what it can find.
+    """
+    try:
+        seen = {}  # name -> dict; first-seen wins
+        # Built-ins first (win over plugins on collision)
+        for name, desc in BUILTIN_SKILLS:
+            seen[name] = {"name": name, "description": desc, "source": "built-in"}
+
+        scan_dirs = []
+        home = os.path.expanduser("~")
+        # personal skills
+        scan_dirs.append((os.path.join(home, ".claude", "skills"), "personal"))
+        # project skills
+        if cwd:
+            scan_dirs.append((os.path.join(cwd, ".claude", "skills"), "project"))
+        # plugin skills (two sub-layouts)
+        plugins_root = os.path.join(home, ".claude", "plugins", "marketplaces")
+        if os.path.isdir(plugins_root):
+            for mp in os.listdir(plugins_root):
+                mp_path = os.path.join(plugins_root, mp)
+                for sub in ("plugins", "external_plugins"):
+                    sub_path = os.path.join(mp_path, sub)
+                    if os.path.isdir(sub_path):
+                        for plugin in os.listdir(sub_path):
+                            skills_dir = os.path.join(sub_path, plugin, "skills")
+                            scan_dirs.append((skills_dir, "plugin"))
+
+        for skills_root, source in scan_dirs:
+            if not os.path.isdir(skills_root):
+                continue
+            try:
+                for skill_dir in os.listdir(skills_root):
+                    skill_md = os.path.join(skills_root, skill_dir, "SKILL.md")
+                    if not os.path.isfile(skill_md):
+                        continue
+                    try:
+                        name = None
+                        desc = None
+                        with open(skill_md, encoding="utf-8", errors="replace") as fh:
+                            lines = fh.readlines()
+                        in_front = False
+                        dash_count = 0
+                        for raw_line in lines:
+                            stripped = raw_line.strip()
+                            if stripped == "---":
+                                dash_count += 1
+                                if dash_count == 1:
+                                    in_front = True
+                                    continue
+                                if dash_count == 2:
+                                    break
+                            if not in_front:
+                                continue
+                            if stripped.startswith("name:"):
+                                name = stripped[5:].strip().strip('"').strip("'")
+                            elif stripped.startswith("description:"):
+                                desc = stripped[12:].strip().strip('"').strip("'")
+                        if not name:
+                            name = skill_dir
+                        if not desc:
+                            desc = ""
+                        desc = desc[:140]
+                        if name not in seen:
+                            seen[name] = {"name": name, "description": desc, "source": source}
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Prefer a clear human blurb; otherwise strip boilerplate from the raw text.
+        for entry in seen.values():
+            entry["description"] = SKILL_BLURBS.get(entry["name"]) or _humanize_skill_desc(
+                entry["description"]
+            )
+        return sorted(seen.values(), key=lambda s: s["name"])
+    except Exception:
+        return [{"name": n, "description": d, "source": "built-in"} for n, d in BUILTIN_SKILLS]
+
+
 def discover_external_sessions(cwd, agent_key):
     if agent_key == "codex":
         return codex_sessions_for_cwd(cwd)
@@ -2048,13 +2276,43 @@ def structured_handoff_packet(session, max_chars=HANDOFF_MAX_CHARS):
     agent = clean_text(session.get("agent") or "agent").title()
     cwd = clean_text(session.get("cwd") or os.path.expanduser("~"))
     context = session.get("context") or {}
-    requests = []
-    conclusions = []
+
+    first_user_request = ""
+    last_agent_conclusion = ""
     upgrades = []
     failures = []
     unresolved = []
-    technical = []
-    chronology = []
+    commands = []
+    file_changes = []
+    decisions = []
+
+    def last_line(text):
+        """Return the last non-empty line of text, stripped."""
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        return lines[-1] if lines else text.strip()
+
+    def truncate(text, limit=160):
+        text = re.sub(r"\s+", " ", clean_text(text)).strip()
+        return text[:limit - 1].rstrip() + "…" if len(text) > limit else text
+
+    def deduped(values, limit=12):
+        seen = set()
+        result = []
+        for v in values:
+            key = re.sub(r"\s+", " ", v).strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                result.append(v)
+                if len(result) >= limit:
+                    break
+        return result
+
+    def bullets(values, fallback="None recorded."):
+        items = deduped(values)
+        return ("\n".join(f"- {v}" for v in items)) if items else f"- {fallback}"
+
+    def section(header, values, fallback="None recorded."):
+        return f"## {header}\n{bullets(values, fallback)}"
 
     for turn_index, turn in enumerate(session.get("turns") or [], start=1):
         user_texts = []
@@ -2066,72 +2324,135 @@ def structured_handoff_packet(session, max_chars=HANDOFF_MAX_CHARS):
                 continue
             if typ == "userMessage":
                 user_texts.append(text)
-                requests.append(text)
-                chronology.append(f"{turn_index}. USER: {text}")
+                if not first_user_request:
+                    first_user_request = truncate(text, 300)
             elif typ == "agentMessage":
                 agent_texts.append(text)
-                conclusions.append(text)
-                chronology.append(f"{turn_index}. AGENT: {text}")
+                last_agent_conclusion = text
                 lowered = text.lower()
                 if re.search(
                     r"\b(added|built|implemented|upgraded|updated|fixed|created|installed|"
                     r"changed|wired|enabled|completed|now supports)\b",
                     lowered,
                 ):
-                    upgrades.append(text)
+                    upgrades.append(truncate(last_line(text)))
                 if re.search(
                     r"\b(failed|failure|error|blocked|unable|could not|couldn't|"
                     r"timeout|timed out|stalled|broken|regression)\b",
                     lowered,
                 ):
-                    failures.append(text)
+                    failures.append(truncate(last_line(text)))
                 if re.search(
                     r"\b(todo|remaining|unresolved|not yet|still needs|follow[- ]?up|"
                     r"deferred|later|next step|open question)\b",
                     lowered,
                 ):
-                    unresolved.append(text)
-            elif typ in {"commandExecution", "fileChange", "plan", "note"}:
-                label = {
-                    "commandExecution": "COMMAND",
-                    "fileChange": "FILES",
-                    "plan": "PLAN",
-                    "note": "NOTE",
-                }[typ]
-                technical.append(f"{label}: {text}")
+                    unresolved.append(truncate(last_line(text)))
+                if re.search(
+                    r"\b(decided|decision|chose|choosing|approach|strategy|will use|going with)\b",
+                    lowered,
+                ):
+                    decisions.append(truncate(last_line(text)))
+            elif typ == "commandExecution":
+                commands.append(truncate(text))
+            elif typ == "fileChange":
+                file_changes.append(truncate(text))
+            elif typ == "plan":
+                decisions.append(truncate(last_line(text)))
+            elif typ == "note":
+                if text.startswith("ERROR:"):
+                    failures.append(truncate(f"Turn {turn_index}: {text}"))
         if user_texts and not agent_texts:
-            unresolved.extend(user_texts)
+            unresolved.append(truncate(last_line(user_texts[-1])))
         if turn.get("status") not in {None, "completed"}:
-            prompt = clean_text(turn.get("prompt")) or "Turn had no saved prompt."
-            failures.append(f"Turn {turn_index} ended as {turn.get('status')}: {prompt}")
+            failures.append(truncate(
+                f"Turn {turn_index} ended as {turn.get('status')}: "
+                f"{clean_text(turn.get('prompt')) or 'no prompt'}"
+            ))
 
-    def unique(values, limit=None, item_limit=1400):
+    def detect_project_commands(cwd):
+        """Return (bullets: list[str], is_software_project: bool) for the project at cwd."""
         result = []
-        seen = set()
-        for value in values:
-            normalized = re.sub(r"\s+", " ", clean_text(value))
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            if len(value) > item_limit:
-                value = value[: item_limit - 1].rstrip() + "…"
-            result.append(value)
-            if limit and len(result) >= limit:
-                break
-        return result
+        is_software = False
+        if not cwd or not os.path.isdir(cwd):
+            result += [
+                f'cd "{cwd or os.path.expanduser("~")}"',
+                "git status",
+                "git log --oneline -10",
+                "ls",
+            ]
+            return result, False
 
-    def section(name, values, fallback="None recorded.", limit=None, item_limit=1400):
-        values = unique(values, limit=limit, item_limit=item_limit)
-        body = "\n".join(f"- {value}" for value in values) if values else f"- {fallback}"
-        return f"## {name}\n{body}"
+        pkg_json = os.path.join(cwd, "package.json")
+        if os.path.isfile(pkg_json):
+            is_software = True
+            try:
+                with open(pkg_json, encoding="utf-8") as fh:
+                    pkg = json.load(fh)
+            except Exception:
+                pkg = {}
+            scripts = pkg.get("scripts") or {}
+            deps_all = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+            script_text = json.dumps(scripts).lower()
+            has_tauri = os.path.isdir(os.path.join(cwd, "src-tauri")) or "tauri" in script_text or "tauri" in " ".join(deps_all).lower()
+            result.append("pnpm install — install deps")
+            for name, desc in [("dev", "start dev server"), ("build", "production build"),
+                                ("test", "run tests"), ("check", "type-check"),
+                                ("lint", "lint code")]:
+                if name in scripts:
+                    result.append(f"pnpm {name} — {desc}")
+            if has_tauri:
+                result.append("pnpm tauri dev — launch Tauri desktop app")
+                result.append("pnpm tauri build — build distributable")
+
+        cargo = os.path.join(cwd, "Cargo.toml")
+        if os.path.isfile(cargo):
+            is_software = True
+            result += ["cargo build — compile", "cargo test — run tests", "cargo run — run binary"]
+
+        has_py = os.path.isfile(os.path.join(cwd, "pyproject.toml")) or \
+                 os.path.isfile(os.path.join(cwd, "requirements.txt")) or \
+                 any(f.endswith(".py") for f in (os.listdir(cwd) if os.path.isdir(cwd) else []))
+        if has_py:
+            is_software = True
+            if os.path.isfile(os.path.join(cwd, "pyproject.toml")):
+                result.append("python3 -m pytest — run tests")
+            else:
+                result.append("python3 <script>.py — run entry point")
+
+        result += [f'cd "{cwd}"', "git status", "git log --oneline -10", "ls"]
+        # Cap to 6 most relevant; dedupe
+        seen, final = set(), []
+        for item in result:
+            k = item.lower().strip()
+            if k not in seen:
+                seen.add(k)
+                final.append(item)
+            if len(final) >= 6:
+                break
+        return final, is_software
+
+    # Build overview: goal from first user request, state from last agent conclusion
+    last_conclusion_line = truncate(last_line(last_agent_conclusion), 300) if last_agent_conclusion else "No agent response recorded."
+    overview_goal = first_user_request or "No user request recorded."
+    overview = f"Goal: {overview_goal}\nState: {last_conclusion_line}"
+
+    # Current status: what's being built + latest turn outcome
+    last_turn = (session.get("turns") or [{}])[-1]
+    last_turn_status = last_turn.get("status") or "completed"
+    last_action = truncate(last_line(last_agent_conclusion), 200) if last_agent_conclusion else "No agent response recorded."
+    outcome_note = "" if last_turn_status in {None, "completed"} else f" (last turn ended: {last_turn_status})"
+    current_status = f"Working on: {overview_goal}\nLatest: {last_action}{outcome_note}"
 
     used = int(context.get("used") or 0)
-    limit = int(context.get("limit") or 0)
+    limit_val = int(context.get("limit") or 0)
     context_line = (
-        f"{round(used * 100 / limit)}% ({used:,}/{limit:,} tokens)"
-        if used > 0 and limit > 0
+        f"{round(used * 100 / limit_val)}% ({used:,}/{limit_val:,} tokens)"
+        if used > 0 and limit_val > 0
         else "unknown"
     )
+
+    cmd_bullets, is_sw_project = detect_project_commands(cwd)
     parts = [
         "# Automatic Session Handoff",
         f"- Source title: {title}",
@@ -2140,46 +2461,21 @@ def structured_handoff_packet(session, max_chars=HANDOFF_MAX_CHARS):
         f"- Source context usage: {context_line}",
         f"- Generated: {now_iso()}",
         "",
-        section("User Goals And Requests", requests, limit=80, item_limit=900),
+        f"## Overview\n{overview}",
         "",
-        section(
-            "Decisions And Important Conclusions",
-            conclusions[-40:],
-            limit=40,
-            item_limit=1200,
-        ),
+        f"## Current status\n{current_status}",
         "",
-        section(
-            "Upgrades And Completed Changes",
-            upgrades[-30:],
-            limit=30,
-            item_limit=1200,
-        ),
+        section("What went right", upgrades[-12:]),
         "",
-        section(
-            "Failures, Dead Ends, And Blockers",
-            failures[-30:],
-            limit=30,
-            item_limit=1200,
-        ),
+        section("What went wrong / blockers", failures[-12:]),
         "",
-        section(
-            "Unresolved Questions And Forgotten Follow-Ups",
-            unresolved[-40:],
-            limit=40,
-            item_limit=1000,
-        ),
+        section("Updates applied", (file_changes + commands)[-12:]),
         "",
-        section(
-            "Important Technical Details",
-            technical[-60:],
-            limit=60,
-            item_limit=800,
-        ),
+        section("Key decisions", decisions[-12:]),
         "",
-        "## Chronological Conversation Record",
-        "\n".join(unique(chronology[-80:], item_limit=700))
-        or "- No conversation text was available.",
+        section("Open items & next steps", unresolved[-12:]),
+        "",
+        "## Useful commands\n" + "\n".join(f"- {b}" for b in cmd_bullets),
         "",
         "## Continuation Instructions",
         "- Treat this packet as authoritative context from the previous session.",
@@ -2187,7 +2483,7 @@ def structured_handoff_packet(session, max_chars=HANDOFF_MAX_CHARS):
         "- Address unresolved items when they are relevant, even if the prior conversation moved on.",
         "- Inspect the current filesystem before assuming recorded file state is still current.",
         "- Continue the user's latest objective directly after a brief acknowledgment.",
-    ]
+    ] + (["- Before changing anything, orient yourself in the program — read its structure, run `git status`, and run the build/check command listed above — so you know the current state before acting."] if is_sw_project else [])
     packet = "\n".join(parts)
     if len(packet) > max_chars:
         packet = packet[: max_chars - 160].rstrip() + (
@@ -2354,14 +2650,16 @@ class SessionStore:
                     save_json(path, data)
         self.compact_linked_duplicates()
 
-    def save(self, session):
+    def save(self, session, durable=True):
         if session.get("origin", "local") != "local":
             return
         session["updated_at"] = now_iso()
         if not session.get("created_at"):
             session["created_at"] = session["updated_at"]
         self.sessions[session["id"]] = session
-        save_json(os.path.join(SESSIONS_DIR, session["id"] + ".json"), session)
+        save_json(
+            os.path.join(SESSIONS_DIR, session["id"] + ".json"), session, durable=durable
+        )
 
     def delete(self, session_id):
         self.sessions.pop(session_id, None)
@@ -2509,22 +2807,6 @@ class SessionStore:
                 except OSError:
                     pass
 
-    def clone_for_continuation(self, source):
-        backend = deepcopy(source.get("backend") or {})
-        turns = deepcopy(source.get("turns") or [])
-        title = source.get("title") or source.get("preview") or f"New {source.get('agent', 'agent')} session"
-        session = self._make_session(
-            agent_key=source.get("agent", "codex"),
-            cwd=source.get("cwd") or os.path.expanduser("~"),
-            title=title,
-            backend=backend,
-            turns=turns,
-            origin="local",
-            source_session_id=source.get("source_session_id") or source.get("id"),
-        )
-        self.save(session)
-        return session
-
     def new_handoff_session(self, source, title, packet, agent_key=None, backend=None):
         session = self._make_session(
             agent_key=agent_key or source.get("agent", "codex"),
@@ -2539,16 +2821,19 @@ class SessionStore:
         self.save(session)
         return session
 
-    def list_for(self, cwd, agent_key):
+    def list_all_local(self, agent_key=None):
+        """Stored sessions newest-first, deduped. With agent_key, only that agent's
+        sessions (across all working dirs); without it, every agent's. The picker
+        passes the active agent so switching agents shows that agent's sessions."""
         items = [
             s
             for s in self.sessions.values()
-            if s.get("cwd") == cwd and s.get("agent") == agent_key
+            if agent_key is None or s.get("agent") == agent_key
         ]
         items.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
         unique = []
         seen = set()
-        kept_empty_draft = False
+        empty_draft_agents = set()
         for session in items:
             backend = session.get("backend") or {}
             client_id = clean_text(
@@ -2556,9 +2841,10 @@ class SessionStore:
             )
             empty_draft = not client_id and not (session.get("turns") or [])
             if empty_draft:
-                if kept_empty_draft:
+                agent = session.get("agent")
+                if agent in empty_draft_agents:
                     continue
-                kept_empty_draft = True
+                empty_draft_agents.add(agent)
             key = client_id or session.get("source_session_id") or session.get("id")
             if key in seen:
                 continue
@@ -2591,6 +2877,7 @@ class SessionStore:
         return turn
 
     def add_item(self, session, turn, item):
+        item.setdefault("created_at", now_iso())
         turn.setdefault("items", []).append(item)
         self.save(session)
 
@@ -2992,65 +3279,354 @@ class StreamCliBackend(BaseBackend):
 
 
 class OllamaBackend(StreamCliBackend):
-    """Ollama (local LLM) client handler with multi-turn streaming support."""
+    """Local LLM (Ollama) agent with a real tool-use loop: the model can run shell
+    commands and read/write files on this machine, not just chat."""
+
+    MAX_STEPS = 25
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "run_shell",
+                "description": (
+                    "Run a bash command on the user's local Fedora Linux machine and "
+                    "return its combined stdout and stderr. Use this to inspect and "
+                    "change the system: audio (pactl/wpctl), bluetooth (bluetoothctl), "
+                    "packages, services, processes, files — anything."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "The bash command to run."}
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read and return the contents of a file on the local machine.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Absolute or ~-relative file path."}
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Create or overwrite a file on the local machine with text content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List entries in a directory on the local machine.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Directory path (defaults to the working dir)."}
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": (
+                    "HTTP GET a URL and return the response body — use this to call web / REST "
+                    "APIs or read documentation. Returns up to ~8000 chars."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string", "description": "The URL to fetch."}},
+                    "required": ["url"],
+                },
+            },
+        },
+    ]
+
+    # The five tools above, by name — used to validate text-embedded tool calls so
+    # we don't mistake ordinary JSON in a model's prose for a tool invocation.
+    TOOL_NAMES = {"run_shell", "read_file", "write_file", "list_dir", "web_fetch"}
 
     def __init__(self, events, spec, workspace_id=None):
         super().__init__(events, spec.get("key", "ollama"), workspace_id)
         self.spec = spec
         self.base_url = "http://localhost:11434"
-        self.model = spec.get("model", "qwen3-coder:30b")
-        self.messages = []  # Multi-turn conversation history
+        raw_model = spec.get("model") or spec.get("label") or "qwen3-coder:30b"
+        # /api/chat needs the bare model id, not the aider-style "ollama_chat/" prefix.
+        self.model = re.sub(r"^ollama(_chat)?/", "", clean_text(raw_model))
+        self.messages = []  # Multi-turn conversation history (incl. tool turns)
+
+    def _ollama_chat(self, messages):
+        import urllib.request
+
+        body = json.dumps(
+            {"model": self.model, "messages": messages, "tools": self.TOOLS, "stream": False}
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}/api/chat",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data.get("message") or {}
+
+    def _run_tool(self, name, args, cwd):
+        if not isinstance(args, dict):
+            args = {}
+        try:
+            if name == "run_shell":
+                command = str(args.get("command") or "").strip()
+                if not command:
+                    return "error: no command provided"
+                self.emit("work", text="$ " + command, tag="command")
+                proc = subprocess.run(
+                    ["bash", "-lc", command],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+                out = ((proc.stdout or "") + (proc.stderr or "")).strip() or "(no output)"
+                if len(out) > 6000:
+                    out = out[:6000] + "\n…[truncated]"
+                self.emit("work", text=out, tag="system")
+                if proc.returncode != 0:
+                    return f"[exit {proc.returncode}]\n{out}"
+                return out
+            if name == "read_file":
+                path = os.path.expanduser(str(args.get("path") or ""))
+                self.emit("work", text=f"read {path}", tag="tool")
+                with open(path, "r", errors="replace") as fh:
+                    data = fh.read()
+                if len(data) > 8000:
+                    data = data[:8000] + "\n…[truncated]"
+                return data or "(empty file)"
+            if name == "write_file":
+                path = os.path.expanduser(str(args.get("path") or ""))
+                content = str(args.get("content") or "")
+                self.emit("work", text=f"write {path} ({len(content)} bytes)", tag="fileChange")
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(path, "w") as fh:
+                    fh.write(content)
+                return f"wrote {len(content)} bytes to {path}"
+            if name == "list_dir":
+                path = os.path.expanduser(str(args.get("path") or cwd))
+                self.emit("work", text=f"ls {path}", tag="tool")
+                if not os.path.isdir(path):
+                    return f"error: not a directory: {path}"
+                listing = "\n".join(sorted(os.listdir(path))) or "(empty directory)"
+                if len(listing) > 6000:
+                    listing = listing[:6000] + "\n…[truncated]"
+                return listing
+            if name == "web_fetch":
+                import urllib.request
+
+                url = str(args.get("url") or "").strip()
+                if not url:
+                    return "error: no url provided"
+                self.emit("work", text=f"GET {url}", tag="tool")
+                request = urllib.request.Request(
+                    url, headers={"User-Agent": "AgentWorkbench-qwen"}
+                )
+                with urllib.request.urlopen(request, timeout=30) as resp:
+                    body = resp.read(200000).decode("utf-8", errors="replace")
+                if len(body) > 8000:
+                    body = body[:8000] + "\n…[truncated]"
+                self.emit("work", text=f"({len(body)} chars received)", tag="system")
+                return body
+            return f"error: unknown tool '{name}'"
+        except subprocess.TimeoutExpired:
+            msg = "error: command timed out after 180s"
+            self.emit("work", text=msg, tag="system")
+            return msg
+        except Exception as exc:
+            msg = f"error: {exc}"
+            self.emit("work", text=msg, tag="system")
+            return msg
+
+    @classmethod
+    def _parse_text_tool_calls(cls, content):
+        """Recover tool calls that a model emitted as TEXT instead of in Ollama's
+        structured `tool_calls` field. Handles the three formats seen in the wild:
+
+          1. qwen3-coder XML:  <function=run_shell><parameter=command>date</parameter></function>
+          2. Hermes/Qwen JSON: <tool_call>{"name":"run_shell","arguments":{...}}</tool_call>
+          3. bare / fenced JSON: {"name":"run_shell","arguments":{...}}  (optionally in ```json)
+
+        Returns (calls, cleaned_content): calls normalized to the structured shape
+        [{"function": {"name", "arguments"}}], and the prose with the call blocks
+        stripped out so the user never sees a raw tool-call blob. Only calls whose
+        name is a real tool (TOOL_NAMES) are accepted, so plain JSON in an answer is
+        not mistaken for a tool invocation."""
+        if not content or not content.strip():
+            return [], content
+        calls = []
+        cleaned = content
+
+        # 1) qwen3-coder XML: <function=NAME>…<parameter=KEY>VALUE</parameter>…</function>
+        for fm in re.finditer(r"<function=([A-Za-z0-9_]+)\s*>(.*?)</function>", content, re.DOTALL):
+            name = fm.group(1)
+            if name not in cls.TOOL_NAMES:
+                continue
+            args = {}
+            for pm in re.finditer(
+                r"<parameter=([A-Za-z0-9_]+)\s*>(.*?)</parameter>", fm.group(2), re.DOTALL
+            ):
+                args[pm.group(1)] = pm.group(2).strip("\n")
+            calls.append({"function": {"name": name, "arguments": args}})
+        if calls:
+            cleaned = re.sub(r"<function=.*?</function>", "", cleaned, flags=re.DOTALL)
+            cleaned = re.sub(r"</?tool_call>", "", cleaned)
+            return calls, cleaned.strip()
+
+        # 2) and 3) JSON forms — inside <tool_call>…</tool_call>, ```json fences, or bare.
+        candidates = []
+        candidates += re.findall(r"<tool_call>\s*(\{.*?\}|\[.*?\])\s*</tool_call>", content, re.DOTALL)
+        candidates += re.findall(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", content, re.DOTALL)
+        if not candidates:
+            stripped = content.strip()
+            if stripped[:1] in "{[":
+                candidates.append(stripped)
+        for blob in candidates:
+            try:
+                data = json.loads(blob)
+            except (ValueError, TypeError):
+                continue
+            for obj in (data if isinstance(data, list) else [data]):
+                if not isinstance(obj, dict):
+                    continue
+                fn = obj.get("function") if isinstance(obj.get("function"), dict) else obj
+                name = clean_text(fn.get("name") or fn.get("tool"))
+                if name not in cls.TOOL_NAMES:
+                    continue
+                args = fn.get("arguments")
+                if args is None:
+                    args = fn.get("parameters")
+                calls.append({"function": {"name": name, "arguments": args if args is not None else {}}})
+        if calls:
+            cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", cleaned, flags=re.DOTALL)
+            cleaned = re.sub(r"```(?:json)?\s*(?:\{.*?\}|\[.*?\])\s*```", "", cleaned, flags=re.DOTALL)
+            if cleaned.strip()[:1] in "{[":
+                cleaned = ""  # whole message was the bare JSON call
+        return calls, cleaned.strip()
 
     def start_turn(self, session, turn, prompt, context_text=""):
-        def run():
-            import urllib.request
-            import urllib.error
+        import urllib.error
 
+        def run():
+            cwd = session.get("cwd") or os.path.expanduser("~")
+            if not os.path.isdir(cwd):
+                cwd = os.path.expanduser("~")
+            speaker = self.spec.get("label", "LOCAL").upper()
+            if not self.messages:
+                self.messages.append({
+                    "role": "system",
+                    "content": (
+                        "You are an autonomous, fully-capable system-administration and coding "
+                        "agent running directly on the user's Fedora Linux laptop, inside the "
+                        "Agent Workbench app. You are NOT sandboxed. You have REAL tools: "
+                        "run_shell (ANY bash command — install packages with `sudo dnf`, manage "
+                        "services with systemctl, control audio with pactl/wpctl, bluetooth with "
+                        "bluetoothctl, use git, call APIs with curl, etc.), read_file, write_file, "
+                        "list_dir, and web_fetch (HTTP GET any URL / REST API). Use them to "
+                        "actually inspect and change this machine and reach the network — never "
+                        "tell the user to run commands themselves and never claim you lack access "
+                        "or files. Work one step at a time: call a tool, read its result, then "
+                        "decide the next step. Verify your work with follow-up commands. When the "
+                        "task is fully complete, reply with a short plain-text summary and NO tool "
+                        f"call. The current working directory is {cwd}."
+                    ),
+                })
             payload = prompt
             if context_text:
                 payload = context_text.strip() + "\n\n" + prompt.strip()
-
             self.messages.append({"role": "user", "content": payload})
 
-            body = json.dumps(
-                {"model": self.model, "messages": self.messages, "stream": True}
-            ).encode("utf-8")
-
+            final_text = ""
+            status = "completed"
             try:
-                req = urllib.request.Request(
-                    f"{self.base_url}/api/chat",
-                    data=body,
-                    headers={"Content-Type": "application/json"},
-                )
-                with urllib.request.urlopen(req, timeout=300) as resp:
-                    full_response = ""
-                    for line in resp:
-                        chunk = json.loads(line.decode("utf-8"))
-                        if "message" in chunk and "content" in chunk["message"]:
-                            content = chunk["message"]["content"]
-                            full_response += content
-                            self.emit("work", text=content, tag="stream")
-
-                    if full_response:
+                for _step in range(self.MAX_STEPS):
+                    if self.stop_flag.is_set():
+                        status = "error"
+                        break
+                    msg = self._ollama_chat(self.messages)
+                    content = clean_text(msg.get("content"))
+                    tool_calls = msg.get("tool_calls") or []
+                    visible = content
+                    if not tool_calls and content:
+                        # Models like qwen3-coder / qwen2.5-coder emit tool calls as
+                        # TEXT (XML or JSON) rather than in the structured field.
+                        # Recover them so the tool actually runs — and strip the call
+                        # markup so the user sees prose, not a raw blob.
+                        recovered, visible = self._parse_text_tool_calls(content)
+                        if recovered:
+                            tool_calls = recovered
+                    assistant_turn = {"role": "assistant", "content": msg.get("content") or ""}
+                    if tool_calls:
+                        assistant_turn["tool_calls"] = tool_calls
+                    self.messages.append(assistant_turn)
+                    if visible:
+                        final_text = visible
+                        self.emit("assistant_message", text=visible, speaker=speaker)
+                    if not tool_calls:
+                        break
+                    for call in tool_calls:
+                        if self.stop_flag.is_set():
+                            status = "error"
+                            break
+                        fn = call.get("function") or {}
+                        name = clean_text(fn.get("name"))
+                        args = fn.get("arguments")
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except ValueError:
+                                args = {}
+                        result = self._run_tool(name, args or {}, cwd)
                         self.messages.append(
-                            {"role": "assistant", "content": full_response}
+                            {"role": "tool", "tool_name": name, "content": result}
                         )
-                        self.emit("assistant_message", text=full_response,
-                                 speaker=self.spec.get("label", "OLLAMA").upper())
-                        self.emit("turn_done", status="completed")
                     else:
-                        self.emit("error", text="No response from Ollama")
-                        self.emit("turn_done", status="error")
+                        continue
+                    break
+                else:
+                    self.emit(
+                        "work",
+                        text=f"[stopped after {self.MAX_STEPS} tool steps]",
+                        tag="system",
+                    )
+            except urllib.error.URLError as exc:
+                self.emit("error", text=f"Ollama not reachable at {self.base_url}: {exc}")
+                status = "error"
+            except Exception as exc:
+                self.emit("error", text=f"Local agent error: {exc}")
+                status = "error"
 
-            except urllib.error.URLError as e:
-                self.emit(
-                    "error",
-                    text=f"Ollama not reachable at {self.base_url}: {str(e)}",
-                )
-                self.emit("turn_done", status="error")
-            except Exception as e:
-                self.emit("error", text=f"Ollama error: {str(e)}")
-                self.emit("turn_done", status="error")
+            if status == "completed" and not final_text:
+                self.emit("assistant_message", text="(done — no summary returned)", speaker=speaker)
+            self.emit("turn_done", status=status)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -3340,6 +3916,13 @@ class ClaudeBackend(StreamCliBackend):
                     "--agents",
                     CLAUDE_SMART_AGENTS_JSON,
                 ]
+                # Offer the free local-LLM delegation tool (mcp__local-delegate__
+                # delegate_local). Added on top of any existing MCP config (no
+                # --strict), and skipped if the server isn't deployed. A failing
+                # MCP server is non-fatal to the turn — Claude just won't see the tool.
+                delegate_cfg = ensure_local_delegate_mcp_config()
+                if delegate_cfg:
+                    cmd += ["--mcp-config", delegate_cfg]
             if model and model != "Default":
                 cmd += ["--model", model]
             if effort:
@@ -3429,28 +4012,41 @@ class ClaudeBackend(StreamCliBackend):
                                 buffer.append(content)
                                 self.emit("assistant_delta", text=content, speaker="CLAUDE")
                             elif block_type == "tool_use":
-                                self.emit(
-                                    "work",
-                                    text=f"Tool: {clean_text(block.get('name'))}",
-                                    tag="tool",
-                                )
+                                tool_name = clean_text(block.get("name"))
                                 # Claude Code names the subagent tool "Agent"
                                 # (older versions: "Task") — match both, or the
                                 # Sub-agents counter never registers a fan-out.
-                                if block.get("name") in ("Task", "Agent"):
+                                if tool_name in ("Task", "Agent"):
                                     inp = block.get("input") or {}
+                                    sub_type = clean_text(
+                                        inp.get("subagent_type") or inp.get("description") or "sub-agent"
+                                    )
+                                    desc = clean_text(inp.get("description") or inp.get("prompt"))
+                                    # Surface the delegation in the Work Log so the
+                                    # user can SEE what each sub-agent was told to do
+                                    # — in-turn sub-agents finish fast and the live
+                                    # popover empties, so this is the durable record.
+                                    line = f"🤖 Delegated → {sub_type}"
+                                    if desc:
+                                        line += f": {shorten(desc, 240)}"
+                                    self.emit("work", text=line, tag="tool")
                                     self.emit(
                                         "subagent_start",
                                         agent_id=clean_text(block.get("id")),
-                                        name=clean_text(inp.get("subagent_type") or inp.get("description") or "sub-agent"),
-                                        detail=clean_text(inp.get("description")),
+                                        name=sub_type,
+                                        detail=desc,
                                     )
+                                else:
+                                    self.emit("work", text=f"Tool: {tool_name}", tag="tool")
                     elif etype == "user":
-                        # A tool_result carrying parent_tool_use_id is THAT subagent
-                        # finishing — clear the matching one from the live count.
-                        parent_id = event.get("parent_tool_use_id")
-                        if parent_id:
-                            self.emit("subagent_stop", agent_id=clean_text(parent_id))
+                        # A tool_result block carries the id of the tool_use it answers;
+                        # when that id matches a live Task/Agent, that subagent finished.
+                        message = event.get("message") or {}
+                        for block in message.get("content") or []:
+                            if isinstance(block, dict) and block.get("type") == "tool_result":
+                                tool_id = clean_text(block.get("tool_use_id"))
+                                if tool_id:
+                                    self.emit("subagent_stop", agent_id=tool_id)
                         self.emit("work", text=line, tag="system")
                     elif etype == "result":
                         result = event.get("result") or ""
@@ -3780,6 +4376,17 @@ class App:
         self.custom_clients = self.config.get("custom_clients") or []
         if not isinstance(self.custom_clients, list):
             self.custom_clients = []
+        # Migrate old local-model CLI clients (e.g. the aider "dumb terminal" wrapper)
+        # to the agentic Ollama backend: drop the command and set the bare model so the
+        # client routes to OllamaBackend's tool loop (run_shell/read_file/write_file/...).
+        for client in self.custom_clients:
+            command = clean_text(client.get("command"))
+            if command and "ollama_chat/" in command and not clean_text(client.get("model")):
+                match = re.search(r"ollama_chat/[\w.:\-]+", command)
+                if match:
+                    client["model"] = match.group(0)
+                    client.pop("command", None)
+        self.config["custom_clients"] = self.custom_clients
         self.runtime_help = {
             "claude": cached_cli_help("claude"),
             "gemini": cached_cli_help("gemini"),
@@ -3793,9 +4400,13 @@ class App:
             key = clean_text(client.get("key"))
             label = clean_text(client.get("label"))
             command = clean_text(client.get("command"))
-            if key and label and command:
+            model = clean_text(client.get("model"))
+            # Register both CLI clients (have a command) and local Ollama agents
+            # (have a model, no command) so connected local models survive restarts.
+            if key and label and (command or model):
+                color = "#10b981" if (model and not command) else "#67e8f9"
                 self.agent_specs.append(
-                    {"key": key, "label": label, "color": "#67e8f9", "custom": True}
+                    {"key": key, "label": label, "color": color, "custom": True}
                 )
         self.agent_map = {spec["key"]: spec for spec in self.agent_specs}
         saved_agent_settings = self.config.get("agent_settings") or {}
@@ -3886,7 +4497,6 @@ class App:
         self.external_sessions = []
         self.visible_sessions = []
         self.session_filter = tk.StringVar(master=self.win, value="")
-        self.show_discovered_sessions = tk.BooleanVar(master=self.win, value=bool(self.config.get("show_discovered_sessions", False)))
         self.session_tooltip = None
         self.session_tooltip_after = None
         self.session_tooltip_index = None
@@ -3897,6 +4507,10 @@ class App:
         self.worker_dialog = None
         self.queue_dialog = None
         self._subagents_popover = None
+        self._skill_popover = None
+        self.skill_favorites = self.config.get("skill_favorites") or []
+        if not isinstance(self.skill_favorites, list):
+            self.skill_favorites = []
         self.terminal_history = []
         self.terminal_history_index = 0
         self._draft_persist_after = None
@@ -4074,8 +4688,8 @@ class App:
                 for item in spec.get("queued_prompts") or []
                 if isinstance(item, dict) and clean_text(item.get("prompt"))
             ]
-            workspace["local_sessions"] = self.store.list_for(cwd, agent)
-            workspace["external_sessions"] = discover_external_sessions(cwd, agent)
+            workspace["local_sessions"] = self.store.list_all_local(agent)
+            workspace["external_sessions"] = []  # local-only picker; skip CLI scan
             workspace["sessions"] = self._merge_session_lists(
                 workspace["local_sessions"], workspace["external_sessions"]
             )
@@ -4189,7 +4803,12 @@ class App:
                 "worker_jobs": self.worker_jobs,
             }
         )
-        save_json(CONFIG_FILE, self.config)
+        save_json(CONFIG_FILE, self.config, durable=False)
+
+    def _save_skill_favorites(self):
+        """Persist skill_favorites list to config.json (non-durable write)."""
+        self.config["skill_favorites"] = self.skill_favorites
+        save_json(CONFIG_FILE, self.config, durable=False)
 
     def _schedule_workspace_config_save(self, immediate=False):
         if self.finalizing_close:
@@ -4314,6 +4933,9 @@ class App:
         else:
             self.stop_btn.pack_forget()
             self.win.after(0, self._send_next_queued_prompt)
+        # Re-render the skills chips bar (favorites are global, not per-tab)
+        if hasattr(self, "skill_chips"):
+            self._render_skill_chips()
 
     def switch_workspace(self, workspace_id):
         if workspace_id == self.active_workspace_id or workspace_id not in self.workspaces:
@@ -4416,6 +5038,9 @@ class App:
             return
         if agent_key not in self.agent_map:
             return
+        if self._at_tab_limit():
+            self._notify_tab_limit()
+            return
         self._save_active_workspace()
         self._schedule_workspace_config_save(immediate=True)
         previous_agent = self.active_agent.get()
@@ -4436,9 +5061,7 @@ class App:
         )
         self.current_session = session
         self.local_sessions = [session]
-        self.external_sessions = discover_external_sessions(
-            self.cwd.get(), agent_key
-        )
+        self.external_sessions = []  # local-only picker; skip CLI scan
         self.sessions = self._combined_sessions()
         self.open_session(session["id"], remember=False)
         self._save_active_workspace()
@@ -4557,6 +5180,19 @@ class App:
                 pass
         self._workspace_tabs_render_after = self.win.after_idle(self._render_workspace_tabs_now)
 
+    def _on_win_configure(self, _event=None):
+        # Reflow tabs to fit when the window WIDTH changes (so they shrink only when
+        # they'd overflow). Width-gated so it never loops on our own re-renders.
+        try:
+            width = self.win.winfo_width()
+        except tk.TclError:
+            return
+        if abs(width - getattr(self, "_last_win_width", 0)) < 24:
+            return
+        self._last_win_width = width
+        self._workspace_tabs_signature = None  # force a width-aware recompute
+        self._render_workspace_tabs()
+
     def _render_workspace_tabs_now(self):
         if not hasattr(self, "workspace_tabs_frame"):
             return
@@ -4575,9 +5211,33 @@ class App:
         self._workspace_tabs_signature = signature
         for child in self.workspace_tabs_frame.winfo_children():
             child.destroy()
-        for workspace_id in self.workspace_order:
+        order = [wid for wid in self.workspace_order if wid in self.workspaces]
+        n = len(order)
+        # Shrink-to-fit: keep every tab full-width and readable until they would
+        # overflow the strip's right edge, THEN shrink them uniformly so they all stay
+        # visible. New tabs always append on the right (workspace_order order).
+        pad_in = 10
+        maxlen = 40
+        if n:
+            try:
+                avail = self.workspace_tabs_frame.winfo_width()
+            except tk.TclError:
+                avail = 0
+            if avail <= 1:
+                avail = max(600, self.win.winfo_width() - 80)
+            self._last_win_width = self.win.winfo_width()
+            plus_px = 70           # reserved for the + button / limit label
+            tab_overhead_px = 52   # padding + close button, per tab
+            avg_char_px = 7
+            label_budget = avail - plus_px - n * tab_overhead_px
+            if label_budget > 0:
+                maxlen = max(6, min(40, int((label_budget / n) / avg_char_px)))
+            else:
+                maxlen = 6
+        for pos, workspace_id in enumerate(order):
             workspace = self.workspaces[workspace_id]
             selected = workspace_id == self.active_workspace_id
+            label = shorten(self._workspace_label(workspace), maxlen)
             frame = tk.Frame(
                 self.workspace_tabs_frame,
                 bg=SIDEBAR_SEL if selected else PANEL,
@@ -4585,14 +5245,14 @@ class App:
             frame.pack(side="left", padx=(4, 0), pady=4)
             tk.Button(
                 frame,
-                text=self._workspace_label(workspace),
+                text=label,
                 command=lambda wid=workspace_id: self.switch_workspace(wid),
                 bg=SIDEBAR_SEL if selected else PANEL,
                 fg=TEXT,
                 activebackground=SIDEBAR_SEL,
                 activeforeground=TEXT,
                 relief="flat",
-                padx=10,
+                padx=pad_in,
                 pady=5,
                 cursor="hand2",
             ).pack(side="left")
@@ -4605,23 +5265,34 @@ class App:
                 activebackground="#7f1d1d",
                 activeforeground="white",
                 relief="flat",
-                padx=5,
+                padx=4,
                 pady=5,
                 cursor="hand2",
             ).pack(side="left")
-        tk.Button(
-            self.workspace_tabs_frame,
-            text="+",
-            command=self.open_new_agent_dialog,
-            bg=PANEL_ALT,
-            fg=TEXT,
-            activebackground=SIDEBAR_SEL,
-            activeforeground=TEXT,
-            relief="flat",
-            padx=12,
-            pady=6,
-            cursor="hand2",
-        ).pack(side="left", padx=(6, 0), pady=4)
+        if n >= MAX_WORKSPACE_TABS:
+            tk.Label(
+                self.workspace_tabs_frame,
+                text=f"({MAX_WORKSPACE_TABS} tab limit reached)",
+                bg=PANEL,
+                fg=MUTED,
+                font=("Sans", 8, "italic"),
+                padx=10,
+                pady=6,
+            ).pack(side="left", padx=(6, 0), pady=4)
+        else:
+            tk.Button(
+                self.workspace_tabs_frame,
+                text="+",
+                command=self.open_new_agent_dialog,
+                bg=PANEL_ALT,
+                fg=TEXT,
+                activebackground=SIDEBAR_SEL,
+                activeforeground=TEXT,
+                relief="flat",
+                padx=12,
+                pady=6,
+                cursor="hand2",
+            ).pack(side="left", padx=(6, 0), pady=4)
 
     def _build_style(self):
         style = ttk.Style(self.win)
@@ -4670,6 +5341,7 @@ class App:
         workspace_bar = tk.Frame(right, bg=BG)
         workspace_bar.pack(fill="x", pady=(0, 3))
         self.workspace_tabs_frame = tk.Frame(workspace_bar, bg=BG)
+        self.win.bind("<Configure>", self._on_win_configure, add="+")
         self.workspace_tabs_frame.pack(side="left", fill="x", expand=True)
 
         topbar = tk.Frame(right, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
@@ -4871,6 +5543,8 @@ class App:
         self.chat.tag_config("assistant_head", foreground=CODEX, font=("Sans", 10, "bold"))
         self.chat.tag_config("claude_head", foreground=CLAUDE, font=("Sans", 10, "bold"))
         self.chat.tag_config("gemini_head", foreground=GEMINI, font=("Sans", 10, "bold"))
+        self.chat.tag_config("msg_time", foreground=MUTED, font=("Sans", 8))
+        self.chat.tag_raise("msg_time")
         self.chat.tag_config(
             "user",
             foreground="#dbeafe",
@@ -4921,6 +5595,20 @@ class App:
         self.chat.tag_raise("sel")
         self.chat.configure(state="disabled")
 
+        # Left column of clickable "Log N" page buttons (filled by _rebuild_work_page_buttons).
+        self.work_pages_col = tk.Frame(self.work_tab, bg=BG, width=104)
+        self.work_pages_col.pack(side="left", fill="y", padx=(8, 0), pady=8)
+        self.work_pages_col.pack_propagate(False)
+        tk.Label(
+            self.work_pages_col,
+            text="WORK LOGS",
+            bg=BG,
+            fg=MUTED,
+            font=("Sans", 8, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 4))
+        self.work_pages_buttons = tk.Frame(self.work_pages_col, bg=BG)
+        self.work_pages_buttons.pack(fill="both", expand=True)
         self.work = ScrolledText(
             self.work_tab,
             wrap="word",
@@ -4933,7 +5621,7 @@ class App:
             pady=18,
             font=("Monospace", 10),
         )
-        self.work.pack(fill="both", expand=True, padx=8, pady=8)
+        self.work.pack(side="left", fill="both", expand=True, padx=8, pady=8)
         self.work_bottom_btn = tk.Button(
             self.work_tab,
             text="↓",
@@ -5078,7 +5766,13 @@ class App:
             font=("Monospace", 10),
         )
         self.terminal.pack(fill="both", expand=True, padx=8, pady=(8, 4))
-        self.terminal.configure(state="disabled")
+        # Interactive: keystrokes in the main area forward straight to the pty (bash
+        # echoes them back), so it behaves like a real terminal — type anywhere, not
+        # just the box below. Selection still works for copy (Ctrl+Shift+C).
+        self.terminal.bind("<Key>", self._terminal_key)
+        self.terminal.bind("<Button-2>", self._terminal_paste)
+        self.terminal.bind("<<Paste>>", self._terminal_paste)
+        self.terminal.bind("<Button-1>", lambda _e: self.terminal.focus_set(), add="+")
 
         terminal_bar = tk.Frame(self.terminal_tab, bg=BG)
         terminal_bar.pack(fill="x", padx=8, pady=(0, 8))
@@ -5169,17 +5863,9 @@ class App:
         self.composer = composer
         composer.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         self.attachment_bar = tk.Frame(composer, bg=PANEL)
-        tk.Label(
-            self.attachment_bar,
-            textvariable=self.attachment_text,
-            bg=PANEL,
-            fg="#bfdbfe",
-            anchor="w",
-            font=("Sans", 9),
-        ).pack(side="left", fill="x", expand=True, padx=12, pady=7)
         tk.Button(
             self.attachment_bar,
-            text="Clear",
+            text="Clear all",
             command=self.clear_attachments,
             bg=PANEL_ALT,
             fg=TEXT,
@@ -5190,6 +5876,9 @@ class App:
             pady=4,
             cursor="hand2",
         ).pack(side="right", padx=6, pady=4)
+        # Per-file chips (each with its own red ✕) are rebuilt in _update_attachment_bar.
+        self.attachment_chips = tk.Frame(self.attachment_bar, bg=PANEL)
+        self.attachment_chips.pack(side="left", fill="x", expand=True, padx=8, pady=4)
         self.input = ScrolledText(
             composer,
             wrap="word",
@@ -5213,6 +5902,12 @@ class App:
         self.input.bind("<Button-3>", lambda event: self.show_edit_menu(event, self.input))
         self.input.bind("<<Modified>>", self._on_input_modified)
         self.input.bind("<FocusOut>", lambda _e: self._schedule_workspace_config_save(immediate=True))
+        # Ctrl + scroll wheel zooms text, like a terminal — on the reading panes,
+        # the typed prompt, and the embedded terminal.
+        for _zoom_attr in ("chat", "work", "input", "terminal", "artifact_preview_text"):
+            _zoom_widget = getattr(self, _zoom_attr, None)
+            if _zoom_widget is not None:
+                self._enable_text_zoom(_zoom_widget)
 
         composer_state = tk.Frame(composer, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
         composer_state.pack(fill="x", padx=8, pady=(4, 0))
@@ -5287,6 +5982,27 @@ class App:
         )
         self.prompt_state_label.pack(side="right", padx=(6, 0))
 
+        # Skills bar — sits between the composer state and the send bar
+        self.skills_bar = tk.Frame(composer, bg=PANEL)
+        self.skills_bar.pack(fill="x", padx=8, pady=(4, 0))
+        tk.Button(
+            self.skills_bar,
+            text="✦ Skills",
+            command=self.open_skills_menu,
+            bg=PANEL_ALT,
+            fg=TEXT,
+            relief="flat",
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            font=("Sans", 9, "bold"),
+        ).pack(side="left")
+        chips_wrap = tk.Frame(self.skills_bar, bg=PANEL)
+        chips_wrap.pack(side="left", fill="x", expand=True)
+        self.skill_chips = tk.Frame(chips_wrap, bg=PANEL)
+        self.skill_chips.pack(anchor="center")
+        self._render_skill_chips()
+
         bar = tk.Frame(composer, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
         bar.pack(fill="x", padx=8, pady=(6, 8))
         self.hint = tk.Label(bar, textvariable=self.status, bg=PANEL, fg=MUTED, anchor="w")
@@ -5344,6 +6060,446 @@ class App:
         self._schedule_workspace_config_save()
         return None
 
+    # ------------------------------------------------------------------
+    # Skills bar
+    # ------------------------------------------------------------------
+
+    def _render_skill_chips(self):
+        """Rebuild the chip buttons inside self.skill_chips from self.skill_favorites."""
+        for child in self.skill_chips.winfo_children():
+            child.destroy()
+        self._skill_chip_widgets = {}
+        for name in self.skill_favorites:
+            # highlightthickness gives each chip a top/edge border we can recolor to
+            # "connect" it to its prompt popover when open.
+            chip = tk.Frame(
+                self.skill_chips,
+                bg=PANEL_ALT,
+                highlightthickness=1,
+                highlightbackground=BORDER,
+            )
+            chip.pack(side="left", padx=3)
+            self._skill_chip_widgets[name] = chip
+            tk.Button(
+                chip,
+                text=name,
+                command=lambda n=name: self._open_skill_prompt(n),
+                bg=PANEL_ALT,
+                fg=TEXT,
+                relief="flat",
+                padx=8,
+                pady=3,
+                cursor="hand2",
+                font=("Sans", 9, "bold"),
+            ).pack(side="left")
+            tk.Button(
+                chip,
+                text="×",
+                command=lambda n=name: self._toggle_skill_favorite(n),
+                bg=PANEL_ALT,
+                fg=MUTED,
+                relief="flat",
+                padx=4,
+                pady=3,
+                cursor="hand2",
+                font=("Sans", 9),
+            ).pack(side="left")
+
+    def open_skills_menu(self):
+        """Open a searchable Toplevel listing all skills; clicking toggles favorites."""
+        # If already open, close it
+        if hasattr(self, "_skills_menu") and self._skills_menu and self._skills_menu.winfo_exists():
+            self._skills_menu.destroy()
+            self._skills_menu = None
+            return
+
+        all_skills = discover_skills(self.cwd.get())
+
+        pop = tk.Toplevel(self.win)
+        pop.title("Skills")
+        pop.configure(bg=PANEL)
+        pop.transient(self.win)
+        self._skills_menu = pop
+
+        # Position near the skills bar
+        self.win.update_idletasks()
+        try:
+            bx = self.skills_bar.winfo_rootx()
+            by = self.skills_bar.winfo_rooty()
+        except tk.TclError:
+            bx, by = 100, 100
+
+        # Search entry
+        search_var = tk.StringVar()
+        search_frame = tk.Frame(pop, bg=PANEL_ALT)
+        search_frame.pack(fill="x", padx=0, pady=0)
+        tk.Label(
+            search_frame,
+            text="Search skills:",
+            bg=PANEL_ALT,
+            fg=MUTED,
+            font=("Sans", 9),
+            padx=8,
+            pady=6,
+        ).pack(side="left")
+        search_entry = tk.Entry(
+            search_frame,
+            textvariable=search_var,
+            bg=PANEL_ALT,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            font=("Sans", 10),
+        )
+        search_entry.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=4)
+
+        separator = tk.Frame(pop, bg=BORDER, height=1)
+        separator.pack(fill="x")
+
+        # Scrollable list area
+        list_container = tk.Frame(pop, bg=PANEL)
+        list_container.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(list_container, bg=PANEL, highlightthickness=0, height=320)
+        scrollbar = tk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        rows_frame = tk.Frame(canvas, bg=PANEL)
+        canvas_window = canvas.create_window((0, 0), window=rows_frame, anchor="nw")
+
+        def _update_scroll_region(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        rows_frame.bind("<Configure>", _update_scroll_region)
+
+        def _resize_rows(event=None):
+            canvas.itemconfigure(canvas_window, width=canvas.winfo_width())
+
+        canvas.bind("<Configure>", _resize_rows)
+
+        # Two staggered title-box colors only (regular / faded), alternating per row.
+        ROW_REG = "#26405c"
+        ROW_FADED = "#1e2c3d"
+
+        def _on_wheel(event):
+            self._hide_skill_name_overlay()
+            if getattr(event, "num", None) == 4:
+                canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                canvas.yview_scroll(1, "units")
+            else:
+                canvas.yview_scroll(-1 if getattr(event, "delta", 0) > 0 else 1, "units")
+            return "break"
+
+        for _w in (canvas, rows_frame):
+            _w.bind("<MouseWheel>", _on_wheel)
+            _w.bind("<Button-4>", _on_wheel)
+            _w.bind("<Button-5>", _on_wheel)
+
+        row_widgets = []
+
+        def _build_rows(filter_text=""):
+            self._hide_skill_name_overlay()
+            for w in rows_frame.winfo_children():
+                w.destroy()
+            row_widgets.clear()
+            query = filter_text.lower()
+            idx = 0
+            for skill in all_skills:
+                sname = skill["name"]
+                sdesc = skill["description"]
+                if query and query not in sname.lower() and query not in sdesc.lower():
+                    continue
+                is_fav = sname in self.skill_favorites
+                display_name = sname.replace("-", " ").replace("_", " ").title()
+                box_bg = ROW_REG if idx % 2 == 0 else ROW_FADED
+                idx += 1
+                row = tk.Frame(rows_frame, bg=PANEL)
+                row.pack(fill="x")
+                # Skill name: own color-coded box on the LEFT — floats free (no divider
+                # under it), with vertical padding to separate it from neighbors.
+                name_lbl = tk.Label(
+                    row,
+                    text=("✓ " if is_fav else "") + display_name,
+                    bg=box_bg,
+                    fg="#ffffff" if is_fav else "#cbd5e1",
+                    font=("Sans", 9, "bold"),
+                    anchor="w",
+                    width=22,
+                    padx=10,
+                    pady=6,
+                    justify="left",
+                )
+                name_lbl.pack(side="left", padx=(6, 8), pady=4)
+                # Right column: description + a divider UNDER THE DESCRIPTION ONLY, so the
+                # separating lines stop at the title box and never cram against it.
+                right_col = tk.Frame(row, bg=PANEL)
+                right_col.pack(side="left", fill="both", expand=True)
+                desc_lbl = tk.Label(
+                    right_col,
+                    text=sdesc,
+                    bg=PANEL,
+                    fg=MUTED,
+                    anchor="w",
+                    font=("Sans", 9),
+                    justify="left",
+                    wraplength=300,
+                )
+                desc_lbl.pack(fill="x", anchor="w", pady=(8, 6))
+                tk.Frame(right_col, bg=BORDER, height=1).pack(fill="x")
+                for w in (row, right_col, name_lbl, desc_lbl):
+                    w.configure(cursor="hand2")
+                    w.bind("<Button-1>", lambda _e, n=sname: _toggle_and_refresh(n))
+                    w.bind("<MouseWheel>", _on_wheel)
+                    w.bind("<Button-4>", _on_wheel)
+                    w.bind("<Button-5>", _on_wheel)
+                # If the title is too long for its box, hover (same 143ms delay as the
+                # session list) reveals the full name by extending the box over the desc.
+                if len(display_name) > 19:
+                    name_lbl.bind(
+                        "<Enter>",
+                        lambda _e, w=name_lbl, t=display_name, b=box_bg: self._schedule_skill_name_reveal(w, t, b),
+                    )
+                    name_lbl.bind("<Leave>", lambda _e: self._cancel_skill_name_reveal())
+                row_widgets.append(row)
+
+        def _toggle_and_refresh(name):
+            self._toggle_skill_favorite(name)
+            _build_rows(search_var.get())
+
+        def _on_search(*_args):
+            _build_rows(search_var.get())
+
+        search_var.trace_add("write", _on_search)
+        _build_rows()
+
+        sep2 = tk.Frame(pop, bg=BORDER, height=1)
+        sep2.pack(fill="x")
+        tk.Button(
+            pop,
+            text="Close",
+            command=lambda: _on_close(),
+            bg=PANEL_ALT,
+            fg=MUTED,
+            activebackground=SIDEBAR_SEL,
+            activeforeground=TEXT,
+            relief="flat",
+            padx=12,
+            pady=5,
+            cursor="hand2",
+        ).pack(anchor="e", padx=8, pady=6)
+
+        pop.update_idletasks()
+        pw = max(pop.winfo_reqwidth(), 500)
+        ph = min(pop.winfo_reqheight(), 480)
+        pop.geometry(f"{pw}x{ph}+{bx}+{max(by - ph - 4, 10)}")
+        pop.lift()
+        search_entry.focus_set()
+
+        def _on_close():
+            self._hide_skill_name_overlay()
+            if pop.winfo_exists():
+                pop.destroy()
+            self._skills_menu = None
+
+        pop.protocol("WM_DELETE_WINDOW", _on_close)
+
+    def _toggle_skill_favorite(self, name):
+        """Add or remove a skill from favorites, persist, and re-render chips."""
+        if name in self.skill_favorites:
+            self.skill_favorites.remove(name)
+        else:
+            self.skill_favorites.append(name)
+        self._save_skill_favorites()
+        self._render_skill_chips()
+
+    def _open_skill_prompt(self, name):
+        """Open a prompt popover hard-anchored above THIS skill's chip, visually joined
+        to it so it's clear which skill the box belongs to."""
+        accent = "#1a56db"
+        chip = getattr(self, "_skill_chip_widgets", {}).get(name)
+
+        # Toggle: if a popover is open, close it and un-highlight its chip.
+        if getattr(self, "_skill_popover", None) and self._skill_popover.winfo_exists():
+            self._skill_popover.destroy()
+            self._skill_popover = None
+            self._unhighlight_skill_chip()
+            return
+
+        pop = tk.Toplevel(self.win)
+        pop.overrideredirect(True)
+        pop.configure(bg=accent, highlightbackground=accent, highlightthickness=2)
+        self._skill_popover = pop
+
+        # Colored header bearing the skill name — ties the box to its chip.
+        tk.Label(
+            pop,
+            text=f"✦ {name}",
+            bg=accent,
+            fg="white",
+            font=("Sans", 10, "bold"),
+            padx=10,
+            pady=5,
+            anchor="w",
+        ).pack(fill="x")
+        body = tk.Frame(pop, bg=PANEL)
+        body.pack(fill="both", expand=True)
+        tk.Label(
+            body,
+            text="Tell it what to do — or leave blank to let the skill ask you / use its defaults.",
+            bg=PANEL,
+            fg=MUTED,
+            font=("Sans", 8),
+            anchor="w",
+            padx=10,
+        ).pack(fill="x", pady=(6, 0))
+
+        text_widget = tk.Text(
+            body,
+            height=3,
+            bg=PANEL_ALT,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            padx=10,
+            pady=8,
+            font=("Sans", 10),
+            wrap="word",
+        )
+        text_widget.pack(fill="x", padx=8, pady=(4, 0))
+
+        btn_row = tk.Frame(body, bg=PANEL)
+        btn_row.pack(fill="x", padx=8, pady=6)
+
+        def _close():
+            if pop.winfo_exists():
+                pop.destroy()
+            self._skill_popover = None
+            self._unhighlight_skill_chip()
+
+        def _run():
+            typed = clean_text(text_widget.get("1.0", "end"))
+            _close()
+            self._run_skill(name, typed)
+
+        tk.Button(
+            btn_row, text="Run", command=_run, bg=accent, fg="white",
+            activebackground="#1e40af", activeforeground="white", relief="flat",
+            padx=14, pady=4, cursor="hand2", font=("Sans", 9, "bold"),
+        ).pack(side="right")
+        tk.Button(
+            btn_row, text="Cancel", command=_close, bg=PANEL_ALT, fg=MUTED,
+            relief="flat", padx=10, pady=4, cursor="hand2", font=("Sans", 9),
+        ).pack(side="right", padx=(0, 6))
+
+        text_widget.bind("<Return>", lambda e: (_run(), "break")[1])
+        pop.bind("<Escape>", lambda e: _close())
+
+        # Anchor flush above the chip (overlap 2px so the accent borders merge into one
+        # connected unit). Highlight the chip with the same accent. Clamp on-screen.
+        self.win.update_idletasks()
+        pop.update_idletasks()
+        pw = max(pop.winfo_reqwidth(), 360)
+        ph = pop.winfo_reqheight()
+        anchor_widget = chip if (chip and chip.winfo_exists()) else self.skills_bar
+        try:
+            ax = anchor_widget.winfo_rootx()
+            ay = anchor_widget.winfo_rooty()
+        except tk.TclError:
+            ax, ay = 100, 200
+        screen_w = self.win.winfo_screenwidth()
+        x = max(6, min(ax, screen_w - pw - 6))
+        y = max(10, ay - ph + 2)
+        pop.geometry(f"{pw}x{ph}+{x}+{y}")
+        if chip and chip.winfo_exists():
+            self._active_skill_chip = chip
+            chip.configure(highlightbackground=accent, highlightthickness=2)
+        pop.lift()
+        text_widget.focus_set()
+
+    def _unhighlight_skill_chip(self):
+        chip = getattr(self, "_active_skill_chip", None)
+        if chip:
+            try:
+                if chip.winfo_exists():
+                    chip.configure(highlightbackground=BORDER, highlightthickness=1)
+            except tk.TclError:
+                pass
+        self._active_skill_chip = None
+
+    def _schedule_skill_name_reveal(self, widget, full_text, box_bg):
+        self._cancel_skill_name_reveal()
+        self._skill_name_after = self.win.after(
+            143, lambda: self._show_skill_name_overlay(widget, full_text, box_bg)
+        )
+
+    def _cancel_skill_name_reveal(self):
+        after = getattr(self, "_skill_name_after", None)
+        if after:
+            try:
+                self.win.after_cancel(after)
+            except tk.TclError:
+                pass
+        self._skill_name_after = None
+
+    def _hide_skill_name_overlay(self):
+        overlay = getattr(self, "_skill_name_overlay", None)
+        if overlay is not None:
+            try:
+                if overlay.winfo_exists():
+                    overlay.destroy()
+            except tk.TclError:
+                pass
+        self._skill_name_overlay = None
+
+    def _show_skill_name_overlay(self, widget, full_text, box_bg):
+        """Reveal a too-long skill title by overlaying a box that extends right (over the
+        description) from the chip's exact position. Same 143ms delay as session hover."""
+        self._skill_name_after = None
+        if not widget.winfo_exists():
+            return
+        self._hide_skill_name_overlay()
+        overlay = tk.Toplevel(self.win)
+        overlay.overrideredirect(True)
+        overlay.configure(bg=box_bg)
+        self._skill_name_overlay = overlay
+        tk.Label(
+            overlay,
+            text=full_text,
+            bg=box_bg,
+            fg="#ffffff",
+            font=("Sans", 9, "bold"),
+            anchor="w",
+            padx=10,
+            pady=6,
+            justify="left",
+        ).pack()
+        overlay.update_idletasks()
+        try:
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty()
+        except tk.TclError:
+            self._hide_skill_name_overlay()
+            return
+        overlay.geometry(f"+{x}+{y}")
+        overlay.lift()
+        overlay.bind("<Leave>", lambda _e: self._hide_skill_name_overlay())
+        overlay.bind("<Button-1>", lambda _e: self._hide_skill_name_overlay())
+
+    def _run_skill(self, name, text):
+        """Invoke a skill via the active agent's send path. An EMPTY box runs the skill
+        bare (just /name) so it uses its own prerequisites/defaults and asks you itself —
+        your text never overrides the skill's own questionnaire."""
+        if self.active_agent.get() != "claude":
+            self.append_work("Skills run best on the Claude agent.", "system")
+        body = text.strip()
+        self.append_work(f"✦ Skill: {name}", "system")
+        self.set_activity("working")
+        self.send(prompt=f"/{name} {body}".strip())
+        self._log_event("skill_run", skill=name, chars=len(body))
+
     def set_activity(self, state, text=None):
         self.activity_state = state
         colors = {
@@ -5375,16 +6531,6 @@ class App:
             self.activity_word.set("Working")
         else:
             self.activity_word.set("Starting")
-
-    def _format_context_load(self, context=None):
-        context = context or {}
-        used = int(context.get("used") or 0)
-        limit = int(context.get("limit") or 0)
-        if used <= 0 or limit <= 0:
-            return ""
-        used_label = f"{used / 1_000_000:.1f}M" if used >= 1_000_000 else f"{round(used / 1000)}K"
-        limit_label = f"{limit / 1_000_000:.0f}M" if limit >= 1_000_000 else f"{round(limit / 1000)}K"
-        return f"{used_label}/{limit_label}"
 
     def _model_options_for(self, agent_key):
         if agent_key == "codex":
@@ -5717,19 +6863,88 @@ class App:
         header.pack(fill="x")
         tk.Label(
             header,
-            text="Manual worker sessions",
+            text="Active agents",
             bg=BG,
             fg=TEXT,
             font=("Sans", 14, "bold"),
         ).pack(side="left")
         status_label = tk.Label(
             header,
-            text="Smart Claude subagents run inside the current conversation.",
+            text="",
             bg=BG,
             fg=MUTED,
             anchor="w",
         )
         status_label.pack(side="left", padx=(10, 0))
+        # Live list of every open agent tab in this window — agent, model, running
+        # state, session. Double-click a row to jump to that tab.
+        agents_list = tk.Listbox(
+            body,
+            bg=PANEL,
+            fg=TEXT,
+            selectbackground=SIDEBAR_SEL,
+            selectforeground=TEXT,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            font=("Sans", 10),
+            activestyle="none",
+            height=6,
+        )
+        agents_list.pack(fill="x", pady=(8, 2))
+        agent_rows = []  # workspace ids, parallel to agents_list rows
+
+        def _focus_agent_tab(_event=None):
+            sel = agents_list.curselection()
+            if sel and sel[0] < len(agent_rows):
+                wid = agent_rows[sel[0]]
+                if wid in self.workspaces:
+                    self.switch_workspace(wid)
+
+        agents_list.bind("<Double-Button-1>", _focus_agent_tab)
+
+        def render_agents():
+            agents_list.delete(0, "end")
+            agent_rows.clear()
+            order = self.workspace_order or list(self.workspaces.keys())
+            running = 0
+            for wid in order:
+                ws = self.workspaces.get(wid)
+                if not ws:
+                    continue
+                spec = self._agent_spec(ws.get("agent") or "claude")
+                agent_lbl = spec.get("label") or ws.get("agent") or "agent"
+                model = clean_text(ws.get("live_model")) or clean_text(
+                    (ws.get("current_session") or {}).get("backend", {}).get("model")
+                )
+                busy = bool(ws.get("busy"))
+                if busy:
+                    running += 1
+                status = clean_text(ws.get("activity_text")) or ("Working" if busy else "Idle")
+                sess = clean_text((ws.get("current_session") or {}).get("title")) or "(new session)"
+                subs = ws.get("live_subagents") or []
+                sub_txt = f"  +{len(subs)} sub-agent{'s' if len(subs) != 1 else ''}" if subs else ""
+                here = "   ◀ current tab" if wid == self.active_workspace_id else ""
+                model_txt = f" · {model}" if model and model != "Default" else ""
+                agents_list.insert(
+                    "end",
+                    f"{'●' if busy else '○'} {agent_lbl}{model_txt} · {status} · {shorten(sess, 28)}{sub_txt}{here}",
+                )
+                agent_rows.append(wid)
+            n = len(agent_rows)
+            status_label.configure(
+                text=f"{n} agent tab{'s' if n != 1 else ''} open · {running} working · double-click to jump"
+            )
+
+        tk.Label(
+            body,
+            text="Manual worker sessions",
+            bg=BG,
+            fg=MUTED,
+            font=("Sans", 9, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(6, 0))
 
         show_history_var = tk.BooleanVar(master=dialog, value=False)
         filter_row = tk.Frame(body, bg=BG)
@@ -5791,6 +7006,7 @@ class App:
 
         def render():
             nonlocal displayed_jobs
+            render_agents()
             active_jobs = self._active_worker_jobs()
             history_jobs = [
                 job
@@ -5800,17 +7016,6 @@ class App:
             jobs = active_jobs + history_jobs if show_history_var.get() else active_jobs
             displayed_jobs = jobs
             worker_list.delete(0, "end")
-            active = len(active_jobs)
-            if active:
-                status = f"{active} active manual worker{'s' if active != 1 else ''}."
-            elif history_jobs:
-                status = (
-                    f"No active manual workers; {len(history_jobs)} historical "
-                    f"record{'s' if len(history_jobs) != 1 else ''} hidden."
-                )
-            else:
-                status = "No active manual workers."
-            status_label.configure(text=status)
             for index, job in enumerate(jobs, start=1):
                 title = clean_text(job.get("title")) or "Worker"
                 state = clean_text(job.get("status")) or "queued"
@@ -6014,6 +7219,19 @@ class App:
         dialog._refresh_worker_render = render
         render()
 
+        # Keep the "Active agents" list live (busy/idle, sub-agent counts) without
+        # disturbing the worker-list selection — refresh only the agents section.
+        def _tick():
+            if not (self.worker_dialog is dialog and dialog.winfo_exists()):
+                return
+            try:
+                render_agents()
+            except tk.TclError:
+                return
+            dialog.after(1200, _tick)
+
+        dialog.after(1200, _tick)
+
     def open_queue_dialog(self):
         workspace = self._active_queue_workspace()
         if not workspace:
@@ -6137,20 +7355,44 @@ class App:
             item = queued[index]
             prompt = clean_text(item.get("prompt"))
             attachments = [clean_text(path) for path in item.get("attachments") or [] if clean_text(path)]
-            detail_title.configure(text=f"Queued item {index + 1}")
-            detail_meta.configure(
-                text=(
-                    f"{len(prompt)} characters · {len(attachments)} attachment"
-                    f"{'s' if len(attachments) != 1 else ''}"
-                )
+            detail_title.configure(text=f"Queued item {index + 1} — editable")
+            meta = (
+                f"{len(prompt)} characters · {len(attachments)} attachment"
+                f"{'s' if len(attachments) != 1 else ''} · edit below, then Save edit"
             )
-            body_text = prompt or "(empty prompt)"
             if attachments:
-                body_text += "\n\nAttachments:\n- " + "\n- ".join(attachments)
+                meta += "\nAttachments: " + ", ".join(os.path.basename(p) for p in attachments)
+            detail_meta.configure(text=meta)
+            # It hasn't been sent yet, so let the user fix it in place rather than
+            # delete + re-queue. Stays editable (state normal).
             detail_text.configure(state="normal")
             detail_text.delete("1.0", "end")
-            detail_text.insert("1.0", body_text)
-            detail_text.configure(state="disabled")
+            detail_text.insert("1.0", prompt)
+
+        def save_edit():
+            selection = queue_list.curselection()
+            queued = list(workspace.get("queued_prompts") or [])
+            if not selection or not queued:
+                return
+            index = int(selection[0])
+            if index >= len(queued):
+                return
+            new_prompt = clean_text(detail_text.get("1.0", "end"))
+            if not new_prompt:
+                self.status.set("Queued prompt can't be empty — use Delete instead.")
+                return
+            queued[index]["prompt"] = new_prompt
+            workspace["queued_prompts"] = queued
+            self.queued_prompts = list(queued)
+            self._save_active_workspace()
+            self._schedule_workspace_config_save(immediate=True)
+            self._update_queue_indicator()
+            render_queue()
+            if 0 <= index < queue_list.size():
+                queue_list.selection_clear(0, "end")
+                queue_list.selection_set(index)
+                show_selected()
+            self.status.set(f"Queued item {index + 1} updated.")
 
         def delete_selected():
             selection = queue_list.curselection()
@@ -6183,6 +7425,19 @@ class App:
 
         button_row = tk.Frame(body, bg=BG)
         button_row.pack(fill="x", pady=(12, 0))
+        tk.Button(
+            button_row,
+            text="Save edit",
+            command=save_edit,
+            bg=ACCENT,
+            fg="white",
+            activebackground=SIDEBAR_SEL,
+            activeforeground="white",
+            relief="flat",
+            padx=12,
+            pady=6,
+            cursor="hand2",
+        ).pack(side="left")
         tk.Button(
             button_row,
             text="Delete selected",
@@ -6236,11 +7491,6 @@ class App:
         dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
         dialog._refresh_queue_render = render_queue
         render_queue()
-
-    def _current_session_context(self, workspace=None):
-        workspace = workspace or self.workspaces.get(self.active_workspace_id) or {}
-        session = workspace.get("current_session") or self.current_session or {}
-        return session.get("context") or {}
 
     def _active_model_alias(self, workspace):
         agent = clean_text(workspace.get("agent")) or clean_text(self.active_agent.get())
@@ -6536,6 +7786,15 @@ class App:
                         font=("Sans", 9),
                         anchor="w",
                     ).pack(side="left", fill="x", expand=True)
+            # Re-fit the popover to its content (usage arrives async, so the body can
+            # grow after the window was first sized — otherwise the buttons get clipped).
+            try:
+                pop.update_idletasks()
+                pop.geometry(
+                    f"{max(pop.winfo_reqwidth(), 300)}x{pop.winfo_reqheight()}"
+                )
+            except tk.TclError:
+                pass
 
         # Store the populator so _display_usage can call it
         self._limits_popover_populate = _populate_limits_body
@@ -6614,11 +7873,52 @@ class App:
         selected = self.notebook.select()
         if selected == str(self.terminal_tab):
             self.composer.grid_remove()
-            self.terminal_input.focus_set()
+            self.terminal.focus_set()
         else:
             self.composer.grid()
         if hasattr(self, "spawned_tab") and selected == str(self.spawned_tab):
             self._refresh_spawned_tab()
+
+    def _scale_font_spec(self, spec, delta):
+        """Return `spec` with its size nudged by `delta`, preserving family and
+        bold/italic. Powers Ctrl+wheel text zoom."""
+        import tkinter.font as tkfont
+        try:
+            actual = tkfont.Font(font=spec).actual()
+        except tk.TclError:
+            return spec
+        size = int(actual.get("size") or 11)
+        # Tk sizes: positive = points, negative = pixels. Keep the sign, clamp magnitude.
+        sign = -1 if size < 0 else 1
+        new_mag = max(6, min(72, abs(size) + delta))
+        styles = []
+        if actual.get("weight") == "bold":
+            styles.append("bold")
+        if actual.get("slant") == "italic":
+            styles.append("italic")
+        return (actual.get("family") or "Sans", sign * new_mag, *styles)
+
+    def _zoom_text_widget(self, widget, delta):
+        """Nudge a Text widget's base font and every font-bearing tag by `delta`,
+        so the whole view scales uniformly (relative sizes preserved)."""
+        try:
+            widget.configure(font=self._scale_font_spec(widget.cget("font"), delta))
+            for tag in widget.tag_names():
+                spec = clean_text(widget.tag_cget(tag, "font"))
+                if spec:
+                    widget.tag_configure(tag, font=self._scale_font_spec(spec, delta))
+        except tk.TclError:
+            pass
+
+    def _on_ctrl_wheel_zoom(self, event, widget):
+        # Linux/X11 wheel = Button-4 (up) / Button-5 (down); Win/Mac use event.delta.
+        up = getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0
+        self._zoom_text_widget(widget, 1 if up else -1)
+        return "break"  # zoom instead of scrolling while Ctrl is held
+
+    def _enable_text_zoom(self, widget):
+        for seq in ("<Control-MouseWheel>", "<Control-Button-4>", "<Control-Button-5>"):
+            widget.bind(seq, lambda e, w=widget: self._on_ctrl_wheel_zoom(e, w))
 
     def scroll_chat_to_latest(self):
         self._flush_deferred_chat_updates()
@@ -6629,6 +7929,9 @@ class App:
         self._save_active_workspace()
 
     def scroll_work_to_latest(self):
+        # Jump to the live (last) page, then to its end.
+        if hasattr(self, "work_pages") and self.work_pages:
+            self._show_work_page(len(self.work_pages) - 1)
         try:
             self.work.see("end")
             self.work.yview_moveto(1.0)
@@ -6676,27 +7979,6 @@ class App:
                 return
         self.chat_updates_pending = True
         self._update_chat_update_indicator()
-
-    def _should_defer_chat_update(self):
-        return (
-            not self.rendering_chat
-            and not self.flushing_deferred_chat
-            and (self.chat_updates_pending or not self._chat_is_at_bottom())
-        )
-
-    def _defer_chat_update(self, kind, **payload):
-        if (
-            kind == "stream"
-            and self.deferred_chat_updates
-            and self.deferred_chat_updates[-1].get("kind") == "stream"
-            and self.deferred_chat_updates[-1].get("speaker") == payload.get("speaker")
-        ):
-            self.deferred_chat_updates[-1]["text"] += payload.get("text", "")
-        else:
-            self.deferred_chat_updates.append({"kind": kind, **payload})
-        self.chat_updates_pending = True
-        self._update_chat_update_indicator()
-        self._save_active_workspace()
 
     def _flush_deferred_chat_updates(self):
         if not self.deferred_chat_updates:
@@ -6795,12 +8077,6 @@ class App:
             return "break"
         self.copy_text(text)
         return "break"
-
-    def copy_latest_response(self):
-        if not self.latest_agent_text:
-            self.status.set("No agent response is available to copy.")
-            return
-        self.copy_text(self.latest_agent_text)
 
     def _artifact_session_key(self, session):
         raw = clean_text(
@@ -6972,18 +8248,50 @@ class App:
         self.pending_attachments = []
         self._update_attachment_bar()
 
+    def remove_attachment(self, path):
+        """Remove a single attached/pasted file (the per-chip red ✕)."""
+        self.pending_attachments = [p for p in self.pending_attachments if p != path]
+        self._update_attachment_bar()
+
     def _update_attachment_bar(self):
-        count = len(self.pending_attachments)
-        if not count:
-            self.attachment_text.set("")
+        if not hasattr(self, "attachment_chips"):
+            return
+        for child in self.attachment_chips.winfo_children():
+            child.destroy()
+        if not self.pending_attachments:
             self.attachment_bar.pack_forget()
             return
-        names = ", ".join(os.path.basename(path) for path in self.pending_attachments[:3])
-        if count > 3:
-            names += f", +{count - 3} more"
-        self.attachment_text.set(
-            f"{count} file{'s' if count != 1 else ''} attached: {names}"
-        )
+        for path in self.pending_attachments:
+            chip = tk.Frame(
+                self.attachment_chips,
+                bg=PANEL_ALT,
+                highlightbackground=BORDER,
+                highlightthickness=1,
+            )
+            chip.pack(side="left", padx=(0, 6), pady=2)
+            tk.Label(
+                chip,
+                text=shorten(os.path.basename(path), 24),
+                bg=PANEL_ALT,
+                fg="#bfdbfe",
+                font=("Sans", 9),
+                padx=8,
+                pady=3,
+            ).pack(side="left")
+            tk.Button(
+                chip,
+                text="✕",
+                command=lambda p=path: self.remove_attachment(p),
+                bg=PANEL_ALT,
+                fg="#f87171",
+                activebackground="#7f1d1d",
+                activeforeground="white",
+                relief="flat",
+                padx=5,
+                pady=3,
+                cursor="hand2",
+                font=("Sans", 9, "bold"),
+            ).pack(side="left")
         self.attachment_bar.pack(fill="x", padx=8, pady=(0, 6), before=self.input)
 
     def _setup_drag_and_drop(self):
@@ -7196,16 +8504,71 @@ class App:
         if not text:
             return
         at_bottom = self.terminal.yview()[1] >= 0.995
-        self.terminal.configure(state="normal")
+        # Widget stays "normal" (interactive); shell output is appended at the end and
+        # the insert cursor follows so typing continues at the live prompt.
         self.terminal.insert("end", text)
-        self.terminal.configure(state="disabled")
+        self.terminal.mark_set("insert", "end")
         if at_bottom:
             self.terminal.see("end")
 
     def clear_terminal(self):
-        self.terminal.configure(state="normal")
         self.terminal.delete("1.0", "end")
-        self.terminal.configure(state="disabled")
+
+    def _terminal_send(self, seq):
+        if not seq:
+            return
+        if not self.terminal_shell.send(seq):
+            self.restart_terminal()
+            self.terminal_shell.send(seq)
+
+    def _terminal_paste(self, _event=None):
+        try:
+            text = self.win.clipboard_get()
+        except tk.TclError:
+            text = ""
+        self._terminal_send(text)
+        return "break"
+
+    def _terminal_key(self, event):
+        """Forward a keystroke from the main terminal area straight to the pty so it
+        behaves like a real terminal. bash -i echoes input, so we never insert
+        locally — every binding returns 'break' to suppress the Text widget's own
+        editing."""
+        ks = event.keysym
+        if ks in (
+            "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+            "Meta_L", "Meta_R", "Super_L", "Super_R", "Caps_Lock", "Num_Lock",
+        ):
+            return "break"
+        ctrl = bool(event.state & 0x4)
+        shift = bool(event.state & 0x1)
+        # Terminal-standard copy/paste: Ctrl+Shift+C copies; Ctrl+(Shift+)V pastes.
+        # Ctrl+C alone stays an interrupt (sent as \x03 below).
+        if ctrl and shift and ks in ("C", "c"):
+            try:
+                self.win.clipboard_clear()
+                self.win.clipboard_append(self.terminal.get("sel.first", "sel.last"))
+            except tk.TclError:
+                pass
+            return "break"
+        if ctrl and ks in ("V", "v"):
+            return self._terminal_paste()
+        special = {
+            "Return": "\r", "KP_Enter": "\r", "BackSpace": "\x7f", "Tab": "\t",
+            "ISO_Left_Tab": "\x1b[Z", "Up": "\x1b[A", "Down": "\x1b[B",
+            "Right": "\x1b[C", "Left": "\x1b[D", "Home": "\x1b[H", "End": "\x1b[F",
+            "Delete": "\x1b[3~", "Prior": "\x1b[5~", "Next": "\x1b[6~", "Escape": "\x1b",
+        }
+        seq = None
+        if ctrl and len(ks) == 1 and ks.isalpha():
+            seq = chr(ord(ks.lower()) - ord("a") + 1)  # Ctrl-A..Z -> 0x01..0x1a
+        elif ks in special:
+            seq = special[ks]
+        elif event.char and (event.char >= " " or event.char == "\t"):
+            seq = event.char
+        if seq is not None:
+            self._terminal_send(seq)
+        return "break"
 
     def submit_terminal_command(self, _event=None):
         command = self.terminal_input.get()
@@ -7394,14 +8757,31 @@ class App:
             bg=SIDEBAR,
         )
         sess_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        sess_header = tk.Frame(sess_frame, bg=SIDEBAR)
+        sess_header.pack(fill="x", pady=(0, 5))
         tk.Label(
-            sess_frame,
+            sess_header,
             text="SESSIONS",
             bg=SIDEBAR,
             fg=MUTED,
             anchor="w",
             font=("Sans", 9, "bold"),
-        ).pack(fill="x", pady=(0, 5))
+        ).pack(side="left")
+        self.organize_btn = tk.Button(
+            sess_header,
+            text="Organize ▾",
+            command=self._open_organize_menu,
+            bg=PANEL_ALT,
+            fg=TEXT,
+            activebackground=SIDEBAR_SEL,
+            activeforeground="white",
+            relief="flat",
+            padx=8,
+            pady=1,
+            font=("Sans", 8),
+            cursor="hand2",
+        )
+        self.organize_btn.pack(side="right")
         sess_tools = tk.Frame(sess_frame, bg=SIDEBAR)
         sess_tools.pack(fill="x", pady=(0, 6))
         self.session_search = tk.Entry(
@@ -7432,23 +8812,13 @@ class App:
                 pady=2,
                 cursor="hand2",
             ).pack(side="left", padx=(4, 0))
-        tk.Checkbutton(
-            sess_frame,
-            text="Show discovered CLI sessions",
-            variable=self.show_discovered_sessions,
-            bg=SIDEBAR,
-            fg=MUTED,
-            selectcolor=PANEL,
-            activebackground=SIDEBAR,
-            relief="flat",
-            anchor="w",
-            command=self._on_toggle_discovered,
-        ).pack(fill="x", pady=(0, 4))
         self.session_list = tk.Listbox(
             sess_frame,
             bg=PANEL,
             fg=TEXT,
             selectbackground=SIDEBAR_SEL,
+            selectforeground="white",
+            exportselection=False,
             relief="flat",
             highlightthickness=0,
             activestyle="none",
@@ -7469,6 +8839,8 @@ class App:
         sess_scroll.pack(side="right", fill="y")
         self.session_list.configure(yscrollcommand=sess_scroll.set)
         self.session_menu = tk.Menu(self.win, tearoff=False)
+        self.session_menu.add_command(label="Open in new tab", command=self._open_selected_session_new_tab)
+        self.session_menu.add_separator()
         self.session_menu.add_command(label="Rename session", command=self.rename_selected_session)
         self.session_menu.add_separator()
         self.session_menu.add_command(label="Move up", command=lambda: self.move_selected_session(-1))
@@ -7618,9 +8990,10 @@ class App:
                     justify="left",
                 ).pack(anchor="w", pady=4)
             else:
-                aider_ready = shutil.which("aider") is not None
-                existing_cmds = [
-                    clean_text(c.get("command")) for c in self.custom_clients
+                # One-click Ollama clients store the model as `ollama_chat/<model>`
+                # (no shell command), so detect "already added" by the model field.
+                existing_models = [
+                    clean_text(c.get("model")) for c in self.custom_clients
                 ]
                 for model in models:
                     row = tk.Frame(
@@ -7639,12 +9012,10 @@ class App:
                         fg=TEXT,
                         font=("Sans", 10, "bold"),
                     ).pack(anchor="w")
-                    already = any(
-                        ("ollama_chat/" + model) in cmd for cmd in existing_cmds
-                    )
+                    already = ("ollama_chat/" + model) in existing_models
                     tk.Label(
                         info,
-                        text="Local · offline" + (" · added" if already else ""),
+                        text="Local · ready" + (" · added" if already else ""),
                         bg="#0f1621",
                         fg="#86efac",
                     ).pack(anchor="w")
@@ -7654,15 +9025,6 @@ class App:
                             text="Added",
                             bg="#0f1621",
                             fg="#94a3b8",
-                            padx=12,
-                            pady=6,
-                        ).pack(side="right", padx=10)
-                    elif not aider_ready:
-                        tk.Label(
-                            row,
-                            text="needs aider",
-                            bg="#0f1621",
-                            fg="#facc15",
                             padx=12,
                             pady=6,
                         ).pack(side="right", padx=10)
@@ -7747,30 +9109,6 @@ class App:
         y = self.win.winfo_rooty() + (self.win.winfo_height() - dialog.winfo_reqheight()) // 2
         dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
 
-    def add_custom_client(self, parent):
-        label = simpledialog.askstring(
-            "Add custom CLI",
-            "Client name shown in Agent Workbench:",
-            parent=parent,
-        )
-        label = clean_text(label)
-        if not label:
-            return
-        command = simpledialog.askstring(
-            "Add custom CLI",
-            (
-                "Command template.\n\n"
-                "Use {prompt} where the prompt belongs, for example:\n"
-                "aider --message {prompt}\n\n"
-                "If omitted, the prompt is sent to standard input."
-            ),
-            parent=parent,
-        )
-        command = clean_text(command)
-        if not command:
-            return
-        self._register_custom_client(label, command, parent)
-
     def _list_ollama_models(self):
         """Return installed Ollama model names, [] if none, or None if Ollama
         is not reachable."""
@@ -7815,50 +9153,6 @@ class App:
         self.on_agent_changed()
         self.status.set(f"Added {model}. Multi-turn streaming via Ollama.")
 
-    def _register_custom_client(self, label, command, parent):
-        """Validate and register a custom CLI client; shared by manual add and
-        one-click Ollama connect."""
-        label = clean_text(label)
-        command = clean_text(command)
-        if not label or not command:
-            return
-        try:
-            executable = shlex.split(command.replace("{prompt}", "prompt"))[0]
-        except (ValueError, IndexError):
-            messagebox.showerror("Add custom CLI", "The command template is not valid.", parent=parent)
-            return
-        if not shutil.which(executable):
-            messagebox.showerror(
-                "Add custom CLI",
-                f"'{executable}' was not found on this machine.",
-                parent=parent,
-            )
-            return
-        base = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "custom"
-        key = "custom-" + base
-        suffix = 2
-        while key in self.agent_map:
-            key = f"custom-{base}-{suffix}"
-            suffix += 1
-        client = {"key": key, "label": label, "command": command}
-        self.custom_clients.append(client)
-        spec = {"key": key, "label": label, "color": "#67e8f9", "custom": True}
-        self.agent_specs.append(spec)
-        self.agent_map[key] = spec
-        self.agent_settings[key] = {"model": "Default", "effort": "Default"}
-        for workspace_id, workspace in self.workspaces.items():
-            workspace["backends"][key] = CustomCliBackend(
-                self.events, client, workspace_id
-            )
-        self.agent_picker.configure(values=[item["key"] for item in self.agent_specs])
-        self.config["custom_clients"] = self.custom_clients
-        save_json(CONFIG_FILE, self.config)
-        self.active_agent.set(key)
-        if parent is not None:
-            parent.destroy()
-        self.on_agent_changed()
-        self.status.set(f"Added {label}. Prompts will run through its local CLI command.")
-
     def remove_custom_client(self, key, parent):
         if self.busy and self.active_agent.get() == key:
             messagebox.showinfo(
@@ -7885,24 +9179,6 @@ class App:
             self.on_agent_changed()
         parent.destroy()
         self.status.set("Custom client registration removed. Saved sessions were kept.")
-
-    def launch_client_setup(self, command, dialog=None):
-        if dialog is not None:
-            dialog.destroy()
-        terminals = (
-            ("konsole", ["konsole", "-e", "bash", "-lc"]),
-            ("gnome-terminal", ["gnome-terminal", "--", "bash", "-lc"]),
-            ("xterm", ["xterm", "-e", "bash", "-lc"]),
-        )
-        script = f"{command}; printf '\\nSetup finished. Press Enter to close.\\n'; read"
-        for executable, prefix in terminals:
-            if shutil.which(executable):
-                subprocess.Popen(prefix + [script], cwd=self.cwd.get())
-                self.status.set("Client setup opened. Complete the vendor sign-in there.")
-                return
-        self.notebook.select(self.terminal_tab)
-        self.terminal_shell.send(command + "\n")
-        self.status.set("Client setup started in Terminal.")
 
     def show_session_menu(self, event):
         index = self.session_list.nearest(event.y)
@@ -7960,9 +9236,6 @@ class App:
             (session_id and session_id in deleted_ids)
             or (source_path and source_path in deleted_paths)
         )
-
-    def _filter_deleted_sessions(self, sessions):
-        return [session for session in sessions if not self._session_is_deleted(session)]
 
     def _session_alias(self, session):
         return clean_text(self.session_aliases.get(session_alias_key(session), ""))
@@ -8178,36 +9451,29 @@ class App:
         self._refresh_project_list()
 
     def on_agent_changed(self):
+        # Always allow switching — even while a turn is running. We don't touch the
+        # current session/conversation or interrupt the turn (the backend keeps going;
+        # sending while busy still queues). Switching just shows the chosen agent's
+        # sessions so you can click one to open it in a new tab on the fly.
         requested_agent = self.active_agent.get()
-        workspace = self.workspaces.get(self.active_workspace_id)
-        current_agent = (
-            workspace.get("agent", requested_agent) if workspace else requested_agent
+        settings = self.agent_settings.get(requested_agent) or self._default_settings_for(
+            requested_agent
         )
-        if workspace and workspace.get("busy") and requested_agent != current_agent:
-            self.active_agent.set(current_agent)
-            requested_label = self._agent_spec(requested_agent)["label"]
-            current_label = self._agent_spec(current_agent)["label"]
-            self.status.set(
-                f"{current_label} is still running in this tab. Open {requested_label} in a new tab."
-            )
-            if messagebox.askyesno(
-                "Agent still running",
-                (
-                    f"{current_label} is still running in this tab.\n\n"
-                    f"Open {requested_label} in a new agent tab instead?"
-                ),
-                parent=self.win,
-            ):
-                self.new_workspace(requested_agent)
-            return
-        settings = self.agent_settings[requested_agent]
         self.selected_model.set(settings["model"])
         self.selected_effort.set(settings["effort"])
         self.refresh_agent_controls()
         self.apply_agent_theme(requested_agent)
-        self.refresh_sessions()
+        self.store.load()
+        self.local_sessions = self.store.list_all_local(requested_agent)
+        self.external_sessions = []  # picker is local-only; skip the slow CLI scan
+        self.sessions = self._combined_sessions()
+        self._render_session_list()
         self._save_active_workspace()
         self._render_workspace_tabs()
+        label = self._agent_spec(requested_agent).get("label", requested_agent)
+        self.status.set(
+            f"{label} selected — its sessions are listed. Click one to open it in a tab."
+        )
 
     def refresh_agent_controls(self):
         agent_key = self.active_agent.get()
@@ -8261,10 +9527,8 @@ class App:
         self._remember_project(self.cwd.get())
         if getattr(self, "terminal_shell", None) and self.terminal_shell.cwd != self.cwd.get():
             self.restart_terminal()
-        self.local_sessions = self.store.list_for(self.cwd.get(), self.active_agent.get())
-        self.external_sessions = self._filter_deleted_sessions(
-            discover_external_sessions(self.cwd.get(), self.active_agent.get())
-        )
+        self.local_sessions = self.store.list_all_local(self.active_agent.get())
+        self.external_sessions = []  # picker is local-only; skip the slow CLI scan
         self.sessions = self._combined_sessions()
         if not self.sessions:
             self.current_session = self.store.new_session(self.active_agent.get(), self.cwd.get())
@@ -8272,15 +9536,12 @@ class App:
             self.sessions = list(self.local_sessions)
             self.transfer_source_session_id = None
         self._render_session_list()
-        if self.sessions:
+        if self.visible_sessions:
+            self.open_session(self.visible_sessions[0]["id"], remember=False)
+        elif self.sessions:
             self.open_session(self.sessions[0]["id"], remember=False)
         else:
             self.open_session(self.current_session["id"], remember=False)
-
-    def _on_toggle_discovered(self):
-        self.config["show_discovered_sessions"] = self.show_discovered_sessions.get()
-        save_json(CONFIG_FILE, self.config)
-        self.refresh_sessions()
 
     def refresh_workspace(self):
         self.status.set("Refreshing workspace state…")
@@ -8295,14 +9556,8 @@ class App:
         )
         self.store.load()
         workspace["live_source_signature"] = ""
-        workspace["local_sessions"] = self.store.list_for(
-            workspace["cwd"], workspace["agent"]
-        )
-        workspace["external_sessions"] = self._filter_deleted_sessions(
-            discover_external_sessions(
-                workspace["cwd"], workspace["agent"]
-            )
-        )
+        workspace["local_sessions"] = self.store.list_all_local(workspace["agent"])
+        workspace["external_sessions"] = []  # local-only picker; skip CLI scan
         workspace["sessions"] = self._merge_session_lists(
             workspace["local_sessions"], workspace["external_sessions"]
         )
@@ -8449,39 +9704,37 @@ class App:
             if backend_id:
                 local_backend_ids.add(backend_id)
             local.append(session)
-        if not self.show_discovered_sessions.get():
-            return local
-        external = [
-            session
-            for session in external_sessions
-            if clean_text(session.get("source_session_id"))
-            not in local_backend_ids | worker_backend_ids
-        ]
-        return local + external
+        # Discovered / imported CLI sessions never belong in the picker.
+        return local
+
+    def _is_picker_session(self, session):
+        """True only for focused sessions created in the workbench (new / created /
+        handoff). Excludes spawned workers and children, and imported or discovered
+        CLI sessions (origin ends in '-terminal'), which belong in the per-session
+        Spawned tab — not the main session picker."""
+        if session.get("worker_job_id") or session.get("worker_parent_session_id"):
+            return False
+        origin = str(session.get("origin") or "local").strip().lower()
+        if origin.endswith("-terminal"):
+            return False
+        return True
 
     def _render_session_list(self):
         self._hide_session_tooltip()
         selected_id = self.current_session.get("id") if self.current_session else None
         self.session_list.delete(0, "end")
         query = clean_text(self.session_filter.get()).lower()
-        # Spawnees live in the per-session "Spawned" tab — keep them out of the
-        # main Sessions list (buildinstructions1.md #5).
+        # The picker shows ONLY focused sessions created here (new / created /
+        # handoff): origin "local", never imported/discovered CLI sessions
+        # (*-terminal origin) and never spawned workers/children. Those live in
+        # the per-session "Spawned" tab.
         self.visible_sessions = [
-            s for s in self.sessions if not s.get("worker_parent_session_id")
+            s for s in self.sessions if self._is_picker_session(s)
         ]
-        self.visible_sessions.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
-        fallback_index = {
-            session.get("id"): index
-            for index, session in enumerate(self.visible_sessions)
-        }
-        order = self.session_order.get(self._session_order_key(), [])
-        order_index = {session_id: index for index, session_id in enumerate(order)}
-        self.visible_sessions.sort(
-            key=lambda session: order_index.get(
-                session.get("id"),
-                len(order) + fallback_index.get(session.get("id"), 0),
-            )
-        )
+        # Stable order: each session holds its slot. A brand-new session lands at
+        # the TOP and pushes the rest down; merely opening/touching a session never
+        # reorders it. The ↑/↓ buttons and the Organize button rewrite this order.
+        self.visible_sessions = self._apply_stable_session_order(self.visible_sessions)
         if query:
             self.visible_sessions = [
                 session
@@ -8508,6 +9761,82 @@ class App:
     def _session_order_key(self):
         return f"{self.active_agent.get()}|{os.path.abspath(self.cwd.get())}"
 
+    def _apply_stable_session_order(self, sessions):
+        """Return picker sessions in their remembered order. Sessions already known
+        keep their saved slot; sessions not seen before are inserted at the TOP
+        (newest first), so a brand-new session pushes the rest down but nothing
+        reorders just because it was opened. Dead ids are dropped. The merged order
+        is persisted only when it actually changed (no disk churn on every render)."""
+        key = self._session_order_key()
+        stored = list(self.session_order.get(key, []))
+        stored_set = set(stored)
+        by_id = {s.get("id"): s for s in sessions if s.get("id")}
+        ordered_ids = []
+        seen = set()
+        # Brand-new sessions (never ordered before) go on top, newest first.
+        fresh = [
+            s for s in sessions if s.get("id") and s.get("id") not in stored_set
+        ]
+        fresh.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
+        for s in fresh:
+            ordered_ids.append(s.get("id"))
+            seen.add(s.get("id"))
+        # Then everything previously known, in its saved order.
+        for sid in stored:
+            if sid in by_id and sid not in seen:
+                ordered_ids.append(sid)
+                seen.add(sid)
+        if ordered_ids != stored:
+            self.session_order[key] = ordered_ids
+            self.config["session_order"] = self.session_order
+            save_json(CONFIG_FILE, self.config)
+        return [by_id[sid] for sid in ordered_ids]
+
+    def _open_organize_menu(self):
+        """Drop-down for the Organize button: one-shot sort of the session list by
+        date or title. The chosen order is written into the saved session_order so
+        it persists; the list then stays stable until the next Organize / new
+        session / manual ↑↓ move."""
+        menu = tk.Menu(
+            self.win,
+            tearoff=0,
+            bg=PANEL,
+            fg=TEXT,
+            activebackground=SIDEBAR_SEL,
+            activeforeground="white",
+        )
+        menu.add_command(
+            label="By date (newest first)",
+            command=lambda: self.organize_sessions("date"),
+        )
+        menu.add_command(
+            label="By title (A–Z)",
+            command=lambda: self.organize_sessions("title"),
+        )
+        try:
+            x = self.organize_btn.winfo_rootx()
+            y = self.organize_btn.winfo_rooty() + self.organize_btn.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def organize_sessions(self, mode):
+        """Sort all picker sessions by the chosen key and persist that as the new
+        saved order, then re-render. After this the list is stable again."""
+        key = self._session_order_key()
+        picker = [s for s in self.sessions if self._is_picker_session(s)]
+        if mode == "title":
+            picker.sort(key=lambda s: self._display_session_title(s).lower())
+            label = "title"
+        else:
+            picker.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
+            label = "date"
+        self.session_order[key] = [s.get("id") for s in picker if s.get("id")]
+        self.config["session_order"] = self.session_order
+        save_json(CONFIG_FILE, self.config)
+        self._render_session_list()
+        self.status.set(f"Sessions organized by {label}.")
+
     def _render_recent_sessions(self):
         """Populate the Recent box with the 2 most-recently-used local sessions."""
         if not hasattr(self, "recent_session_list"):
@@ -8515,7 +9844,7 @@ class App:
         # Collect local sessions sorted by updated_at descending
         candidates = [
             s for s in self.local_sessions
-            if not s.get("worker_parent_session_id")
+            if self._is_picker_session(s)
         ]
         candidates.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
         self._recent_sessions = candidates[:2]
@@ -8575,7 +9904,7 @@ class App:
         if idx < len(self._spawned_sessions):
             sid = self._spawned_sessions[idx].get("id")
             if sid:
-                self.open_session(sid)
+                self.open_session_in_new_tab(sid)
 
     def move_selected_session(self, direction):
         selection = self.session_list.curselection()
@@ -8734,11 +10063,84 @@ class App:
         if not selection:
             return
         idx = selection[0]
-        if idx < len(self.visible_sessions):
-            selected_id = self.visible_sessions[idx]["id"]
-            if self.current_session and self.current_session.get("id") == selected_id:
+        if idx >= len(self.visible_sessions):
+            return
+        selected_id = self.visible_sessions[idx]["id"]
+        if self.current_session and self.current_session.get("id") == selected_id:
+            return  # already showing in the active tab — nothing to do
+        # Paint the selection highlight NOW, before the heavier open work (create
+        # workspace, re-render list, load transcript, rebuild tabs) blocks the event
+        # loop. Without this flush Tk defers the highlight redraw until that work
+        # returns, so the click feels laggy. update_idletasks flushes the pending
+        # redraw without processing further user events.
+        self.session_list.update_idletasks()
+        # Every picker click opens the session in its OWN tab; never swap/replace the
+        # current tab. If that exact session (matched by id, not title) is already open
+        # in some tab, focus that tab instead of opening a duplicate. So distinct
+        # sessions that share a title each get a tab, but one session is never opened twice.
+        self.open_session_in_new_tab(selected_id)
+
+    def open_session_in_new_tab(self, session_id):
+        """Open a session in its own workspace tab, leaving the current tab — and any
+        turn running there — untouched. If it's already open in a tab, focus that tab."""
+        for wid in self.workspace_order:
+            cur = (self.workspaces.get(wid) or {}).get("current_session") or {}
+            if cur.get("id") == session_id:
+                self.switch_workspace(wid)
+                self.input.focus_set()
                 return
-            self.open_session(selected_id, remember=True)
+        if self._at_tab_limit():
+            self._notify_tab_limit()
+            return
+        session = self.store.get(session_id)
+        if not session:
+            for candidate in self.external_sessions:
+                if candidate.get("id") == session_id:
+                    session = candidate
+                    break
+        if not session:
+            return
+        if self.close_when_idle and not self.restart_after_close:
+            self.status.set("Workbench is waiting for active tasks to finish before closing.")
+            return
+        agent_key = session.get("agent") or self.active_agent.get()
+        if agent_key not in self.agent_map:
+            agent_key = self.active_agent.get()
+        cwd = session.get("cwd") or self.cwd.get()
+        self._save_active_workspace()
+        self._schedule_workspace_config_save(immediate=True)
+        previous_agent = self.active_agent.get()
+        previous_cwd = self.cwd.get()
+        settings = self.agent_settings.get(
+            agent_key, self._default_settings_for(agent_key)
+        )
+        self.active_agent.set(agent_key)
+        self.cwd.set(cwd)
+        self.selected_model.set(settings["model"])
+        self.selected_effort.set(settings["effort"])
+        workspace_id = self._create_workspace()
+        self.active_agent.set(previous_agent)
+        self.cwd.set(previous_cwd)
+        self.active_workspace_id = workspace_id
+        self._restore_workspace(self.workspaces[workspace_id])
+        # Populate this tab's picker without auto-opening the top session (which
+        # would bump an unrelated session's timestamp); open only the target.
+        self.local_sessions = self.store.list_all_local(self.active_agent.get())
+        self.external_sessions = []  # picker is local-only; skip the slow CLI scan
+        self.sessions = self._combined_sessions()
+        self._render_session_list()
+        self.open_session(session_id, remember=False)
+        self._save_active_workspace()
+        self._render_workspace_tabs()
+        self.input.focus_set()
+
+    def _open_selected_session_new_tab(self):
+        selection = self.session_list.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        if idx < len(self.visible_sessions):
+            self.open_session_in_new_tab(self.visible_sessions[idx]["id"])
 
     def _restore_last_session(self):
         last_id = self.config.get("last_session_id")
@@ -8936,10 +10338,10 @@ class App:
                 pass
         self.report_cards = []
         self.latest_agent_text = ""
-        for widget in (self.chat, self.work):
-            widget.configure(state="normal")
-            widget.delete("1.0", "end")
-            widget.configure(state="disabled")
+        self.chat.configure(state="normal")
+        self.chat.delete("1.0", "end")
+        self.chat.configure(state="disabled")
+        self._reset_work_pages()
 
     def _render_session(self, session, on_complete=None):
         self.render_generation += 1
@@ -8965,15 +10367,46 @@ class App:
         render_batch()
 
     def _render_turn(self, turn, agent_key):
-        for item in turn.get("items") or []:
-            self._render_item(item, agent_key)
+        turn_time = turn.get("created_at")
+        items = turn.get("items") or []
+        # One request → ONE response bubble. The agent narrates in several blocks
+        # between tool calls, which are persisted as separate agentMessage items;
+        # rendering each as its own bubble made a single reply look like many. Merge
+        # this turn's assistant text into one bubble (shown at the first block's
+        # timestamp). Non-chat items (commands, file changes, system output) still
+        # render in order — they go to the Work Log, not the conversation.
+        agent_parts = [
+            t for t in (
+                self._extract_agent_text(it)
+                for it in items
+                if it.get("type") == "agentMessage"
+            ) if t
+        ]
+        merged_agent = "\n\n".join(agent_parts)
+        agent_ts = next(
+            (it.get("created_at") for it in items if it.get("type") == "agentMessage"),
+            turn_time,
+        )
+        rendered_agent = False
+        for item in items:
+            if item.get("type") == "agentMessage":
+                if not rendered_agent:
+                    rendered_agent = True
+                    self._render_item(
+                        {"type": "agentMessage", "text": merged_agent, "created_at": agent_ts},
+                        agent_key,
+                        turn_time,
+                    )
+                continue
+            self._render_item(item, agent_key, turn_time)
 
-    def _render_item(self, item, agent_key):
+    def _render_item(self, item, agent_key, turn_time=None):
         typ = item.get("type", "")
+        ts = item.get("created_at") or turn_time
         if typ == "userMessage":
             text = self._extract_user_text(item)
             if text:
-                self.append_chat("YOU", text, "user")
+                self.append_chat("YOU", text, "user", ts)
         elif typ == "agentMessage":
             text = self._extract_agent_text(item)
             if text:
@@ -8988,6 +10421,7 @@ class App:
                         self._agent_spec(agent_key)["label"].upper(),
                         visible_text,
                         "assistant",
+                        ts,
                     )
         elif typ == "report":
             self.append_report(
@@ -9049,7 +10483,22 @@ class App:
             return clean_text(" ".join(parts))
         return clean_text(text)
 
-    def append_chat(self, speaker, text, tag="assistant"):
+    def _format_msg_time(self, iso=None):
+        """Short clock stamp for a message header, from the system's local time.
+        Parses a stored ISO timestamp when given; otherwise stamps 'now'."""
+        moment = None
+        if iso:
+            try:
+                moment = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                moment = None
+            if moment is not None and moment.tzinfo is not None:
+                moment = moment.astimezone()
+        if moment is None:
+            moment = datetime.now()
+        return moment.strftime("%-I:%M:%S %p")
+
+    def append_chat(self, speaker, text, tag="assistant", timestamp=None):
         if not text:
             return
         raw_text, visible_text = strip_session_context(text)
@@ -9071,7 +10520,10 @@ class App:
             head_tag = "gemini_head"
         if speaker != "YOU":
             self.latest_agent_text = text
-        widget.insert("end", speaker + "\n", head_tag)
+        widget.insert("end", speaker, head_tag)
+        widget.insert(
+            "end", "   " + self._format_msg_time(timestamp) + "\n", (head_tag, "msg_time")
+        )
         content_start = widget.index("end-1c")
         if tag == "assistant":
             self._insert_formatted_chat(text)
@@ -9251,45 +10703,212 @@ class App:
         self.chat.insert("end", "\n", "assistant")
 
     def append_work(self, text, tag="system"):
+        # Buffer into pages so no single page is huge (keeps Tk fast); the left column
+        # gives one clickable "Log N" button per page. Newest page is live.
         if not text:
             return
+        if not hasattr(self, "work_pages"):
+            self._reset_work_pages()
+        self.work_pages[-1].append((text, tag))
+        self.work_page_lines += text.count("\n") + 1
+        live = len(self.work_pages) - 1
+        viewing_live = self.work_view_index == live
+        if viewing_live:
+            self._insert_work_entry(text, tag)
+        if self.work_page_lines >= WORK_LOG_PAGE_LINES and self.work_pages[-1]:
+            self.work_pages.append([])
+            self.work_page_lines = 0
+            self._rebuild_work_page_buttons()
+            if viewing_live:
+                self._show_work_page(len(self.work_pages) - 1)
+
+    def _insert_work_entry(self, text, tag):
         widget = self.work
         at_bottom = widget.yview()[1] >= 0.995
         widget.configure(state="normal")
         widget.insert("end", text.rstrip() + "\n", tag)
         widget.configure(state="disabled")
         if at_bottom:
-            # Re-check after insert: user may have scrolled away between
-            # the pre-insert check and now (scroll-lock guard).
             try:
-                still_at_bottom = widget.yview()[1] >= 0.995
+                if widget.yview()[1] >= 0.995:
+                    widget.see("end")
             except tk.TclError:
-                still_at_bottom = True
-            if still_at_bottom:
-                widget.see("end")
+                pass
+
+    def _reset_work_pages(self):
+        self.work_pages = [[]]
+        self.work_page_lines = 0
+        self.work_view_index = 0
+        if hasattr(self, "work"):
+            self.work.configure(state="normal")
+            self.work.delete("1.0", "end")
+            self.work.configure(state="disabled")
+        self._rebuild_work_page_buttons()
+
+    def _show_work_page(self, index):
+        if not hasattr(self, "work_pages") or not self.work_pages:
+            return
+        index = max(0, min(index, len(self.work_pages) - 1))
+        self.work_view_index = index
+        widget = self.work
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        for text, tag in self.work_pages[index]:
+            widget.insert("end", text.rstrip() + "\n", tag)
+        widget.configure(state="disabled")
+        try:
+            widget.see("end")
+        except tk.TclError:
+            pass
+        self._rebuild_work_page_buttons()
+
+    def _rebuild_work_page_buttons(self):
+        if not hasattr(self, "work_pages_buttons"):
+            return
+        for child in self.work_pages_buttons.winfo_children():
+            child.destroy()
+        total = len(getattr(self, "work_pages", [[]]))
+        live = total - 1
+        for i in range(total):
+            selected = i == self.work_view_index
+            label = f"Log {i + 1}" + ("  ●" if i == live else "")
+            tk.Button(
+                self.work_pages_buttons,
+                text=label,
+                command=lambda n=i: self._show_work_page(n),
+                bg=SIDEBAR_SEL if selected else PANEL_ALT,
+                fg=TEXT if selected else MUTED,
+                activebackground=SIDEBAR_SEL,
+                activeforeground=TEXT,
+                relief="flat",
+                anchor="w",
+                padx=8,
+                pady=4,
+                cursor="hand2",
+                font=("Sans", 9, "bold" if selected else "normal"),
+            ).pack(fill="x", pady=1)
+
+    def _at_tab_limit(self):
+        return (
+            len([w for w in self.workspace_order if w in self.workspaces])
+            >= MAX_WORKSPACE_TABS
+        )
+
+    def _notify_tab_limit(self):
+        self.status.set(
+            f"{MAX_WORKSPACE_TABS} tab limit reached — close a tab to open another."
+        )
+        messagebox.showinfo(
+            "Tab limit reached",
+            f"You already have {MAX_WORKSPACE_TABS} tabs open — that's the maximum.\n\n"
+            "Close a tab before opening another session.",
+            parent=self.win,
+        )
 
     def new_session(self):
         if self.close_when_idle and not self.restart_after_close:
             self.status.set("Workbench is waiting for active tasks to finish before closing.")
             return
-        if self.busy:
-            messagebox.showinfo("Busy", "Wait for the current turn to finish before starting a new session.")
+        if self._at_tab_limit():
+            self._notify_tab_limit()
             return
-        title = simpledialog.askstring(
-            "New session",
-            "Session title (leave blank to title it from your first prompt):",
-            parent=self.win,
-        )
-        session = self.store.new_session(
-            self.active_agent.get(),
-            self.cwd.get(),
-            title=clean_text(title),
-        )
-        self.local_sessions.insert(0, session)
+        # Step 1: choose which client to start with. Step 2 (in _choose) names it.
+        self._open_new_session_dialog()
+
+    def _open_new_session_dialog(self):
+        dialog = tk.Toplevel(self.win)
+        dialog.title("New session")
+        dialog.configure(bg=BG)
+        dialog.transient(self.win)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        body = tk.Frame(dialog, bg=BG, padx=20, pady=18)
+        body.pack(fill="both", expand=True)
+        tk.Label(
+            body, text="Start a new session", bg=BG, fg=TEXT, font=("Sans", 14, "bold")
+        ).pack(anchor="w")
+        tk.Label(
+            body,
+            text="Pick which client to start with — you'll name the session next.",
+            bg=BG,
+            fg=MUTED,
+            justify="left",
+            wraplength=460,
+        ).pack(anchor="w", pady=(4, 14))
+
+        def _choose(agent_key):
+            dialog.destroy()
+            label = self._agent_spec(agent_key).get("label", agent_key)
+            title = simpledialog.askstring(
+                "New session",
+                f"Name this {label} session "
+                "(leave blank to title it from your first prompt):",
+                parent=self.win,
+            )
+            self._create_named_session(agent_key, title or "")
+
+        for spec in self.agent_specs:
+            agent_key = spec["key"]
+            if spec.get("custom"):
+                installed = True  # user-added clients (Ollama/CLI) are always available
+            else:
+                installed = bool(self._agent_executable(agent_key)) and shutil.which(
+                    self._agent_executable(agent_key)
+                )
+            row = tk.Frame(body, bg=PANEL, highlightbackground="#2d3b49", highlightthickness=1)
+            row.pack(fill="x", pady=4)
+            info = tk.Frame(row, bg=PANEL)
+            info.pack(side="left", fill="x", expand=True, padx=12, pady=10)
+            tk.Label(
+                info, text=spec["label"], bg=PANEL, fg=TEXT, font=("Sans", 10, "bold")
+            ).pack(anchor="w")
+            tk.Label(
+                info,
+                text="Ready" if installed else "Not installed",
+                bg=PANEL,
+                fg="#86efac" if installed else "#facc15",
+            ).pack(anchor="w")
+            tk.Button(
+                row,
+                text="Start",
+                command=lambda key=agent_key: _choose(key),
+                bg=spec.get("color", ACCENT) if installed else "#334155",
+                fg="white",
+                activebackground=SIDEBAR_SEL,
+                activeforeground="white",
+                relief="flat",
+                padx=12,
+                pady=5,
+                cursor="hand2",
+                state="normal" if installed else "disabled",
+            ).pack(side="right", padx=10)
+
+    def _create_named_session(self, agent_key, title):
+        """Open a named new session for agent_key in its own tab (never swaps the
+        current tab or interrupts a running turn)."""
+        if agent_key not in self.agent_map:
+            agent_key = self.active_agent.get()
+        self._save_active_workspace()
+        self._schedule_workspace_config_save(immediate=True)
+        prev_agent = self.active_agent.get()
+        settings = self.agent_settings.get(agent_key, self._default_settings_for(agent_key))
+        self.active_agent.set(agent_key)
+        self.selected_model.set(settings["model"])
+        self.selected_effort.set(settings["effort"])
+        workspace_id = self._create_workspace()
+        self.active_agent.set(prev_agent)
+        self.active_workspace_id = workspace_id
+        self._restore_workspace(self.workspaces[workspace_id])
+        session = self.store.new_session(agent_key, self.cwd.get(), title=clean_text(title))
+        self.current_session = session
+        self.local_sessions = self.store.list_all_local(agent_key)
         self.sessions = self._combined_sessions()
         self.transfer_source_session_id = None
         self._render_session_list()
         self.open_session(session["id"], remember=False)
+        self._save_active_workspace()
+        self._render_workspace_tabs()
+        self.input.focus_set()
 
     def _next_handoff_title(self, source):
         current = self._display_session_title(source)
@@ -9466,6 +11085,21 @@ class App:
         self.store.save(session)
         self.local_sessions.insert(0, session)
         self.sessions = self._combined_sessions()
+        # Open continuation in a NEW tab inserted right after the source tab,
+        # leaving the source workspace open and untouched.
+        source_workspace_id = self.active_workspace_id
+        source_index = (
+            self.workspace_order.index(source_workspace_id)
+            if source_workspace_id in self.workspace_order
+            else len(self.workspace_order) - 1
+        )
+        self._save_active_workspace()
+        new_workspace_id = self._create_workspace(title)
+        # _create_workspace appends; splice it to source_index + 1 instead.
+        self.workspace_order.remove(new_workspace_id)
+        self.workspace_order.insert(source_index + 1, new_workspace_id)
+        self.active_workspace_id = new_workspace_id
+        self._restore_workspace(self.workspaces[new_workspace_id])
         self.transfer_source_session_id = None
         self.active_agent.set(target_agent)
         self.selected_model.set(model)
@@ -9482,6 +11116,7 @@ class App:
         self.status.set(
             f"Starting fresh {self._agent_spec(target_agent)['label']} session '{title}'…"
         )
+        self._render_workspace_tabs()
         self.win.after(0, self.send)
 
     def spawn_worker_job(
@@ -10821,6 +12456,7 @@ class App:
             f"Queued next message: {shorten(prompt, 100)}",
             "system",
         )
+        self._log_event("queue_add", depth=count, session=(self.current_session or {}).get("id"))
         self._save_active_workspace()
         self._render_workspace_tabs()
 
@@ -10833,21 +12469,85 @@ class App:
         ):
             return
         queued = self.queued_prompts.pop(0)
-        self.input.delete("1.0", "end")
-        self.input.insert("1.0", queued.get("prompt", ""))
-        self.pending_attachments = [
-            path
-            for path in queued.get("attachments") or []
-            if os.path.isfile(path)
-        ]
+        self._log_event("queue_drain", scope="active", remaining=len(self.queued_prompts))
         self._update_queue_indicator()
         self._refresh_queue_dialog()
-        self._update_attachment_bar()
         self._save_active_workspace()
         self._render_workspace_tabs()
-        self.send()
+        # Send the queued message DIRECTLY — never load it into the composer, so a
+        # draft the user is typing right now is preserved instead of overwritten.
+        self.send(
+            prompt=queued.get("prompt", ""),
+            attachments=queued.get("attachments"),
+        )
 
-    def send(self):
+    def _drain_workspace_queue(self, workspace):
+        """Advance a BACKGROUND tab's queue when its turn finishes, so queued work
+        runs across tabs instead of sitting until you switch back. Operates only on
+        the given workspace's own session/backend; never touches the active UI."""
+        if not workspace or workspace is self.workspaces.get(self.active_workspace_id):
+            return  # the active tab uses _send_next_queued_prompt (with rendering)
+        if workspace.get("busy") or (self.close_when_idle and not self.restart_after_close):
+            return
+        queue_list = workspace.get("queued_prompts") or []
+        if not queue_list:
+            return
+        session = workspace.get("current_session")
+        agent = workspace.get("agent")
+        backend = (workspace.get("backends") or {}).get(agent)
+        if not session or not backend or session.get("origin", "local") != "local":
+            return
+        queued = queue_list.pop(0)
+        prompt = clean_text(queued.get("prompt", ""))
+        attachments = [
+            p for p in (queued.get("attachments") or []) if p and os.path.isfile(p)
+        ]
+        if not prompt and not attachments:
+            return
+        if not prompt:
+            names = ", ".join(os.path.basename(p) for p in attachments)
+            prompt = f"Please inspect and respond to the attached file(s): {names}"
+        turn = {"id": str(uuid.uuid4()), "created_at": now_iso(), "status": "running", "items": []}
+        session.setdefault("turns", []).append(turn)
+        self.store.add_item(
+            session, turn, {"type": "userMessage", "content": [{"type": "text", "text": prompt}]}
+        )
+        workspace["current_turn"] = turn
+        workspace["busy"] = True
+        now = time.monotonic()
+        workspace["turn_started_at"] = now
+        workspace["last_event_at"] = now
+        workspace["last_progress_at"] = now
+        workspace["live_token_count"] = 0
+        workspace["status"] = f"{self._agent_spec(agent).get('label', agent)} is working…"
+        workspace["activity_state"] = "working"
+        workspace["activity_text"] = "Working"
+        backend_settings = session.setdefault("backend", {})
+        backend_settings["model"] = workspace.get("model")
+        if agent == "claude":
+            backend_settings["orchestration_mode"] = clean_text(
+                self.claude_orchestration.get("mode") or "smart"
+            )
+        effort = workspace.get("effort")
+        if agent == "gemini" or effort in (None, "", "Default"):
+            backend_settings.pop("effort", None)
+        else:
+            backend_settings["effort"] = effort
+        backend_prompt = prompt_with_authoritative_time(
+            prompt_with_attachments(prompt, attachments)
+        )
+        self._log_event(
+            "queue_drain",
+            scope="background",
+            agent=agent,
+            session=session.get("id"),
+            remaining=len(queue_list),
+        )
+        self.store.save(session, durable=False)
+        backend.start_turn(session, turn, backend_prompt, context_text="")
+        self._render_workspace_tabs()
+
+    def send(self, prompt=None, attachments=None):
         if (
             self.close_when_idle
             and not self.restart_after_close
@@ -10855,10 +12555,20 @@ class App:
         ):
             self.status.set("Workbench is waiting for active tasks to finish before closing.")
             return
-        prompt = clean_text(self.input.get("1.0", "end"))
-        attachments = [
-            path for path in self.pending_attachments if path and os.path.isfile(path)
-        ]
+        # prompt=None => send the live composer draft (and clear it afterward).
+        # An explicit prompt (e.g. a queued message) is sent WITHOUT reading or
+        # clearing the composer, so text the user is typing right now is never lost.
+        from_composer = prompt is None
+        if from_composer:
+            prompt = clean_text(self.input.get("1.0", "end"))
+            attachments = [
+                path for path in self.pending_attachments if path and os.path.isfile(path)
+            ]
+        else:
+            prompt = clean_text(prompt)
+            attachments = [
+                path for path in (attachments or []) if path and os.path.isfile(path)
+            ]
         if not prompt and not attachments:
             return
         if not prompt:
@@ -10867,7 +12577,8 @@ class App:
         if self.pending_user_input:
             pending = self.pending_user_input
             self.pending_user_input = None
-            self.input.delete("1.0", "end")
+            if from_composer:
+                self.input.delete("1.0", "end")
             reply = prompt_with_attachments(prompt, attachments)
             raw_prompt, visible_prompt = strip_session_context(prompt)
             if raw_prompt and not visible_prompt:
@@ -10879,7 +12590,8 @@ class App:
                 visible_prompt += "\n\nAttached: " + ", ".join(
                     os.path.basename(path) for path in attachments
                 )
-                self.clear_attachments()
+                if from_composer:
+                    self.clear_attachments()
             self.append_chat("YOU", visible_prompt, "user")
             if self.current_turn is not None:
                 self.store.add_item(
@@ -10902,13 +12614,25 @@ class App:
             self._queue_prompt(prompt, attachments)
             return
         agent_key = self.active_agent.get()
-        executable = self._agent_executable(agent_key)
-        if not executable or not shutil.which(executable):
-            self.status.set(
-                f"{self._current_agent_label()} is not installed. Use Add client to connect it."
-            )
-            self.open_add_client_dialog()
-            return
+        # Local-model clients (Ollama) reach a local HTTP API through OllamaBackend —
+        # they have NO CLI executable, so the "is it installed?" gate below (which only
+        # makes sense for CLI agents) must be skipped. Otherwise every send to a local
+        # model wrongly pops the Add-client dialog and the message never goes out.
+        backend = self.backends.get(agent_key)
+        client = next(
+            (c for c in self.custom_clients if c.get("key") == agent_key), None
+        )
+        is_local_http = isinstance(backend, OllamaBackend) or (
+            client is not None and "ollama_chat/" in clean_text(client.get("model"))
+        )
+        if not is_local_http:
+            executable = self._agent_executable(agent_key)
+            if not executable or not shutil.which(executable):
+                self.status.set(
+                    f"{self._current_agent_label()} is not installed. Use Add client to connect it."
+                )
+                self.open_add_client_dialog()
+                return
         if agent_key == "codex":
             codex_backend = self.backends["codex"]
             if codex_backend.proc is None or codex_backend.proc.poll() is not None:
@@ -10919,11 +12643,13 @@ class App:
                     self.status.set("Codex installed, but its local service did not start.")
                     return
         if prompt.startswith("/resume"):
-            self.input.delete("1.0", "end")
+            if from_composer:
+                self.input.delete("1.0", "end")
             self.open_session_finder()
             return
         if prompt.startswith("/sessions"):
-            self.input.delete("1.0", "end")
+            if from_composer:
+                self.input.delete("1.0", "end")
             self.open_session_finder()
             return
         if not os.path.isdir(self.cwd.get()):
@@ -10934,9 +12660,7 @@ class App:
         if self.current_session.get("origin", "local") != "local":
             self.transfer_source_session_id = self.current_session.get("source_session_id") or self.current_session.get("id")
             self.current_session = self.store.adopt_external(self.current_session)
-            self.local_sessions = self.store.list_for(
-                self.cwd.get(), self.active_agent.get()
-            )
+            self.local_sessions = self.store.list_all_local(self.active_agent.get())
             self.sessions = self._combined_sessions()
             self._render_session_list()
         backend_settings = self.current_session.setdefault("backend", {})
@@ -10951,12 +12675,23 @@ class App:
         else:
             backend_settings["effort"] = effort
         self._remember_project(self.cwd.get())
-        self.input.delete("1.0", "end")
+        if from_composer:
+            self.input.delete("1.0", "end")
         backend_prompt = prompt_with_authoritative_time(
             prompt_with_attachments(prompt, attachments)
         )
-        self.clear_attachments()
+        if from_composer:
+            self.clear_attachments()
         self.busy = True
+        self._log_event(
+            "turn_start",
+            scope="active",
+            agent=self.active_agent.get(),
+            model=self.selected_model.get(),
+            session=(self.current_session or {}).get("id"),
+            prompt_chars=len(prompt or ""),
+            from_composer=from_composer,
+        )
         workspace = self.workspaces.get(self.active_workspace_id)
         if workspace:
             workspace["turn_started_at"] = time.monotonic()
@@ -11048,8 +12783,37 @@ class App:
             items = self.current_turn.setdefault("items", [])
             if items and items[-1].get("type") == "agentMessage":
                 items[-1]["text"] = clean_text(items[-1].get("text", "") + text)
-                self.store.save(self.current_session)
+                self._autosave_stream_session()
         self._append_stream_visual(text, speaker, starts_message)
+
+    def _log_event(self, kind, **fields):
+        """Append one timestamped JSON line to debug.jsonl. Cheap (no fsync), never
+        raises. This is the accurate activity log: turn timings, queue moves, errors."""
+        try:
+            record = {"t": now_iso(), "kind": kind}
+            record.update(fields)
+            with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, default=str) + "\n")
+            self._log_count = getattr(self, "_log_count", 0) + 1
+            if self._log_count % 200 == 0:
+                try:
+                    if os.path.getsize(DEBUG_LOG_FILE) > 5_000_000:
+                        os.replace(DEBUG_LOG_FILE, DEBUG_LOG_FILE + ".1")
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+    def _autosave_stream_session(self):
+        # Stream deltas update the item in memory; persist at most every 2s without
+        # fsync instead of rewriting the whole session file on every token (which was
+        # O(n^2) and fsync-blocked the UI). The durable save happens at turn_done.
+        now = time.monotonic()
+        if now - getattr(self, "_last_stream_save", 0.0) < 2.0:
+            return
+        self._last_stream_save = now
+        if self.current_session:
+            self.store.save(self.current_session, durable=False)
 
     def _append_stream_visual(self, text, speaker, starts_message):
         widget = self.chat
@@ -11061,7 +12825,10 @@ class App:
                 head_tag = "claude_head"
             elif speaker == "GEMINI":
                 head_tag = "gemini_head"
-            widget.insert("end", speaker + "\n", head_tag)
+            widget.insert("end", speaker, head_tag)
+            widget.insert(
+                "end", "   " + self._format_msg_time() + "\n", (head_tag, "msg_time")
+            )
         widget.insert("end", text, "assistant")
         widget.configure(state="disabled")
         self._finish_chat_append(at_bottom)
@@ -11216,6 +12983,8 @@ class App:
                         turn,
                         {"type": "note", "text": "ERROR: " + failure},
                     )
+            # Advance this background tab's queue so queued work runs across tabs.
+            self.win.after(0, lambda ws=workspace: self._drain_workspace_queue(ws))
         elif kind == "error":
             text = event.get("text", "Error")
             if session and turn:
@@ -11369,8 +13138,15 @@ class App:
                     # tool_result, so nested results don't clear the wrong one.
                     for i in range(len(live) - 1, -1, -1):
                         if live[i].get("id") == target:
-                            live.pop(i)
+                            done = live.pop(i)
                             removed = True
+                            # Durable "finished" note in the Work Log — only on an
+                            # exact id match (regular tool results never match a
+                            # sub-agent id, so this won't misfire on normal tools).
+                            self.append_work(
+                                f"✓ Sub-agent finished: {clean_text(done.get('name')) or 'sub-agent'}",
+                                "done",
+                            )
                             break
                 if not removed:
                     for i in range(len(live) - 1, -1, -1):
@@ -11460,6 +13236,16 @@ class App:
             self.input.focus_set()
         elif kind == "turn_done":
             status = event.get("status", "completed")
+            _ws = self.workspaces.get(self.active_workspace_id) or {}
+            _started = float(_ws.get("turn_started_at") or 0.0)
+            self._log_event(
+                "turn_done",
+                scope="active",
+                status=status,
+                elapsed_ms=int((time.monotonic() - _started) * 1000) if _started else None,
+                queued=len(self.queued_prompts or []),
+                session=(self.current_session or {}).get("id"),
+            )
             if self.current_turn is not None:
                 self.store.finish_turn(self.current_session, self.current_turn, status=status)
             sync_claude_session_title(self.current_session)
@@ -11623,17 +13409,27 @@ class App:
             self.append_terminal(f"\n[Shell exited{'' if status is None else f' with status {status}'}]\n")
 
     def drain_events(self):
+        processed = False
         try:
             while True:
                 event = self.events.get_nowait()
-                self.handle_event(event)
-                self._schedule_workspace_config_save()
-                self._render_workspace_tabs()
+                try:
+                    self.handle_event(event)
+                except Exception as exc:
+                    # Never let one bad event kill the loop or stall the queue.
+                    self._log_event("handler_error", kind=event.get("kind"), error=repr(exc))
+                processed = True
                 self._maybe_finish_deferred_close()
                 if self.finalizing_close:
                     return
         except queue.Empty:
             pass
+        # Persist + re-render at most ONCE per drain tick (every 50ms), not once per
+        # event. During streaming that's hundreds of events per second — doing disk
+        # writes and tab rebuilds per event was the main source of stalling.
+        if processed:
+            self._schedule_workspace_config_save()
+            self._render_workspace_tabs()
         self.win.after(50, self.drain_events)
 
     def request_close(self):

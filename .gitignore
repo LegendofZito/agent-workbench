@@ -8,3 +8,8 @@ buildinstructions1.md
 BUILD-SPEC-*.md
 WORKBENCH-SOURCE-OF-TRUTH.md
 secrets.json
+
+# Internal dev docs (not for publish)
+BUILD-SPEC*.md
+WORKBENCH-SOURCE-OF-TRUTH.md
+buildinstructions1.md
