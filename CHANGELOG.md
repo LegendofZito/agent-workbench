@@ -8,6 +8,13 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Client update watcher (claude / codex / gemini)
+- New **Options → "Check for client updates…"**. On launch the app checks each wrapped CLI's installed
+  version against the latest available (codex/gemini via `npm view`, claude via its native `claude update`),
+  and the **Options** button turns yellow when an update is available. The dialog lists each client
+  (current → latest) with a one-click **Update** button (`npm install -g …@latest`, or `claude update`),
+  streams the output, and re-checks afterward — so updating from a terminal also clears the alert.
+
 ### "Ultracode" is now selectable directly in the Effort dropdown
 - It was only reachable from the Claude-orchestration dialog before. Now **Ultracode** appears as the top
   tier in the **Effort** picker (low · medium · high · xhigh · max · **Ultracode**). It's a synthetic tier:
