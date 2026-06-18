@@ -8,6 +8,13 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Copy button on every message
+- Each message in the Conversation — yours and the agent's — now has a small inline **⧉ Copy** button at
+  its end that copies that message's full text to the clipboard. Added on every rendered message
+  (`append_chat`) and on live-streamed replies when they finish (`assistant_done`, pulling the full text
+  from the turn's stored message). Embedded as real Tk buttons so they work on the read-only transcript.
+  (`_insert_copy_button`, `_copy_message`.)
+
 ### Workers dialog now shows which agents are actually running
 - The "Workers" dialog only listed manual worker *sessions* (usually none), so it never answered "which
   agents are up and running." Added an **Active agents** list at the top: every open agent tab in this

@@ -10498,6 +10498,39 @@ class App:
             moment = datetime.now()
         return moment.strftime("%-I:%M:%S %p")
 
+    def _copy_message(self, text):
+        try:
+            self.win.clipboard_clear()
+            self.win.clipboard_append(text)
+            self.status.set("Message copied to clipboard.")
+        except tk.TclError:
+            pass
+
+    def _insert_copy_button(self, text):
+        """Embed a small inline Copy button at the current end of the chat that
+        copies this message's text. Works on the read-only Text because embedded
+        widgets stay interactive."""
+        if not clean_text(text):
+            return
+        btn = tk.Button(
+            self.chat,
+            text="⧉ Copy",
+            command=lambda t=text: self._copy_message(t),
+            bg=PANEL_ALT,
+            fg=MUTED,
+            activebackground=SIDEBAR_SEL,
+            activeforeground="white",
+            relief="flat",
+            font=("Sans", 8),
+            padx=6,
+            pady=0,
+            cursor="hand2",
+            borderwidth=0,
+            takefocus=0,
+        )
+        self.chat.window_create("end", window=btn)
+        self.chat.insert("end", "\n")
+
     def append_chat(self, speaker, text, tag="assistant", timestamp=None):
         if not text:
             return
@@ -10531,6 +10564,7 @@ class App:
             widget.insert("end", text.rstrip() + "\n\n", tag)
         content_end = widget.index("end-1c")
         self._linkify_chat_range(content_start, content_end)
+        self._insert_copy_button(text)
         widget.tag_raise("sel")
         widget.configure(state="disabled")
         self._finish_chat_append(at_bottom)
@@ -13195,7 +13229,19 @@ class App:
                 widget = self.chat
                 at_bottom = widget.yview()[1] >= 0.995
                 widget.configure(state="normal")
-                widget.insert("end", "\n\n")
+                # Copy button for the just-finished streamed message — pull its full
+                # text from the turn's stored agentMessage so the button copies it all.
+                streamed = ""
+                if self.current_turn:
+                    for it in reversed(self.current_turn.get("items") or []):
+                        if it.get("type") == "agentMessage":
+                            streamed = clean_text(it.get("text"))
+                            break
+                if streamed:
+                    self._insert_copy_button(streamed)
+                    widget.insert("end", "\n")
+                else:
+                    widget.insert("end", "\n\n")
                 widget.configure(state="disabled")
                 self._finish_chat_append(at_bottom)
             self.live_speaker = None
