@@ -17,7 +17,8 @@ current turn). A change is only LIVE after a deploy + the app reloading.
   returns its key; new `_start_local_model`.
 
 ### Tab status colors (yellow = working, green = done)
-- Each agent tab's label now turns **yellow while a turn is running** and **green when it finishes** —
+- Each agent tab's whole box now turns **yellow while a turn is running** and **green when it finishes**
+  (dark text for contrast; the selected tab keeps a bright outline) —
   visible even for background tabs, so you can tell at a glance which agents are working or done without
   switching. The green clears when you view that tab (or when a new turn starts there). (`_tab_status` +
   a per-workspace `tab_done` flag set on `turn_done`, cleared on turn-start and on `switch_workspace`;

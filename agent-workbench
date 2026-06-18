@@ -5290,23 +5290,34 @@ class App:
             workspace = self.workspaces[workspace_id]
             selected = workspace_id == self.active_workspace_id
             label = shorten(self._workspace_label(workspace), maxlen)
-            # Tab color: yellow while working, green when a turn just finished
-            # (clears when you view that tab) — visible even for background tabs.
+            # Whole-tab color: the entire box turns yellow while a turn is working and
+            # green when it just finished (green clears when you view that tab) —
+            # visible even for background tabs. Dark text for contrast on the colors.
             status = self._tab_status(workspace)
-            label_fg = {"working": "#fbbf24", "done": "#22c55e"}.get(status, TEXT)
+            if status == "working":
+                tab_bg, tab_fg, close_fg = "#eab308", "#1c1500", "#7f1d1d"
+            elif status == "done":
+                tab_bg, tab_fg, close_fg = "#22c55e", "#04230f", "#7f1d1d"
+            else:
+                tab_bg = SIDEBAR_SEL if selected else PANEL
+                tab_fg = TEXT
+                close_fg = MUTED
+            # Selected tab gets a bright outline so it's identifiable regardless of color.
             frame = tk.Frame(
                 self.workspace_tabs_frame,
-                bg=SIDEBAR_SEL if selected else PANEL,
+                bg=tab_bg,
+                highlightbackground="#e2e8f0" if selected else tab_bg,
+                highlightthickness=2 if selected else 0,
             )
             frame.pack(side="left", padx=(4, 0), pady=4)
             tk.Button(
                 frame,
                 text=label,
                 command=lambda wid=workspace_id: self.switch_workspace(wid),
-                bg=SIDEBAR_SEL if selected else PANEL,
-                fg=label_fg,
-                activebackground=SIDEBAR_SEL,
-                activeforeground=label_fg if status else TEXT,
+                bg=tab_bg,
+                fg=tab_fg,
+                activebackground=tab_bg,
+                activeforeground=tab_fg,
                 relief="flat",
                 padx=pad_in,
                 pady=5,
@@ -5316,8 +5327,8 @@ class App:
                 frame,
                 text="×",
                 command=lambda wid=workspace_id: self.close_workspace(wid),
-                bg=SIDEBAR_SEL if selected else PANEL,
-                fg=MUTED,
+                bg=tab_bg,
+                fg=close_fg,
                 activebackground="#7f1d1d",
                 activeforeground="white",
                 relief="flat",
