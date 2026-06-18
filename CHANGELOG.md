@@ -8,6 +8,13 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Tab status colors (yellow = working, green = done)
+- Each agent tab's label now turns **yellow while a turn is running** and **green when it finishes** —
+  visible even for background tabs, so you can tell at a glance which agents are working or done without
+  switching. The green clears when you view that tab (or when a new turn starts there). (`_tab_status` +
+  a per-workspace `tab_done` flag set on `turn_done`, cleared on turn-start and on `switch_workspace`;
+  tab render signature now includes status so the color updates live.)
+
 ### Copy button on every message
 - Each message in the Conversation — yours and the agent's — now has a small inline **⧉ Copy** button at
   its end that copies that message's full text to the clipboard. Added on every rendered message

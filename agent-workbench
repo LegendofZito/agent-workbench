@@ -4943,6 +4943,7 @@ class App:
         self._save_active_workspace()
         self._schedule_workspace_config_save(immediate=True)
         self.active_workspace_id = workspace_id
+        self.workspaces[workspace_id]["tab_done"] = False  # viewing it clears the green
         self._restore_workspace(self.workspaces[workspace_id])
         self._update_worker_indicator()
         self._update_queue_indicator()
@@ -5193,6 +5194,15 @@ class App:
         self._workspace_tabs_signature = None  # force a width-aware recompute
         self._render_workspace_tabs()
 
+    def _tab_status(self, workspace):
+        """Tab color state: 'working' (yellow) while a turn runs, 'done' (green)
+        after it finishes until that tab is viewed, else None (default)."""
+        if workspace.get("busy"):
+            return "working"
+        if workspace.get("tab_done"):
+            return "done"
+        return None
+
     def _render_workspace_tabs_now(self):
         if not hasattr(self, "workspace_tabs_frame"):
             return
@@ -5202,6 +5212,7 @@ class App:
                 workspace_id,
                 workspace_id == self.active_workspace_id,
                 self._workspace_label(self.workspaces[workspace_id]),
+                self._tab_status(self.workspaces[workspace_id]),
             )
             for workspace_id in self.workspace_order
             if workspace_id in self.workspaces
@@ -5238,6 +5249,10 @@ class App:
             workspace = self.workspaces[workspace_id]
             selected = workspace_id == self.active_workspace_id
             label = shorten(self._workspace_label(workspace), maxlen)
+            # Tab color: yellow while working, green when a turn just finished
+            # (clears when you view that tab) — visible even for background tabs.
+            status = self._tab_status(workspace)
+            label_fg = {"working": "#fbbf24", "done": "#22c55e"}.get(status, TEXT)
             frame = tk.Frame(
                 self.workspace_tabs_frame,
                 bg=SIDEBAR_SEL if selected else PANEL,
@@ -5248,9 +5263,9 @@ class App:
                 text=label,
                 command=lambda wid=workspace_id: self.switch_workspace(wid),
                 bg=SIDEBAR_SEL if selected else PANEL,
-                fg=TEXT,
+                fg=label_fg,
                 activebackground=SIDEBAR_SEL,
-                activeforeground=TEXT,
+                activeforeground=label_fg if status else TEXT,
                 relief="flat",
                 padx=pad_in,
                 pady=5,
@@ -12548,6 +12563,7 @@ class App:
         )
         workspace["current_turn"] = turn
         workspace["busy"] = True
+        workspace["tab_done"] = False  # new work → yellow, clear any prior green
         now = time.monotonic()
         workspace["turn_started_at"] = now
         workspace["last_event_at"] = now
@@ -12992,6 +13008,7 @@ class App:
                     event.get("error"),
                 )
             workspace["busy"] = False
+            workspace["tab_done"] = True  # finished → green until this tab is viewed
             workspace["turn_started_at"] = 0.0
             workspace["pending_user_input"] = None
             workspace["live_speaker"] = None
@@ -13305,6 +13322,7 @@ class App:
             active_workspace = self.workspaces.get(self.active_workspace_id)
             if active_workspace:
                 active_workspace["turn_started_at"] = 0.0
+                active_workspace["tab_done"] = True  # finished → green (clears on next view)
                 active_workspace["session_context_active"] = False
                 active_workspace["session_context_buffer"] = ""
             self.pending_user_input = None
