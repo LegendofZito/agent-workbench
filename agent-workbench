@@ -4940,8 +4940,9 @@ class App:
             self.input.delete("1.0", "end")
             self.input.insert("1.0", workspace.get("input_text") or "")
             self.input.edit_modified(False)
-            # Restored draft is the undo baseline — Ctrl+Z must never erase it.
-            self.input.edit_reset()
+            # Restored draft has no tracked pastes — Ctrl+Z must never erase it.
+            self._paste_stack = []
+            self._paste_redo = []
         finally:
             self._input_save_suppressed = False
         self._update_attachment_bar()
@@ -5957,9 +5958,6 @@ class App:
             padx=16,
             pady=14,
             font=("Sans", 11),
-            undo=True,           # Ctrl+Z undoes edits incl. pastes
-            autoseparators=True,  # each paste/typing burst is its own undo step
-            maxundo=-1,
         )
         self.input.pack(fill="x", padx=8)
         self.input.bind("<Return>", self.handle_prompt_return)
@@ -5968,6 +5966,8 @@ class App:
         self.input.bind("<Command-Return>", lambda _e: self.send() or "break")
         self.input.bind("<Control-v>", self.paste_into_prompt)
         self.input.bind("<Control-V>", self.paste_into_prompt)
+        self.input.bind("<<Paste>>", self._on_paste_event)
+        self.input.bind("<Button-2>", self._on_paste_event)
         self.input.bind("<Control-z>", self._input_undo)
         self.input.bind("<Control-Z>", self._input_redo)  # Ctrl+Shift+Z = redo
         self.input.bind("<Control-y>", self._input_redo)
@@ -8239,18 +8239,75 @@ class App:
                 self.notebook.select(self.chat_tab)
                 self.input.focus_set()
 
-    def _input_undo(self, _event=None):
+    def _paste_text_marked(self, text):
+        """Insert pasted text and bracket it with marks so Ctrl+Z can later remove
+        EXACTLY this block. Typed text is never tracked — so undo never touches it.
+        Marks: start has 'right' gravity and end has 'left', so characters typed at
+        either boundary fall OUTSIDE the pasted range."""
+        if not text:
+            return
         try:
-            self.input.edit_undo()
+            self.input.delete("sel.first", "sel.last")  # paste-over-selection like normal
         except tk.TclError:
-            pass  # nothing left to undo
+            pass
+        start = self.input.index("insert")
+        self.input.insert("insert", text)
+        end = self.input.index("insert")
+        self._paste_seq = getattr(self, "_paste_seq", 0) + 1
+        sm, em = f"_paste_s{self._paste_seq}", f"_paste_e{self._paste_seq}"
+        self.input.mark_set(sm, start)
+        self.input.mark_gravity(sm, "right")
+        self.input.mark_set(em, end)
+        self.input.mark_gravity(em, "left")
+        if getattr(self, "_paste_stack", None) is None:
+            self._paste_stack = []
+        self._paste_stack.append((sm, em))
+        self.input.see("insert")
+        self.input.edit_modified(True)
+
+    def _on_paste_event(self, _event=None):
+        try:
+            text = self.win.clipboard_get()
+        except tk.TclError:
+            text = ""
+        if text:
+            self._paste_text_marked(text)
+        return "break"
+
+    def _input_undo(self, _event=None):
+        # Undo only removes the most recent PASTE (typed text is never tracked).
+        stack = getattr(self, "_paste_stack", None) or []
+        while stack:
+            sm, em = stack.pop()
+            try:
+                start, end = self.input.index(sm), self.input.index(em)
+            except tk.TclError:
+                continue  # marks already gone
+            try:
+                still_there = self.input.compare(start, "<", end)
+            except tk.TclError:
+                still_there = False
+            if still_there:
+                if getattr(self, "_paste_redo", None) is None:
+                    self._paste_redo = []
+                self._paste_redo.append(self.input.get(start, end))
+                self.input.delete(start, end)
+                self.input.edit_modified(True)
+            for m in (sm, em):
+                try:
+                    self.input.mark_unset(m)
+                except tk.TclError:
+                    pass
+            if still_there:
+                self.input.see("insert")
+                break
         return "break"
 
     def _input_redo(self, _event=None):
-        try:
-            self.input.edit_redo()
-        except tk.TclError:
-            pass  # nothing to redo
+        # Re-insert the last undone paste (re-tracked, so it can be undone again).
+        redo = getattr(self, "_paste_redo", None) or []
+        if redo:
+            self._paste_text_marked(redo.pop())
         return "break"
 
     def _input_select_all(self, _event=None):
@@ -8276,8 +8333,10 @@ class App:
         return "break"
 
     def paste_into_prompt(self, _event=None):
+        # Image paste (Wayland) → attach as a file. Everything else → a MARKED text
+        # paste, so Ctrl+Z can remove the pasted block while leaving typed text alone.
         if not shutil.which("wl-paste") or not os.environ.get("WAYLAND_DISPLAY"):
-            return None
+            return self._on_paste_event()
         try:
             types = subprocess.run(
                 ["wl-paste", "--list-types"],
@@ -8288,7 +8347,7 @@ class App:
                 check=False,
             ).stdout.splitlines()
         except (OSError, subprocess.TimeoutExpired):
-            return None
+            return self._on_paste_event()
         mime_type = next(
             (
                 mime
@@ -8304,7 +8363,7 @@ class App:
             None,
         )
         if not mime_type:
-            return None
+            return self._on_paste_event()
         if not self.current_session:
             self.status.set("Start or open a session before pasting an image.")
             return "break"
@@ -12893,7 +12952,8 @@ class App:
         self._remember_project(self.cwd.get())
         if from_composer:
             self.input.delete("1.0", "end")
-            self.input.edit_reset()  # fresh undo history per message (no resurrecting sent text)
+            self._paste_stack = []  # cleared box → no pastes to undo for the next message
+            self._paste_redo = []
         backend_prompt = prompt_with_authoritative_time(
             prompt_with_attachments(prompt, attachments)
         )

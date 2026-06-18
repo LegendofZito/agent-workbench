@@ -42,11 +42,13 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 - Bound Ctrl+A (and Ctrl+Shift+A) to select-all in the composer (Tk's default Ctrl+A was "go to line
   start"). (`_input_select_all`.)
 
-### Ctrl+Z undo in the prompt box (undo a paste)
-- Enabled undo on the composer (`undo=True`): **Ctrl+Z** removes a paste / reverts edits; **Ctrl+Y** or
-  **Ctrl+Shift+Z** redoes. Guarded the draft: `edit_reset()` after restoring a tab's saved draft (so undo
-  can't erase a restored draft) and after sending (fresh undo history per message). (`_input_undo`,
-  `_input_redo`.)
+### Ctrl+Z undoes only PASTES, never typed text
+- Ctrl+Z in the composer removes the most recent **pasted** block and leaves everything you **typed**
+  intact (Ctrl+Y / Ctrl+Shift+Z re-inserts it). Implemented with our own paste tracking instead of Tk's
+  linear undo: each paste (Ctrl+V, middle-click, or the right-click menu) is bracketed with marks
+  (start "right" gravity, end "left" gravity) so text typed at either boundary stays outside the block;
+  Ctrl+Z deletes that marked range. Typing is never tracked, so it's never undone. Paste tracking resets
+  on draft-restore and on send. (`_paste_text_marked`, `_on_paste_event`, `_input_undo`/`_input_redo`.)
 
 ### New-session dialog lists your local models (one-click Start)
 - Pulling an Ollama model didn't make it appear anywhere to start — you had to go through Add-client →
