@@ -4977,9 +4977,13 @@ class App:
 
         for spec in self.agent_specs:
             agent_key = spec["key"]
-            installed = bool(self._agent_executable(agent_key)) and shutil.which(
-                self._agent_executable(agent_key)
-            )
+            if spec.get("custom"):
+                # Connected custom/local client (Ollama HTTP-backed or a validated
+                # custom CLI) — no system executable to probe; it's ready.
+                installed = True
+            else:
+                exe = self._agent_executable(agent_key)
+                installed = bool(exe) and shutil.which(exe)
             row = tk.Frame(
                 body,
                 bg=PANEL,
@@ -5019,6 +5023,43 @@ class App:
                 cursor="hand2",
                 state="normal" if installed else "disabled",
             ).pack(side="right", padx=10)
+
+        # Local models (Ollama): auto-list installed models that aren't connected
+        # yet, so a pulled model is startable here directly. "Start" connects it and
+        # opens a new tab.
+        ollama_models = self._list_ollama_models()
+        if ollama_models:
+            connected = {clean_text(c.get("model")) for c in self.custom_clients}
+            available = [m for m in ollama_models if f"ollama_chat/{m}" not in connected]
+            if available:
+                tk.Label(
+                    body,
+                    text="Local models (Ollama) — free, runs on this machine",
+                    bg=BG,
+                    fg=MUTED,
+                    font=("Sans", 9, "bold"),
+                    anchor="w",
+                ).pack(fill="x", pady=(14, 2))
+                for model in available:
+                    row = tk.Frame(body, bg=PANEL, highlightbackground="#2d3b49", highlightthickness=1)
+                    row.pack(fill="x", pady=4)
+                    info = tk.Frame(row, bg=PANEL)
+                    info.pack(side="left", fill="x", expand=True, padx=12, pady=10)
+                    tk.Label(info, text=model, bg=PANEL, fg=TEXT, font=("Sans", 10, "bold")).pack(anchor="w")
+                    tk.Label(info, text="Local · ready", bg=PANEL, fg="#86efac").pack(anchor="w")
+                    tk.Button(
+                        row,
+                        text="Start",
+                        command=lambda m=model: self._start_local_model(m, dialog),
+                        bg="#10b981",
+                        fg="white",
+                        activebackground=SIDEBAR_SEL,
+                        activeforeground="white",
+                        relief="flat",
+                        padx=10,
+                        pady=5,
+                        cursor="hand2",
+                    ).pack(side="right", padx=10)
 
         dialog.bind("<Escape>", lambda _e: dialog.destroy())
         dialog.update_idletasks()
@@ -9139,7 +9180,20 @@ class App:
             return None
 
     def connect_ollama_model(self, model, parent):
-        """One-click connect a local Ollama model with full streaming support."""
+        """One-click connect a local Ollama model with full streaming support.
+        Idempotent — if this model is already connected, reuse it. Returns the key."""
+        existing = next(
+            (c for c in self.custom_clients
+             if clean_text(c.get("model")) == f"ollama_chat/{model}"),
+            None,
+        )
+        if existing:
+            key = existing["key"]
+            self.active_agent.set(key)
+            if parent is not None:
+                parent.destroy()
+            self.on_agent_changed()
+            return key
         base = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-") or "ollama"
         key = "ollama-" + base
         suffix = 2
@@ -9167,6 +9221,14 @@ class App:
             parent.destroy()
         self.on_agent_changed()
         self.status.set(f"Added {model}. Multi-turn streaming via Ollama.")
+        return key
+
+    def _start_local_model(self, model, dialog=None):
+        """Connect (or reuse) a local Ollama model and open it in a NEW tab."""
+        key = self.connect_ollama_model(model, None)
+        if dialog is not None and dialog.winfo_exists():
+            dialog.destroy()
+        self.new_workspace(key)
 
     def remove_custom_client(self, key, parent):
         if self.busy and self.active_agent.get() == key:

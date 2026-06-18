@@ -8,6 +8,14 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### New-session dialog lists your local models (one-click Start)
+- Pulling an Ollama model didn't make it appear anywhere to start — you had to go through Add-client →
+  Search → Connect. The **New session** dialog now auto-lists installed Ollama models under "Local models
+  (Ollama)", each with a **Start** button that connects it and opens a new tab. Also fixed the dialog's
+  "installed" check so a connected local model shows **Ready** instead of "Not installed" (it was running
+  the same wrong `shutil.which` gate that affected sends). `connect_ollama_model` is now idempotent and
+  returns its key; new `_start_local_model`.
+
 ### Tab status colors (yellow = working, green = done)
 - Each agent tab's label now turns **yellow while a turn is running** and **green when it finishes** —
   visible even for background tabs, so you can tell at a glance which agents are working or done without
