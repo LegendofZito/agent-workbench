@@ -8,6 +8,12 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Ctrl+Z undo in the prompt box (undo a paste)
+- Enabled undo on the composer (`undo=True`): **Ctrl+Z** removes a paste / reverts edits; **Ctrl+Y** or
+  **Ctrl+Shift+Z** redoes. Guarded the draft: `edit_reset()` after restoring a tab's saved draft (so undo
+  can't erase a restored draft) and after sending (fresh undo history per message). (`_input_undo`,
+  `_input_redo`.)
+
 ### New-session dialog lists your local models (one-click Start)
 - Pulling an Ollama model didn't make it appear anywhere to start — you had to go through Add-client →
   Search → Connect. The **New session** dialog now auto-lists installed Ollama models under "Local models
