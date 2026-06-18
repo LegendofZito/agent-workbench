@@ -40,6 +40,11 @@ install -d "${config_home}/agent-workbench"
 install -m 0755 "${root}/agent-workbench" \
   "${HOME}/.local/bin/agent-workbench"
 ln -sfn agent-workbench "${HOME}/.local/bin/codex-conversation-viewer"
+# Local-LLM delegation MCP server (free token-saving sub-agent over Ollama).
+if [[ -f "${root}/local_delegate_server.py" ]]; then
+  install -m 0644 "${root}/local_delegate_server.py" \
+    "${config_home}/agent-workbench/local_delegate_server.py"
+fi
 install -m 0644 "${root}/agent-workbench.desktop" \
   "${data_home}/applications/agent-workbench.desktop"
 rm -f "${data_home}/applications/codex-conversation-viewer.desktop"
