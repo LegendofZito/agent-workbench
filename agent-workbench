@@ -391,6 +391,24 @@ CLAUDE_SMART_AGENTS = {
 CLAUDE_SMART_AGENTS_JSON = json.dumps(CLAUDE_SMART_AGENTS, separators=(",", ":"))
 
 
+def session_charter_prompt(charter):
+    """Wrap the operator's per-session scope text into a system-prompt block that
+    makes the agent refuse / push back on clearly off-scope requests instead of
+    silently carrying them out (the Pig Farm ↔ Agent Workbench mix-up)."""
+    return (
+        "SESSION SCOPE / CHARTER — set by the operator for THIS session:\n"
+        f"{charter}\n\n"
+        "If a request clearly falls OUTSIDE this scope (e.g. it belongs to a "
+        "different project or session), do NOT silently carry it out. If a human "
+        "is present, stop and push back briefly — e.g. \"That looks outside this "
+        "session's scope; this may be the wrong chat. Confirm and I'll proceed.\" "
+        "If you are running unattended/autonomously, STOP and note the mismatch "
+        "rather than acting. A staged handoff that inherited an off-scope objective "
+        "still counts as off-scope. Only push back when the mismatch is clear — "
+        "don't nitpick borderline or supporting work."
+    )
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -2885,6 +2903,10 @@ class SessionStore:
         )
         session["handoff_context"] = packet
         session["handoff_from"] = source.get("id")
+        # Carry the scope charter down the handoff chain so the whole lineage
+        # (e.g. Pig Farm 7→8→9) stays scoped to the same project.
+        if clean_text(source.get("charter")):
+            session["charter"] = source["charter"]
         self.save(session)
         return session
 
@@ -3983,15 +4005,23 @@ class ClaudeBackend(StreamCliBackend):
             if effort == "Ultracode":
                 orchestration_mode = "ultra"
                 effort = "max"
+            # Build the appended system prompt: orchestration policy (smart/ultra)
+            # + the per-session scope charter (if set). Either may be empty; the
+            # charter applies in EVERY mode, including "direct".
+            system_prompt_parts = []
             if orchestration_mode in ("smart", "ultra"):
-                cmd += [
-                    "--append-system-prompt",
+                system_prompt_parts.append(
                     CLAUDE_ULTRACODE_ORCHESTRATION_PROMPT
                     if orchestration_mode == "ultra"
-                    else CLAUDE_SMART_ORCHESTRATION_PROMPT,
-                    "--agents",
-                    CLAUDE_SMART_AGENTS_JSON,
-                ]
+                    else CLAUDE_SMART_ORCHESTRATION_PROMPT
+                )
+            charter = clean_text(session.get("charter"))
+            if charter:
+                system_prompt_parts.append(session_charter_prompt(charter))
+            if system_prompt_parts:
+                cmd += ["--append-system-prompt", "\n\n".join(system_prompt_parts)]
+            if orchestration_mode in ("smart", "ultra"):
+                cmd += ["--agents", CLAUDE_SMART_AGENTS_JSON]
                 # Offer the free local-LLM delegation tool (mcp__local-delegate__
                 # delegate_local). Added on top of any existing MCP config (no
                 # --strict), and skipped if the server isn't deployed. A failing
@@ -11727,6 +11757,10 @@ class App:
             label="Claude orchestration...",
             command=self.open_claude_orchestration_dialog,
         )
+        menu.add_command(
+            label="Session scope / charter…",
+            command=self.open_session_charter_dialog,
+        )
         menu.add_separator()
         menu.add_command(label="Handoff target...", command=self.open_handoff_dialog)
         menu.add_command(label="Auto handoff sequence...", command=self.open_handoff_options_dialog)
@@ -11741,6 +11775,76 @@ class App:
             command=self.open_client_updates_dialog,
         )
         menu.tk_popup(self.options_btn.winfo_rootx(), self.options_btn.winfo_rooty() + self.options_btn.winfo_height())
+
+    def open_session_charter_dialog(self):
+        """Edit the per-session scope charter for the active session (Claude)."""
+        if not self.current_session:
+            messagebox.showinfo("Session scope", "Open a session first.", parent=self.win)
+            return
+        session = self.current_session
+        dialog = tk.Toplevel(self.win)
+        dialog.title("Session scope / charter")
+        dialog.configure(bg=BG)
+        dialog.transient(self.win)
+        dialog.resizable(True, True)
+        dialog.grab_set()
+        body = tk.Frame(dialog, bg=BG, padx=18, pady=16)
+        body.pack(fill="both", expand=True)
+        tk.Label(
+            body,
+            text=f"Scope charter — {clean_text(session.get('title')) or 'this session'}",
+            bg=BG, fg=TEXT, font=("Sans", 14, "bold"), anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            body,
+            text=(
+                "Describe what THIS session is for. If a request clearly falls outside it, the agent "
+                "pushes back (\"this isn't the right chat for that\") and asks before proceeding — and "
+                "STOPS instead of acting when running unattended. Carries forward through handoffs. "
+                "Leave blank to disable (no effect). Applies to Claude sessions."
+            ),
+            bg=BG, fg=MUTED, justify="left", wraplength=560, anchor="w",
+        ).pack(fill="x", pady=(4, 10))
+        text = tk.Text(
+            body, height=7, bg=PANEL_ALT, fg=TEXT, insertbackground=TEXT,
+            relief="flat", wrap="word", padx=10, pady=8, font=("Sans", 10),
+        )
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", clean_text(session.get("charter")))
+        tk.Label(
+            body,
+            text=("Example: \"Pig Farm trading session — the live trading dashboard and strategy only. "
+                  "Do NOT edit Agent Workbench or other projects.\""),
+            bg=BG, fg=MUTED, font=("Sans", 8), justify="left", wraplength=560, anchor="w",
+        ).pack(fill="x", pady=(6, 0))
+
+        def save():
+            value = clean_text(text.get("1.0", "end"))
+            if value:
+                session["charter"] = value
+            else:
+                session.pop("charter", None)
+            if session.get("origin", "local") == "local":
+                self.store.save(session)
+            self._persist_current()
+            self.status.set(
+                "Session scope charter saved (takes effect on the next turn)."
+                if value else "Session scope charter cleared."
+            )
+            dialog.destroy()
+
+        btn_row = tk.Frame(body, bg=BG)
+        btn_row.pack(fill="x", pady=(12, 0))
+        tk.Button(
+            btn_row, text="Save", command=save, bg=ACCENT, fg="white",
+            activebackground="#6aa0ff", activeforeground="white", relief="flat",
+            padx=14, pady=6, cursor="hand2",
+        ).pack(side="right")
+        tk.Button(
+            btn_row, text="Cancel", command=dialog.destroy, bg=PANEL_ALT, fg=TEXT,
+            activebackground=SIDEBAR_SEL, activeforeground=TEXT, relief="flat",
+            padx=14, pady=6, cursor="hand2",
+        ).pack(side="right", padx=(0, 8))
 
     # ------------------------------------------------------------------
     # Client update watcher

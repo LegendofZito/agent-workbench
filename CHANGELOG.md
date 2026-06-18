@@ -8,6 +8,17 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ## 2026-06-18
 
+### Per-session scope charter (push back on wrong-chat requests)
+- New **Options → "Session scope / charter…"**: describe what a session is for (e.g. "Pig Farm trading
+  only — do NOT edit Agent Workbench"). It's injected into that session's system prompt so the agent
+  pushes back on clearly off-scope requests ("this isn't the right chat for that") and asks before
+  proceeding — and **STOPS instead of acting when running unattended**, including when a handoff inherited
+  an off-scope objective. Opt-in: blank = no effect (zero behavior change until set). The charter **carries
+  forward through handoffs** so a whole lineage (Pig Farm 7→8→9) stays scoped. Applies to Claude sessions;
+  works in every orchestration mode (smart/ultra/direct). (`session_charter_prompt`, `session["charter"]`,
+  `open_session_charter_dialog`.) Soft guardrail / smoke detector, not a hard lock — pairs well with giving
+  sessions their real project cwd.
+
 ### Usage popover no longer clipped; usage auto-shows on every tab
 - **Cut-off fixed:** the limits popover opened with its left edge pinned to the badge's x; since the badge
   sits near the right of the window, it ran off the right screen edge and clipped the reset times. It's now
