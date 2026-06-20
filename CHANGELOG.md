@@ -6,6 +6,20 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-20 (Uniform tab bar for spam-close; session list in-place update)
+
+- **Tab bar uniform width** — all workspace tabs are now the same pixel width (capped
+  between 100–220 px, divided equally across available space). Each tab frame uses
+  `pack_propagate(False)` to enforce its fixed width. The × close button is packed
+  `side="right"` and the label button fills the remaining space with `fill="x", expand=True`.
+  When a tab closes, the next tab's × lands exactly where your cursor already is — you can
+  spam-click to close multiple tabs without moving the mouse.
+- **Session list in-place update** — `_render_session_list` now only writes new label text
+  to individual items (`delete(i)` + `insert(i, new_label)`) when the list size is unchanged,
+  instead of wiping and rebuilding the entire Listbox. This eliminates the flash/jump caused
+  by the highlight temporarily disappearing whenever a session label timestamp updated. A full
+  rebuild (count changed) still happens but restores scroll position via `after_idle`.
+
 ## 2026-06-19 (AWB dialogs no longer float above other apps)
 
 - **Removed `-topmost True` from "New agent tab" and "Add agent client" dialogs** — both

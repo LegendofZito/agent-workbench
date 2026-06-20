@@ -6980,6 +6980,7 @@ class App:
         n = len(order)
         pad_in = 10
         maxlen = 40
+        tab_width = 160  # uniform px width for every tab (spam-close alignment)
         if n:
             try:
                 avail = self.workspace_tabs_frame.winfo_width()
@@ -6988,14 +6989,13 @@ class App:
             if avail <= 1:
                 avail = max(600, self.win.winfo_width() - 80)
             self._last_win_width = self.win.winfo_width()
-            plus_px = 70
-            tab_overhead_px = 52
+            plus_px = 40
+            # Divide available space equally so all tabs are the same width.
+            # Clamp between 100 and 220 px so very few/many tabs still look ok.
+            tab_width = max(100, min(220, (avail - plus_px) // n))
             avg_char_px = 7
-            label_budget = avail - plus_px - n * tab_overhead_px
-            if label_budget > 0:
-                maxlen = max(6, min(40, int((label_budget / n) / avg_char_px)))
-            else:
-                maxlen = 6
+            close_px = 24
+            maxlen = max(4, int((tab_width - pad_in * 2 - close_px) / avg_char_px))
         signature = tuple(
             (
                 workspace_id,
@@ -7049,20 +7049,13 @@ class App:
             tab = widgets.get(workspace_id)
             is_new = not tab
             if is_new:
-                frame = tk.Frame(self.workspace_tabs_frame, bg=tab_bg)
+                # Fixed-width frame: pack_propagate(False) locks it to tab_width so
+                # all tabs are the same size. × is packed RIGHT so it always lands
+                # at the same pixel — closing one tab puts the next tab's × exactly
+                # where the cursor already is (spam-close without moving the mouse).
+                frame = tk.Frame(self.workspace_tabs_frame, bg=tab_bg, width=tab_width)
+                frame.pack_propagate(False)
                 self._bind_tab_wheel_handlers(frame, self._on_workspace_tab_horizontal_wheel)
-                tab_button = tk.Button(
-                    frame,
-                    command=lambda wid=workspace_id: self.switch_workspace(wid),
-                    relief="flat",
-                    borderwidth=0,
-                    highlightthickness=0,
-                    padx=pad_in,
-                    pady=5,
-                    cursor="hand2",
-                )
-                tab_button.pack(side="left")
-                self._bind_tab_wheel_handlers(tab_button, self._on_workspace_tab_horizontal_wheel)
                 close_button = tk.Button(
                     frame,
                     text="×",
@@ -7076,8 +7069,21 @@ class App:
                     pady=5,
                     cursor="hand2",
                 )
-                close_button.pack(side="left")
+                close_button.pack(side="right")
                 self._bind_tab_wheel_handlers(close_button, self._on_workspace_tab_horizontal_wheel)
+                tab_button = tk.Button(
+                    frame,
+                    command=lambda wid=workspace_id: self.switch_workspace(wid),
+                    relief="flat",
+                    borderwidth=0,
+                    highlightthickness=0,
+                    padx=pad_in,
+                    pady=5,
+                    cursor="hand2",
+                    anchor="w",
+                )
+                tab_button.pack(side="left", fill="x", expand=True)
+                self._bind_tab_wheel_handlers(tab_button, self._on_workspace_tab_horizontal_wheel)
                 tab = {"frame": frame, "button": tab_button, "close": close_button}
                 widgets[workspace_id] = tab
 
@@ -7091,6 +7097,7 @@ class App:
                     pass  # new frames were never packed; ignore and fall through to pack()
                 tab["frame"].configure(
                     bg=tab_bg,
+                    width=tab_width,
                     highlightbackground="#e2e8f0" if selected else tab_bg,
                     highlightthickness=2 if selected else 0,
                 )
@@ -7110,6 +7117,7 @@ class App:
                 try:
                     tab["frame"].configure(
                         bg=tab_bg,
+                        width=tab_width,
                         highlightbackground="#e2e8f0" if selected else tab_bg,
                         highlightthickness=2 if selected else 0,
                     )
@@ -13039,20 +13047,29 @@ class App:
             self._render_recent_sessions()
             return
         if new_labels != current_labels:
-            # Content changed — preserve scroll, rebuild, restore scroll.
-            try:
-                scroll_top = self.session_list.yview()[0]
-            except tk.TclError:
-                scroll_top = 0.0
-            self.session_list.delete(0, "end")
-            for label in new_labels:
-                self.session_list.insert("end", label)
-            # Defer scroll restore until after Tkinter finishes layout — calling
-            # yview_moveto synchronously right after insert() lands before the
-            # Listbox has calculated item positions, so the scroll doesn't stick.
-            _st = scroll_top
-            self.session_list.after_idle(lambda v=_st: self.session_list.yview_moveto(v))
-        # Move highlight to the active session — no content change, no scroll jump.
+            if len(new_labels) == len(current_labels):
+                # Same number of sessions — only labels changed (e.g. timestamp
+                # update after opening a session).  Update each changed item in
+                # place so the list is never wiped and scroll stays put.
+                for i, (nl, cl) in enumerate(zip(new_labels, current_labels)):
+                    if nl != cl:
+                        self.session_list.delete(i)
+                        self.session_list.insert(i, nl)
+            else:
+                # Session count changed (added or removed) — full rebuild.
+                # Defer scroll restore via after_idle so Tk finishes layout first.
+                try:
+                    scroll_top = self.session_list.yview()[0]
+                except tk.TclError:
+                    scroll_top = 0.0
+                self.session_list.delete(0, "end")
+                for label in new_labels:
+                    self.session_list.insert("end", label)
+                _st = scroll_top
+                self.session_list.after_idle(
+                    lambda v=_st: self.session_list.yview_moveto(v)
+                )
+        # Move highlight to the active session — no list rebuild, no scroll jump.
         if self.visible_sessions:
             self.session_list.selection_clear(0, "end")
             selected_idx = next(
