@@ -13024,67 +13024,98 @@ class App:
             return False
         return True
 
+    # ------------------------------------------------------------------
+    # SESSION LIST — rebuilt from scratch on one hard rule:
+    # a session NEVER changes position on its own. Rows move ONLY when the
+    # user presses Organize or the ↑/↓ arrows. Clicking a session moves the
+    # highlight and nothing else. Scrolling is the listbox's own job.
+    # The order is a DURABLE, APPEND-ONLY list of session ids per agent. New
+    # sessions are added once (at the top); ids are removed only when a session
+    # is actually deleted — never on render. updated_at has zero influence on
+    # the order of an already-known session.
+    # ------------------------------------------------------------------
+
+    def _session_order_key(self):
+        # AGENT ONLY — never cwd. The picker shows every local session for the
+        # active agent regardless of directory; a cwd in the key let opening a
+        # session from another project switch buckets and re-sort the whole list.
+        return self.active_agent.get()
+
+    def _ordered_picker_sessions(self):
+        """The picker's sessions in their durable, append-only order.
+
+        Returns the list of session dicts to display. The stored order is the
+        single source of truth for position. We only ever ADD newly-seen ids
+        (at the top, newest first) — we NEVER drop an id here. A session that
+        momentarily isn't loaded (e.g. cwd-scoped terminal history) keeps its
+        slot and slides right back into it instead of resurfacing as "new" and
+        jumping to the top, which was the last reordering bug.
+        """
+        key = self._session_order_key()
+        stored = list(self.session_order.get(key, []))
+        stored_set = set(stored)
+        by_id = {
+            s.get("id"): s
+            for s in self.sessions
+            if s.get("id") and self._is_picker_session(s)
+        }
+        new_ids = [sid for sid in by_id if sid not in stored_set]
+        new_ids.sort(key=lambda sid: by_id[sid].get("updated_at") or "", reverse=True)
+        if new_ids:
+            stored = new_ids + stored
+            self.session_order[key] = stored
+            self.config["session_order"] = self.session_order
+            save_json(CONFIG_FILE, self.config)
+        return [by_id[sid] for sid in stored if sid in by_id]
+
+    # Back-compat alias: a few callers still reorder via this name.
+    def _apply_stable_session_order(self, sessions):
+        return self._ordered_picker_sessions()
+
     def _render_session_list(self):
         self._hide_session_tooltip()
         selected_id = self.current_session.get("id") if self.current_session else None
         query = clean_text(self.session_filter.get()).lower()
-        # The picker shows focused Workbench sessions plus connected client
-        # history. Worker/child sessions live in the per-session Spawned tab.
-        self.visible_sessions = [
-            s for s in self.sessions if self._is_picker_session(s)
-        ]
-        # Stable order: each session holds its slot. A brand-new session lands at
-        # the TOP and pushes the rest down; merely opening/touching a session never
-        # reorders it. The ↑/↓ buttons and the Organize button rewrite this order.
-        self.visible_sessions = self._apply_stable_session_order(self.visible_sessions)
-        if query:
-            self.visible_sessions = [
-                session
-                for session in self.visible_sessions
-                if query in session_search_blob(session, self._session_alias(session))
-            ]
 
-        # Identity of the rows we're about to show. A row only ever moves or
-        # repaints when the SET, ORDER, or TITLE of sessions changes. Re-opening a
-        # session merely bumps its updated_at (its "HH:MM" prefix), which must NOT
-        # touch the list at all — only the highlight moves. So we compare by id +
-        # title, never by the volatile timestamp label.
-        new_ids = [s.get("id") for s in self.visible_sessions]
-        new_titles = [self._display_session_title(s) for s in self.visible_sessions]
-        new_labels = [self._session_list_label(s) for s in self.visible_sessions]
-        prev_ids = getattr(self, "_rendered_session_ids", [])
+        ordered = self._ordered_picker_sessions()
+        if query:
+            ordered = [
+                s for s in ordered
+                if query in session_search_blob(s, self._session_alias(s))
+            ]
+        self.visible_sessions = ordered
+
+        # Target rows. Compare by id (position) and title (text) — NEVER by the
+        # volatile "HH:MM" timestamp, so a re-open or a poll touching updated_at
+        # leaves every row untouched and only the highlight moves.
+        new_ids = [s.get("id") for s in ordered]
+        new_titles = [self._display_session_title(s) for s in ordered]
+        new_labels = [self._session_list_label(s) for s in ordered]
+        prev_ids = getattr(self, "_rendered_session_ids", None)
         prev_titles = getattr(self, "_rendered_session_titles", [])
         try:
-            current_labels = list(self.session_list.get(0, "end"))
+            current_count = self.session_list.size()
         except tk.TclError:
-            current_labels = []
+            current_count = 0
 
-        # Guard: skip renders that would wipe the list to empty while the UI already
-        # shows sessions. This happens during new-tab init: _create_workspace gives
-        # the workspace sessions=[], _restore_workspace sets self.sessions=[] and
-        # calls _render_session_list, which would blank the list — then sessions are
-        # loaded and a second render fills it back in. The intermediate blank caused
-        # the visible "list wipe + jump" on every session click.
-        if not new_ids and current_labels:
+        # Guard: a transient empty list (mid-reload, no active filter) must not
+        # wipe a populated picker.
+        if not new_ids and current_count and not query:
             self._highlight_session(selected_id)
             self._render_recent_sessions()
             return
 
-        same_rows = (
-            new_ids == prev_ids and len(current_labels) == len(new_labels)
-        )
-        if same_rows:
-            # Same sessions in the same order. Repaint ONLY rows whose title
-            # actually changed (a rename). A plain re-open changed nothing here,
-            # so the listbox is left completely untouched — no flicker, no jump.
-            for i in range(len(new_ids)):
-                if i >= len(prev_titles) or new_titles[i] != prev_titles[i]:
+        if new_ids == prev_ids and current_count == len(new_ids):
+            # Identical row sequence (the click case). Touch only rows whose
+            # TITLE changed (a rename); leave everything else exactly as-is so
+            # there is no flicker, no scroll change, no movement.
+            for i, title in enumerate(new_titles):
+                if i >= len(prev_titles) or prev_titles[i] != title:
                     self.session_list.delete(i)
                     self.session_list.insert(i, new_labels[i])
         else:
-            # Real change (sessions added/removed/reordered, or agent switch).
-            # Full rebuild; defer scroll restore via after_idle so Tk finishes
-            # layout first.
+            # Membership genuinely changed (new/deleted session, agent switch,
+            # filter). Rebuild, preserving the scroll position.
             try:
                 scroll_top = self.session_list.yview()[0]
             except tk.TclError:
@@ -13103,62 +13134,22 @@ class App:
         self._render_recent_sessions()
 
     def _highlight_session(self, selected_id):
-        """Move the selection highlight to `selected_id` without touching any rows.
-        If that session isn't in the visible list (e.g. it belongs to a different
-        agent), highlight nothing rather than defaulting to row 0 — defaulting to 0
-        is what made an unrelated top row flash selected during tab switches."""
-        self.session_list.selection_clear(0, "end")
+        """Move the selection highlight only — never touch a row. If the active
+        session isn't visible (different agent, or filtered out), highlight
+        nothing rather than defaulting to row 0."""
+        try:
+            self.session_list.selection_clear(0, "end")
+        except tk.TclError:
+            return
         if not self.visible_sessions or selected_id is None:
             return
         idx = next(
-            (
-                i
-                for i, session in enumerate(self.visible_sessions)
-                if session.get("id") == selected_id
-            ),
+            (i for i, s in enumerate(self.visible_sessions)
+             if s.get("id") == selected_id),
             None,
         )
         if idx is not None:
             self.session_list.selection_set(idx)
-
-    def _session_order_key(self):
-        # Keyed by AGENT ONLY — never cwd. The picker shows every local session for
-        # the active agent regardless of working directory, so a cwd in the key meant
-        # opening a session from a different project switched the order bucket and
-        # re-sorted the whole list by timestamp. That was the "sessions jump around on
-        # click" bug. One order per agent → the list is static; clicking never moves it.
-        return self.active_agent.get()
-
-    def _apply_stable_session_order(self, sessions):
-        """Return picker sessions in their remembered order. Sessions already known
-        keep their saved slot; sessions not seen before are inserted at the TOP
-        (newest first), so a brand-new session pushes the rest down but nothing
-        reorders just because it was opened. Dead ids are dropped. The merged order
-        is persisted only when it actually changed (no disk churn on every render)."""
-        key = self._session_order_key()
-        stored = list(self.session_order.get(key, []))
-        stored_set = set(stored)
-        by_id = {s.get("id"): s for s in sessions if s.get("id")}
-        ordered_ids = []
-        seen = set()
-        # Brand-new sessions (never ordered before) go on top, newest first.
-        fresh = [
-            s for s in sessions if s.get("id") and s.get("id") not in stored_set
-        ]
-        fresh.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
-        for s in fresh:
-            ordered_ids.append(s.get("id"))
-            seen.add(s.get("id"))
-        # Then everything previously known, in its saved order.
-        for sid in stored:
-            if sid in by_id and sid not in seen:
-                ordered_ids.append(sid)
-                seen.add(sid)
-        if ordered_ids != stored:
-            self.session_order[key] = ordered_ids
-            self.config["session_order"] = self.session_order
-            save_json(CONFIG_FILE, self.config)
-        return [by_id[sid] for sid in ordered_ids]
 
     def _open_organize_menu(self):
         """Drop-down for the Organize button: sort or bulk-delete sessions."""
@@ -13376,15 +13367,23 @@ class App:
         target = index + direction
         if target < 0 or target >= len(self.visible_sessions):
             return
-        ordered = [session.get("id") for session in self.visible_sessions]
-        ordered[index], ordered[target] = ordered[target], ordered[index]
-        self.session_order[self._session_order_key()] = ordered
+        # Swap the two ids WITHIN the full durable order so unloaded ids (e.g.
+        # cwd-scoped terminal history not currently present) keep their slots.
+        moved_id = self.visible_sessions[index].get("id")
+        other_id = self.visible_sessions[target].get("id")
+        key = self._session_order_key()
+        stored = list(self.session_order.get(key, []))
+        try:
+            i, j = stored.index(moved_id), stored.index(other_id)
+        except ValueError:
+            return
+        stored[i], stored[j] = stored[j], stored[i]
+        self.session_order[key] = stored
         self.config["session_order"] = self.session_order
         save_json(CONFIG_FILE, self.config)
-        selected_id = ordered[target]
         self._render_session_list()
         for row, session in enumerate(self.visible_sessions):
-            if session.get("id") == selected_id:
+            if session.get("id") == moved_id:
                 self.session_list.selection_clear(0, "end")
                 self.session_list.selection_set(row)
                 self.session_list.see(row)
