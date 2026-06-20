@@ -11847,30 +11847,9 @@ class App:
             activestyle="none",
             height=2,
         )
-        self.recent_session_list.pack(side="left", fill="x", expand=True)
+        self.recent_session_list.pack(fill="x", expand=True)
         self.recent_session_list.bind("<<ListboxSelect>>", lambda _e: self._select_recent_session())
-        def _recent_wheel(event):
-            if self._modal_scroll_lock > 0:
-                return "break"
-            step = -1 if (getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0) else 1
-            self.recent_session_list.yview_scroll(step, "units")
-            return "break"
-        def _grab_recent_wheel(_e=None):
-            if self._modal_scroll_lock > 0:
-                return
-            for _s in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                self.recent_session_list.bind_all(_s, _recent_wheel)
-        def _release_recent_wheel(_e=None):
-            for _s in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                self.recent_session_list.unbind_all(_s)
-        self.recent_session_list.bind("<Enter>", _grab_recent_wheel)
-        self.recent_session_list.bind("<Leave>", _release_recent_wheel)
-        self.recent_session_list.bind("<MouseWheel>", _recent_wheel)
-        self.recent_session_list.bind("<Button-4>", _recent_wheel)
-        self.recent_session_list.bind("<Button-5>", _recent_wheel)
-        recent_scroll = tk.Scrollbar(recent_list_frame, command=self.recent_session_list.yview)
-        recent_scroll.pack(side="right", fill="y")
-        self.recent_session_list.configure(yscrollcommand=recent_scroll.set)
+        # Recent list is always exactly 2 items (height=2) — no scrollbar needed.
         self._recent_sessions = []
 
         sess_frame = tk.Frame(
@@ -13046,15 +13025,21 @@ class App:
                 if query in session_search_blob(session, self._session_alias(session))
             ]
         new_labels = [self._session_list_label(s) for s in self.visible_sessions]
-        # Only delete/re-insert when the list content actually changed.  The vast
-        # majority of _render_session_list calls are just selection updates — doing
-        # delete+insert every time caused a blank-list flash and a scroll-position
-        # jump on every call (called very frequently: turn start/end, tab switch, etc).
         try:
             current_labels = list(self.session_list.get(0, "end"))
         except tk.TclError:
             current_labels = []
+        # Guard: skip renders that would wipe the list to empty while the UI already
+        # shows sessions.  This happens during new-tab init: _create_workspace gives
+        # the workspace sessions=[], _restore_workspace sets self.sessions=[] and calls
+        # _render_session_list, which would blank the list — then sessions are loaded
+        # and a second render fills it back in.  The intermediate blank causes the
+        # visible "list wipe + jump" the user sees on every session click.
+        if not new_labels and current_labels:
+            self._render_recent_sessions()
+            return
         if new_labels != current_labels:
+            # Content changed — preserve scroll, rebuild, restore scroll.
             try:
                 scroll_top = self.session_list.yview()[0]
             except tk.TclError:
@@ -13062,10 +13047,8 @@ class App:
             self.session_list.delete(0, "end")
             for label in new_labels:
                 self.session_list.insert("end", label)
-            need_scroll_restore = True
-        else:
-            scroll_top = 0.0
-            need_scroll_restore = False
+            self.session_list.yview_moveto(scroll_top)
+        # Move highlight to the active session — no content change, no scroll jump.
         if self.visible_sessions:
             self.session_list.selection_clear(0, "end")
             selected_idx = next(
@@ -13077,8 +13060,6 @@ class App:
                 0,
             )
             self.session_list.selection_set(selected_idx)
-            if need_scroll_restore:
-                self.session_list.yview_moveto(scroll_top)
         self._render_recent_sessions()
 
     def _session_order_key(self):
