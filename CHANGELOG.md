@@ -6,6 +6,16 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-20 (Recent box no longer blinks; dead-code audit)
+
+- **Recent sessions box stopped flashing white on click** — `_render_recent_sessions`
+  did a blanket `delete(0,end)` + reinsert on every render. Now it diffs and only
+  rewrites rows whose label actually changed (usually none on a click), so no blink.
+- **Dead-code audit (AST-based).** Verified the whole file has no duplicate/shadowed
+  method definitions and no unused imports. Removed 3 functions that were defined but
+  never referenced anywhere: `_active_model_alias`, `_schedule_project_state_indicator`,
+  and the unused `_apply_stable_session_order` back-compat alias.
+
 ## 2026-06-20 (Removed the "clicking a session floats it to the top" rule)
 
 - **`open_session` no longer bumps `updated_at` on open.** It used to run

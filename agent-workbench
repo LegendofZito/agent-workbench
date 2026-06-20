@@ -9754,17 +9754,6 @@ class App:
         dialog._refresh_queue_render = render_queue
         render_queue()
 
-    def _active_model_alias(self, workspace):
-        agent = clean_text(workspace.get("agent")) or clean_text(self.active_agent.get())
-        if agent == "claude":
-            live = clean_text(workspace.get("live_model")) or clean_text(
-                (workspace.get("current_session") or {}).get("backend", {}).get("model") or ""
-            )
-            alias = claude_model_alias(live).title()
-            return alias if alias != "Default" else "Claude"
-        spec = self._agent_spec(agent)
-        return clean_text(spec.get("label")) or agent.title()
-
     def _working_model_effort_label(self, workspace=None):
         workspace = workspace or self.workspaces.get(self.active_workspace_id) or {}
         agent = clean_text(workspace.get("agent")) or clean_text(self.active_agent.get())
@@ -10876,13 +10865,6 @@ class App:
         self.project_state_text.set(label)
         if hasattr(self, "project_state_btn"):
             self.project_state_btn.configure(bg=bg, fg=fg)
-
-    def _schedule_project_state_indicator(self, session=None):
-        snapshot = deepcopy(session) if session else None
-        try:
-            self.win.after(0, lambda s=snapshot: self._update_project_state_indicator(s))
-        except tk.TclError:
-            pass
 
     def update_project_state_file(self, session=None, quiet=False, use_local_llm=False):
         session = session or self.current_session
@@ -13068,10 +13050,6 @@ class App:
             save_json(CONFIG_FILE, self.config)
         return [by_id[sid] for sid in stored if sid in by_id]
 
-    # Back-compat alias: a few callers still reorder via this name.
-    def _apply_stable_session_order(self, sessions):
-        return self._ordered_picker_sessions()
-
     def _render_session_list(self):
         self._hide_session_tooltip()
         selected_id = self.current_session.get("id") if self.current_session else None
@@ -13264,9 +13242,24 @@ class App:
         ]
         candidates.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
         self._recent_sessions = candidates[:2]
-        self.recent_session_list.delete(0, "end")
-        for s in self._recent_sessions:
-            self.recent_session_list.insert("end", self._session_list_label(s))
+        new_labels = [self._session_list_label(s) for s in self._recent_sessions]
+        # Diff in place — a blanket delete(0,end)+reinsert on every render made the
+        # Recent box flash white on each click. Only touch rows that actually changed.
+        try:
+            current = list(self.recent_session_list.get(0, "end"))
+        except tk.TclError:
+            current = []
+        if new_labels == current:
+            return
+        if len(new_labels) == len(current):
+            for i, (nl, cl) in enumerate(zip(new_labels, current)):
+                if nl != cl:
+                    self.recent_session_list.delete(i)
+                    self.recent_session_list.insert(i, nl)
+        else:
+            self.recent_session_list.delete(0, "end")
+            for label in new_labels:
+                self.recent_session_list.insert("end", label)
 
     def _select_recent_session(self):
         """Open the session selected in the Recent box."""
