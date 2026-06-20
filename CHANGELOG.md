@@ -6,6 +6,13 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-19 (Organize: bulk-delete sessions older than 30 days / delete all)
+
+- **"Delete sessions older than 30 days…"** and **"Delete ALL sessions (keep current)…"**
+  added to the Organize ▾ drop-down. Both skip any sessions currently open in a workspace
+  tab. Deletes are permanent and preceded by a confirmation dialog. (`_bulk_delete_sessions`,
+  wired into `_open_organize_menu`.)
+
 ## 2026-06-19 (Hard rule: sub-agent sessions never in tab bar; fix session scroll)
 
 - **Sub-agent/workflow sessions are now banned from the workspace tab bar** (hard rule).

@@ -13067,10 +13067,7 @@ class App:
         return [by_id[sid] for sid in ordered_ids]
 
     def _open_organize_menu(self):
-        """Drop-down for the Organize button: one-shot sort of the session list by
-        date or title. The chosen order is written into the saved session_order so
-        it persists; the list then stays stable until the next Organize / new
-        session / manual ↑↓ move."""
+        """Drop-down for the Organize button: sort or bulk-delete sessions."""
         menu = tk.Menu(
             self.win,
             tearoff=0,
@@ -13086,6 +13083,15 @@ class App:
         menu.add_command(
             label="By title (A–Z)",
             command=lambda: self.organize_sessions("title"),
+        )
+        menu.add_separator()
+        menu.add_command(
+            label="Delete sessions older than 30 days…",
+            command=lambda: self._bulk_delete_sessions(days=30),
+        )
+        menu.add_command(
+            label="Delete ALL sessions (keep current)…",
+            command=lambda: self._bulk_delete_sessions(days=0),
         )
         try:
             x = self.organize_btn.winfo_rootx()
@@ -13110,6 +13116,57 @@ class App:
         save_json(CONFIG_FILE, self.config)
         self._render_session_list()
         self.status.set(f"Sessions organized by {label}.")
+
+    def _bulk_delete_sessions(self, days=30):
+        """Delete all picker sessions older than `days` days (days=0 = delete all).
+        Sessions currently open in any workspace tab are always spared."""
+        import datetime as _dt
+        # Collect IDs that are currently open in any workspace tab — never delete those.
+        open_ids = set()
+        for ws in self.workspaces.values():
+            cs = ws.get("current_session") or {}
+            sid = clean_text(cs.get("id"))
+            if sid:
+                open_ids.add(sid)
+
+        picker = [s for s in self.sessions if self._is_picker_session(s)]
+        if days > 0:
+            cutoff = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days)).isoformat()
+            candidates = [
+                s for s in picker
+                if (s.get("updated_at") or "9999") < cutoff and s.get("id") not in open_ids
+            ]
+            age_label = f"older than {days} days"
+        else:
+            candidates = [s for s in picker if s.get("id") not in open_ids]
+            age_label = "all (except open tabs)"
+
+        if not candidates:
+            self.status.set(f"No sessions to delete ({age_label}).")
+            return
+
+        if not messagebox.askyesno(
+            "Bulk delete sessions",
+            f"Delete {len(candidates)} session{'s' if len(candidates) != 1 else ''} "
+            f"({age_label})?\n\nThis cannot be undone.",
+            parent=self.win,
+        ):
+            return
+
+        order_key = self._session_order_key()
+        delete_ids = {s.get("id") for s in candidates}
+        for s in candidates:
+            self.store.delete(s.get("id"))
+        self.session_order[order_key] = [
+            i for i in self.session_order.get(order_key, []) if i not in delete_ids
+        ]
+        self.config["session_order"] = self.session_order
+        save_json(CONFIG_FILE, self.config)
+        self.local_sessions = self.store.list_all_local(self.active_agent.get())
+        self.sessions = self._combined_sessions()
+        self._render_session_list()
+        self._render_recent_sessions()
+        self.status.set(f"Deleted {len(candidates)} session{'s' if len(candidates) != 1 else ''}.")
 
     def _render_recent_sessions(self):
         """Populate the Recent box with the 2 most-recently-used local sessions."""
