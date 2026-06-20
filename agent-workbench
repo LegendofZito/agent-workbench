@@ -6981,6 +6981,8 @@ class App:
         pad_in = 10
         maxlen = 40
         tab_width = 160  # uniform px width for every tab (spam-close alignment)
+        tab_height = 30  # fixed px height — pack_propagate(False) needs this or the
+        #                  frame collapses and clips the label/× vertically.
         if n:
             try:
                 avail = self.workspace_tabs_frame.winfo_width()
@@ -7053,7 +7055,12 @@ class App:
                 # all tabs are the same size. × is packed RIGHT so it always lands
                 # at the same pixel — closing one tab puts the next tab's × exactly
                 # where the cursor already is (spam-close without moving the mouse).
-                frame = tk.Frame(self.workspace_tabs_frame, bg=tab_bg, width=tab_width)
+                frame = tk.Frame(
+                    self.workspace_tabs_frame,
+                    bg=tab_bg,
+                    width=tab_width,
+                    height=tab_height,
+                )
                 frame.pack_propagate(False)
                 self._bind_tab_wheel_handlers(frame, self._on_workspace_tab_horizontal_wheel)
                 close_button = tk.Button(
@@ -7098,6 +7105,7 @@ class App:
                 tab["frame"].configure(
                     bg=tab_bg,
                     width=tab_width,
+                    height=tab_height,
                     highlightbackground="#e2e8f0" if selected else tab_bg,
                     highlightthickness=2 if selected else 0,
                 )
@@ -7118,6 +7126,7 @@ class App:
                     tab["frame"].configure(
                         bg=tab_bg,
                         width=tab_width,
+                        height=tab_height,
                         highlightbackground="#e2e8f0" if selected else tab_bg,
                         highlightthickness=2 if selected else 0,
                     )
@@ -13032,56 +13041,83 @@ class App:
                 for session in self.visible_sessions
                 if query in session_search_blob(session, self._session_alias(session))
             ]
+
+        # Identity of the rows we're about to show. A row only ever moves or
+        # repaints when the SET, ORDER, or TITLE of sessions changes. Re-opening a
+        # session merely bumps its updated_at (its "HH:MM" prefix), which must NOT
+        # touch the list at all — only the highlight moves. So we compare by id +
+        # title, never by the volatile timestamp label.
+        new_ids = [s.get("id") for s in self.visible_sessions]
+        new_titles = [self._display_session_title(s) for s in self.visible_sessions]
         new_labels = [self._session_list_label(s) for s in self.visible_sessions]
+        prev_ids = getattr(self, "_rendered_session_ids", [])
+        prev_titles = getattr(self, "_rendered_session_titles", [])
         try:
             current_labels = list(self.session_list.get(0, "end"))
         except tk.TclError:
             current_labels = []
+
         # Guard: skip renders that would wipe the list to empty while the UI already
-        # shows sessions.  This happens during new-tab init: _create_workspace gives
-        # the workspace sessions=[], _restore_workspace sets self.sessions=[] and calls
-        # _render_session_list, which would blank the list — then sessions are loaded
-        # and a second render fills it back in.  The intermediate blank causes the
-        # visible "list wipe + jump" the user sees on every session click.
-        if not new_labels and current_labels:
+        # shows sessions. This happens during new-tab init: _create_workspace gives
+        # the workspace sessions=[], _restore_workspace sets self.sessions=[] and
+        # calls _render_session_list, which would blank the list — then sessions are
+        # loaded and a second render fills it back in. The intermediate blank caused
+        # the visible "list wipe + jump" on every session click.
+        if not new_ids and current_labels:
+            self._highlight_session(selected_id)
             self._render_recent_sessions()
             return
-        if new_labels != current_labels:
-            if len(new_labels) == len(current_labels):
-                # Same number of sessions — only labels changed (e.g. timestamp
-                # update after opening a session).  Update each changed item in
-                # place so the list is never wiped and scroll stays put.
-                for i, (nl, cl) in enumerate(zip(new_labels, current_labels)):
-                    if nl != cl:
-                        self.session_list.delete(i)
-                        self.session_list.insert(i, nl)
-            else:
-                # Session count changed (added or removed) — full rebuild.
-                # Defer scroll restore via after_idle so Tk finishes layout first.
-                try:
-                    scroll_top = self.session_list.yview()[0]
-                except tk.TclError:
-                    scroll_top = 0.0
-                self.session_list.delete(0, "end")
-                for label in new_labels:
-                    self.session_list.insert("end", label)
-                _st = scroll_top
-                self.session_list.after_idle(
-                    lambda v=_st: self.session_list.yview_moveto(v)
-                )
-        # Move highlight to the active session — no list rebuild, no scroll jump.
-        if self.visible_sessions:
-            self.session_list.selection_clear(0, "end")
-            selected_idx = next(
-                (
-                    idx
-                    for idx, session in enumerate(self.visible_sessions)
-                    if session.get("id") == selected_id
-                ),
-                0,
+
+        same_rows = (
+            new_ids == prev_ids and len(current_labels) == len(new_labels)
+        )
+        if same_rows:
+            # Same sessions in the same order. Repaint ONLY rows whose title
+            # actually changed (a rename). A plain re-open changed nothing here,
+            # so the listbox is left completely untouched — no flicker, no jump.
+            for i in range(len(new_ids)):
+                if i >= len(prev_titles) or new_titles[i] != prev_titles[i]:
+                    self.session_list.delete(i)
+                    self.session_list.insert(i, new_labels[i])
+        else:
+            # Real change (sessions added/removed/reordered, or agent switch).
+            # Full rebuild; defer scroll restore via after_idle so Tk finishes
+            # layout first.
+            try:
+                scroll_top = self.session_list.yview()[0]
+            except tk.TclError:
+                scroll_top = 0.0
+            self.session_list.delete(0, "end")
+            for label in new_labels:
+                self.session_list.insert("end", label)
+            _st = scroll_top
+            self.session_list.after_idle(
+                lambda v=_st: self.session_list.yview_moveto(v)
             )
-            self.session_list.selection_set(selected_idx)
+
+        self._rendered_session_ids = new_ids
+        self._rendered_session_titles = new_titles
+        self._highlight_session(selected_id)
         self._render_recent_sessions()
+
+    def _highlight_session(self, selected_id):
+        """Move the selection highlight to `selected_id` without touching any rows.
+        If that session isn't in the visible list (e.g. it belongs to a different
+        agent), highlight nothing rather than defaulting to row 0 — defaulting to 0
+        is what made an unrelated top row flash selected during tab switches."""
+        self.session_list.selection_clear(0, "end")
+        if not self.visible_sessions or selected_id is None:
+            return
+        idx = next(
+            (
+                i
+                for i, session in enumerate(self.visible_sessions)
+                if session.get("id") == selected_id
+            ),
+            None,
+        )
+        if idx is not None:
+            self.session_list.selection_set(idx)
 
     def _session_order_key(self):
         return f"{self.active_agent.get()}|{os.path.abspath(self.cwd.get())}"

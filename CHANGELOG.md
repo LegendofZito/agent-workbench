@@ -6,6 +6,21 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-20 (Tab height fix; session list rows truly frozen on click)
+
+- **Tabs no longer clipped** — `pack_propagate(False)` froze the tab frame at its
+  default (~0 px) height, so the labels rendered cut off at the top edge. Added an
+  explicit `tab_height = 30` and applied it to the frame creation and both
+  `configure` paths. Tabs are now full-height and uniform-width as intended.
+- **Session list: only the highlight moves on click** — rewrote `_render_session_list`
+  to compare rows by **session id + title**, never by the volatile "HH:MM" timestamp
+  prefix. Re-opening a session bumps its `updated_at` (and thus its time prefix) — that
+  used to repaint the row in place; now it touches nothing at all. Rows are only
+  rewritten on a genuine rename, and only fully rebuilt when the session set/order
+  actually changes (or the agent switches). Added `_highlight_session()` which highlights
+  the active session or **nothing** if it isn't in the visible list — previously it
+  defaulted to row 0, which made an unrelated top row flash selected during tab switches.
+
 ## 2026-06-20 (Uniform tab bar for spam-close; session list in-place update)
 
 - **Tab bar uniform width** — all workspace tabs are now the same pixel width (capped
