@@ -13652,11 +13652,10 @@ class App:
         if remember and self.current_session and self.current_session.get("id") != session_id:
             self.transfer_source_session_id = self.current_session.get("id")
         self.current_session = deepcopy(session)
-        # Update last-use timestamp so sessions sort by most-recently-opened
-        if session.get("origin", "local") == "local":
-            session["updated_at"] = now_iso()
-            self.store.save(session)
-            self.current_session["updated_at"] = session["updated_at"]
+        # NOTE: opening a session deliberately does NOT touch updated_at. Bumping it
+        # here ("sort by most-recently-opened") floated the clicked session to the top
+        # of the list — exactly the jump the user does not want. updated_at now changes
+        # only on real activity (a turn), so the picker order stays static on click.
         linked_path = linked_client_session_path(self.current_session)
         if linked_path:
             self.current_session["source_path"] = linked_path

@@ -6,6 +6,18 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-20 (Removed the "clicking a session floats it to the top" rule)
+
+- **`open_session` no longer bumps `updated_at` on open.** It used to run
+  `session["updated_at"] = now_iso()` ("sort by most-recently-opened") on every click,
+  which floated the clicked session to the top of the picker — the jump the user has been
+  fighting. Removed. `updated_at` now changes only on real activity (a turn), so clicking
+  a session never reorders the list. Combined with the agent-only order key, the picker is
+  fully static except for Organize / ↑↓.
+- **Process-restart verified.** Earlier fixes were correct on disk but the running app
+  never reloaded them (its restart defers until active tasks finish and never fired). Now
+  the app is force-restarted after deploy and the new PID is confirmed before claiming done.
+
 ## 2026-06-20 (ROOT CAUSE: session order keyed per-cwd; constant tab width)
 
 - **Sessions reordering on click — root cause found and fixed.** The session order was
