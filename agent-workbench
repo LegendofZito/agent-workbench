@@ -13047,7 +13047,11 @@ class App:
             self.session_list.delete(0, "end")
             for label in new_labels:
                 self.session_list.insert("end", label)
-            self.session_list.yview_moveto(scroll_top)
+            # Defer scroll restore until after Tkinter finishes layout — calling
+            # yview_moveto synchronously right after insert() lands before the
+            # Listbox has calculated item positions, so the scroll doesn't stick.
+            _st = scroll_top
+            self.session_list.after_idle(lambda v=_st: self.session_list.yview_moveto(v))
         # Move highlight to the active session — no content change, no scroll jump.
         if self.visible_sessions:
             self.session_list.selection_clear(0, "end")
@@ -13546,8 +13550,11 @@ class App:
             self.cwd.get(), self.active_agent.get()
         )
         self.sessions = self._combined_sessions()
-        self._render_session_list()
+        # open_session must run BEFORE _render_session_list so current_session is set.
+        # If render comes first, current_session is None → selected_idx defaults to 0
+        # → the first item is highlighted instead of the clicked session.
         self.open_session(session_id, remember=False)
+        self._render_session_list()
         self._save_active_workspace()
         if background and prior_workspace_id in self.workspaces:
             # Restore the previously-active tab — don't steal focus
