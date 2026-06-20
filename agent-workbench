@@ -2256,6 +2256,11 @@ def codex_sessions_for_cwd(cwd):
         ).fetchall()
     except Exception:
         return []
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
     sessions = []
     for row in rows:
         sid = row["id"]
@@ -3218,6 +3223,10 @@ def ensure_project_registry(cwd, session=None, agent_key="", title="", state_pat
         for value in values:
             if isinstance(value, dict):
                 value = value.get("root") or value.get("path")
+            if not value:
+                # clean_text(None) -> "" and abspath("") resolves to the process
+                # CWD, which would get spuriously added as a related root.
+                continue
             path_value = os.path.abspath(os.path.expanduser(clean_text(value)))
             if path_value and os.path.isdir(path_value) and path_value != root:
                 related_roots.append(path_value)
@@ -9855,7 +9864,6 @@ class App:
                 if live_tokens > 0
                 else (f" · {token_text}" if token_text else "")
             )
-            model = self._working_model_effort_label(workspace)
             if silence >= TURN_STALLED_SECONDS:
                 text = f"{elapsed}{token_suffix}{queue_text}"
                 bg, fg = "#4a2b0b", "#fed7aa"
@@ -10582,7 +10590,7 @@ class App:
         menu.add_command(label="Copy", command=lambda: widget.event_generate("<<Copy>>"))
         menu.add_command(label="Paste", command=lambda: widget.event_generate("<<Paste>>"))
         menu.add_separator()
-        menu.add_command(label="Select all", command=lambda: widget.tag_add("sel", "1.0", "end"))
+        menu.add_command(label="Select all", command=lambda: widget.tag_add("sel", "1.0", "end-1c"))
         menu.tk_popup(event.x_root, event.y_root)
 
     def copy_text(self, text):
@@ -13359,8 +13367,11 @@ class App:
 
     def move_selected_session(self, direction):
         selection = self.session_list.curselection()
-        if not selection or clean_text(self.session_filter.get()):
+        if clean_text(self.session_filter.get()):
             self.status.set("Clear session search before reordering.")
+            return
+        if not selection:
+            self.status.set("Select a session to reorder.")
             return
         index = selection[0]
         target = index + direction
