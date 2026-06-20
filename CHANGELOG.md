@@ -6,6 +6,20 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-19 (New-agent dialog scroll fixed; session list no longer auto-scrolls)
+
+- **"Open new agent" dialog scroll fixed** — the `bind_all` wheel handler checked
+  `under.winfo_toplevel() is not dialog` using Python object identity. Tkinter returns a
+  new Python wrapper object on each `winfo_toplevel()` call, so the `is` check always
+  failed and the handler always returned early without scrolling. Fixed by comparing Tcl
+  path strings: `str(under.winfo_toplevel()) != dialog_path`.
+- **Session list no longer auto-scrolls on re-render** — `_render_session_list` was
+  calling `session_list.see(selected_idx)` every time it ran (called very frequently:
+  on turn start/end, session open/close, filter change, etc.), which jumped the list to
+  show the selected item even when the user had scrolled to a different part. Now saves
+  `yview()[0]` before clearing the list and restores it with `yview_moveto()` after
+  repopulating, so the viewport stays exactly where the user left it.
+
 ## 2026-06-19 (Attach button to attachment bar; copy button copies full message)
 
 - **Attach button moved to attachment bar** — previously in the skills bar (below the text

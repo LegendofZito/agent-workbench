@@ -6570,12 +6570,16 @@ class App:
             lambda e: scroll_canvas.itemconfigure(scroll_window, width=e.width),
         )
 
+        dialog_path = str(dialog)
+
         def _new_agent_wheel(event):
             # Only scroll when the pointer is actually over THIS dialog. bind_all
             # otherwise captures wheel events from the whole app, so scrolling the
             # session list behind the dialog double-scrolled this list too.
+            # Compare Tcl path strings — winfo_toplevel() returns a new Python object
+            # each call, so `is` identity check always fails; str() gives the stable path.
             under = dialog.winfo_containing(event.x_root, event.y_root)
-            if under is None or under.winfo_toplevel() is not dialog:
+            if under is None or str(under.winfo_toplevel()) != dialog_path:
                 return
             step = -1 if (getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0) else 1
             scroll_canvas.yview_scroll(step, "units")
@@ -13004,6 +13008,11 @@ class App:
     def _render_session_list(self):
         self._hide_session_tooltip()
         selected_id = self.current_session.get("id") if self.current_session else None
+        # Preserve scroll position so re-renders don't jump the list.
+        try:
+            scroll_top = self.session_list.yview()[0]
+        except tk.TclError:
+            scroll_top = 0.0
         self.session_list.delete(0, "end")
         query = clean_text(self.session_filter.get()).lower()
         # The picker shows focused Workbench sessions plus connected client
@@ -13035,7 +13044,9 @@ class App:
                 0,
             )
             self.session_list.selection_set(selected_idx)
-            self.session_list.see(selected_idx)
+            # Restore scroll position — don't use see() here, it auto-scrolls to show
+            # the selection and jumps the list every re-render.
+            self.session_list.yview_moveto(scroll_top)
         self._render_recent_sessions()
 
     def _session_order_key(self):
