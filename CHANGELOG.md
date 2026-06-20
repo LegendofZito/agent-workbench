@@ -6,6 +6,15 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-19 (AWB dialogs no longer float above other apps)
+
+- **Removed `-topmost True` from "New agent tab" and "Add agent client" dialogs** — both
+  already use `transient(self.win)` + `grab_set()` which keeps them above AWB without
+  floating them above unrelated apps (e.g. Wayfinder). The `-topmost` flag was setting a
+  system-wide always-on-top hint that caused the dialog to visually bleed into any other
+  window the user switched to. The session tooltip retains `-topmost` (it's a decoration-
+  less overlay that needs it to appear above the session list widget).
+
 ## 2026-06-19 (New-agent dialog scroll fixed; session list no longer auto-scrolls)
 
 - **"Open new agent" dialog scroll fixed** — the `bind_all` wheel handler checked

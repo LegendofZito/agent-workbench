@@ -6516,7 +6516,6 @@ class App:
         dialog.transient(self.win)
         dialog.resizable(False, True)  # vertical resize so the scroll list can grow
         dialog.grab_set()  # modal: block the main window until closed / agent chosen
-        dialog.attributes("-topmost", True)  # always on top so it can't be lost behind
         dialog.focus_force()
         self._modal_scroll_lock += 1  # block the session list from scrolling underneath
         dialog.bind(
@@ -11976,7 +11975,6 @@ class App:
         dialog.transient(self.win)
         dialog.resizable(False, True)
         dialog.grab_set()
-        dialog.attributes("-topmost", True)
         dialog.focus_force()
         self._modal_scroll_lock += 1  # block the session list from scrolling underneath
         dialog.bind(
