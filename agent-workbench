@@ -11855,6 +11855,7 @@ class App:
             step = -1 if (getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0) else 1
             self.recent_session_list.yview_scroll(step, "units")
             return "break"
+        self.recent_session_list.bind("<Enter>", lambda _e: self.recent_session_list.focus_set())
         self.recent_session_list.bind("<MouseWheel>", _recent_wheel)
         self.recent_session_list.bind("<Button-4>", _recent_wheel)
         self.recent_session_list.bind("<Button-5>", _recent_wheel)
@@ -11941,7 +11942,6 @@ class App:
         self.session_list.bind("<F2>", lambda _e: self.rename_selected_session())
         self.session_list.bind("<Delete>", lambda _e: self.delete_selected_session())
         self.session_list.bind("<Motion>", self._schedule_session_tooltip)
-        self.session_list.bind("<Leave>", lambda _e: self._hide_session_tooltip())
         self.session_list.bind("<Button>", lambda _e: self._hide_session_tooltip())
         def _session_wheel(event):
             self._hide_session_tooltip()
@@ -11950,6 +11950,15 @@ class App:
             step = -1 if (getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0) else 1
             self.session_list.yview_scroll(step, "units")
             return "break"
+        def _session_enter(_e=None):
+            # On Wayland, scroll events only fire on the focused widget.
+            # Grab focus when the pointer enters the list so the wheel works
+            # without the user having to click first.
+            self.session_list.focus_set()
+        def _session_leave(_e=None):
+            self._hide_session_tooltip()
+        self.session_list.bind("<Enter>", _session_enter)
+        self.session_list.bind("<Leave>", _session_leave)
         self.session_list.bind("<MouseWheel>", _session_wheel)
         self.session_list.bind("<Button-4>", _session_wheel)
         self.session_list.bind("<Button-5>", _session_wheel)
