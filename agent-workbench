@@ -883,7 +883,6 @@ def format_token_usage(usage):
         or usage.get("used")
         or 0
     )
-    limit = int(usage.get("limit") or usage.get("modelContextWindow") or 0)
     parts = []
     if input_tokens:
         parts.append(f"in {format_token_count(input_tokens)}")
@@ -891,8 +890,6 @@ def format_token_usage(usage):
         parts.append(f"out {format_token_count(output_tokens)}")
     if not parts and total_tokens:
         parts.append(f"used {format_token_count(total_tokens)}")
-    if not parts and limit and total_tokens:
-        parts.append(f"{format_token_count(total_tokens)} used")
     return " · ".join(parts)
 
 
@@ -3095,8 +3092,6 @@ def infer_project_root(session=None, fallback_cwd=""):
             return title_root
     if stored_root:
         return stored_root
-    if title_root:
-        return title_root
     # Registry alias lookup: check all known project.json files for a matching alias.
     # Catches cases where the session title matches a registered alias but the directory
     # name differs (e.g. "Next Agent Workbench" title → "Agent Workbench Next" dir).
@@ -4344,7 +4339,7 @@ class CodexBackend(BaseBackend):
                 self.emit("work", text="▶ " + typ, tag="tool")
         elif method == "item/completed":
             if typ == "agentMessage":
-                text = item.get("text") or item.get("content") or ""
+                text = item.get("text") or ""
                 if not text:
                     content = []
                     for bit in item.get("content") or []:
@@ -8880,7 +8875,6 @@ class App:
         pop.configure(bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
         self._subagents_popover = pop
         # Build content
-        row_bg = PANEL
         title_label = tk.Label(
             pop,
             text="Sub-agents",
@@ -10969,7 +10963,9 @@ class App:
             try:
                 self.win.after(0, finish)
             except tk.TclError:
-                pass
+                # Window destroyed mid-run: finish() never executes, so reset the
+                # guard flag here or update_project_state is blocked forever.
+                self._project_state_update_running = False
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -12774,8 +12770,6 @@ class App:
             self.open_session(self.visible_sessions[0]["id"], remember=False)
         elif self.sessions:
             self.open_session(self.sessions[0]["id"], remember=False)
-        else:
-            self.open_session(self.current_session["id"], remember=False)
 
     def refresh_workspace(self):
         self.status.set("Refreshing workspace state…")
@@ -13226,6 +13220,11 @@ class App:
         order_key = self._session_order_key()
         delete_ids = {s.get("id") for s in candidates}
         for s in candidates:
+            # Mirror delete_selected_session: remove the client-side file and write a
+            # tombstone, or the deleted external session reappears on the next poll.
+            linked, deleted, _err = delete_client_session(s)
+            if linked and deleted:
+                self._record_deleted_session(s)
             self.store.delete(s.get("id"))
         self.session_order[order_key] = [
             i for i in self.session_order.get(order_key, []) if i not in delete_ids
@@ -17182,15 +17181,19 @@ class App:
 
     # ── Queue-vs-Interrupt inline choice helpers ────────────────────────────
 
-    def _queue_prompt(self, prompt, attachments):
+    def _queue_prompt(self, prompt, attachments, from_composer=True):
         self.queued_prompts.append(
             {
                 "prompt": prompt,
                 "attachments": list(attachments),
             }
         )
-        self.input.delete("1.0", "end")
-        self.clear_attachments()
+        # Only clear the composer when the queued message CAME from the composer.
+        # A programmatic send (skill dispatch, queued message) while busy must never
+        # wipe the draft the user is typing right now.
+        if from_composer:
+            self.input.delete("1.0", "end")
+            self.clear_attachments()
         count = len(self.queued_prompts)
         self.status.set(
             f"Queued {count} message{'s' if count != 1 else ''}; "
@@ -17366,7 +17369,7 @@ class App:
             self.set_activity("working")
             return
         if self.busy:
-            self._queue_prompt(prompt, attachments)
+            self._queue_prompt(prompt, attachments, from_composer=from_composer)
             return
         agent_key = self.active_agent.get()
         # Local-model clients (Ollama) reach a local HTTP API through OllamaBackend —
