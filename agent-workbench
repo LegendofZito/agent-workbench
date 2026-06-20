@@ -5976,6 +5976,7 @@ class App:
             self.refresh_sessions()
             self._restore_last_session()
         else:
+            self._evict_subagent_workspace_tabs()
             self._restore_workspace(self.workspaces[self.active_workspace_id])
         self._save_active_workspace()
         self._render_workspace_tabs()
@@ -6197,6 +6198,33 @@ class App:
         active_index = min(max(active_index, 0), len(self.workspace_order) - 1)
         self.active_workspace_id = self.workspace_order[active_index]
         return True
+
+    def _evict_subagent_workspace_tabs(self):
+        """Remove any restored workspace tabs whose current session is a sub-agent
+        or workflow (worker_job_id / worker_parent_session_id set). Hard rule: those
+        sessions belong in the Spawned panel only, never the workspace tab bar."""
+        to_evict = []
+        for wid in list(self.workspace_order):
+            ws = self.workspaces.get(wid) or {}
+            cs = ws.get("current_session") or {}
+            if cs.get("worker_job_id") or cs.get("worker_parent_session_id"):
+                to_evict.append(wid)
+        if not to_evict:
+            return
+        keep = [wid for wid in self.workspace_order if wid not in set(to_evict)]
+        if not keep:
+            return  # don't evict ALL tabs (leave at least one)
+        for wid in to_evict:
+            ws = self.workspaces.pop(wid, None)
+            if ws:
+                for backend in (ws.get("backends") or {}).values():
+                    try:
+                        backend.close()
+                    except Exception:
+                        pass
+        self.workspace_order = [wid for wid in self.workspace_order if wid in self.workspaces]
+        if self.active_workspace_id not in self.workspaces and self.workspace_order:
+            self.active_workspace_id = self.workspace_order[-1]
 
     def _workspace_specs(self):
         specs = []
@@ -11812,10 +11840,12 @@ class App:
         )
         self.recent_session_list.pack(side="left", fill="x", expand=True)
         self.recent_session_list.bind("<<ListboxSelect>>", lambda _e: self._select_recent_session())
-        def _recent_wheel(_event):
+        def _recent_wheel(event):
             if self._modal_scroll_lock > 0:
                 return "break"
-            return None
+            step = -1 if (getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0) else 1
+            self.recent_session_list.yview_scroll(step, "units")
+            return "break"
         self.recent_session_list.bind("<MouseWheel>", _recent_wheel)
         self.recent_session_list.bind("<Button-4>", _recent_wheel)
         self.recent_session_list.bind("<Button-5>", _recent_wheel)
@@ -11904,14 +11934,13 @@ class App:
         self.session_list.bind("<Motion>", self._schedule_session_tooltip)
         self.session_list.bind("<Leave>", lambda _e: self._hide_session_tooltip())
         self.session_list.bind("<Button>", lambda _e: self._hide_session_tooltip())
-        def _session_wheel(_event):
+        def _session_wheel(event):
             self._hide_session_tooltip()
-            # While a modal list dialog is open, block the session list from scrolling
-            # underneath it. "break" runs at the widget level, before the Listbox class
-            # binding, so it actually prevents the scroll.
             if self._modal_scroll_lock > 0:
                 return "break"
-            return None
+            step = -1 if (getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0) else 1
+            self.session_list.yview_scroll(step, "units")
+            return "break"
         self.session_list.bind("<MouseWheel>", _session_wheel)
         self.session_list.bind("<Button-4>", _session_wheel)
         self.session_list.bind("<Button-5>", _session_wheel)
@@ -13172,16 +13201,20 @@ class App:
                 _add(title + status, {"type": "session", "session": s})
 
     def _open_selected_spawned(self):
-        """Open the session selected in the Spawned tab."""
+        """Show the session selected in the Spawned tab.
+        Sub-agent / workflow sessions are confined to the Spawned panel —
+        they must never become workspace tabs."""
         sel = self.spawned_list.curselection()
         if not sel:
             return
         idx = sel[0]
         rows = getattr(self, "_spawned_rows", [])
         if idx < len(rows) and rows[idx].get("type") == "session":
-            sid = (rows[idx].get("session") or {}).get("id")
-            if sid:
-                self.open_session_in_new_tab(sid)
+            session = rows[idx].get("session") or {}
+            self.status.set(
+                f"Sub-agent session: {self._display_session_title(session) or '(untitled)'}"
+                " — view details in the Spawned tab."
+            )
 
     def move_selected_session(self, direction):
         selection = self.session_list.curselection()
@@ -13389,6 +13422,10 @@ class App:
                     session = candidate
                     break
         if not session:
+            return
+        # HARD RULE: sub-agent and workflow sessions live in the Spawned panel
+        # only — they must never appear as workspace tabs in the tab bar.
+        if session.get("worker_job_id") or session.get("worker_parent_session_id"):
             return
         if self.close_when_idle and not self.restart_after_close:
             self.status.set("Workbench is waiting for active tasks to finish before closing.")

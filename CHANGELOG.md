@@ -6,6 +6,19 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-19 (Hard rule: sub-agent sessions never in tab bar; fix session scroll)
+
+- **Sub-agent/workflow sessions are now banned from the workspace tab bar** (hard rule).
+  Three-part guard: (1) `open_session_in_new_tab` silently returns if the session has
+  `worker_job_id` or `worker_parent_session_id`; (2) `_open_selected_spawned` no longer
+  calls open-in-tab — clicking a Spawned entry just echoes its title in the status bar;
+  (3) `_evict_subagent_workspace_tabs` runs at startup to close any sub-agent tabs that
+  were persisted in the saved workspace config (cleaning up ones already open).
+- **Session list scroll wheel fixed** — both `_session_wheel` (main session list) and
+  `_recent_wheel` (recent-sessions pane) now call `yview_scroll` explicitly and return
+  `"break"`, instead of returning `None` and relying on class-level propagation which
+  stopped working after the modal-lock bindings were added.
+
 ## 2026-06-19 (AWBfixes1 remainder: scroll bleed + redundant working label)
 
 - **`recent_session_list` scroll bleed** — the "Open new agent" and "Add client" modal dialogs blocked
