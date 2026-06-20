@@ -6,6 +6,27 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-20 (Full automated audit — 13 fixes applied; AUDIT-REPORT.md)
+
+- Ran a chunked multi-agent audit (24 readers + per-finding adversarial verifiers, 102
+  agents): 74 verified findings. Applied the 13 safest/highest-value, each independently
+  re-checked against the source, in two revertable commits:
+  - **High bugs:** Codex agentMessage rendered as a raw list (`_handle_notification`);
+    project-state guard flag leaked on TclError, blocking all future updates
+    (`update_project_state`); bulk-delete didn't tombstone, so deleted sessions reappeared
+    (`_bulk_delete_sessions`); **composer draft wiped on a programmatic send-while-busy**
+    (`_queue_prompt`) — violated the never-lose-a-draft rule.
+  - **Medium bugs:** sqlite connection leak (`codex_sessions_for_cwd`); spurious CWD added
+    as a related root (`ensure_project_registry`); per-tick unused model call
+    (`refresh_prompt_state`); select-all grabbed the trailing newline (`show_edit_menu`);
+    wrong status when nothing selected (`move_selected_session`).
+  - **Dead code:** unreachable branches in `format_token_usage` / `infer_project_root` /
+    `refresh_sessions`, unused `row_bg`.
+  - **Rejected 1** verifier-"safe" deletion (`_handoff_context_text` else) — removing it
+    would cause UnboundLocalError on a falsy artifact. Kept.
+- Remaining 49 verified-safe items (30 behavioral bug-fixes + 19 refactors) and 11
+  report-only items are catalogued in `AUDIT-REPORT.md` for review rather than blind-applied.
+
 ## 2026-06-20 (Recent box no longer blinks; dead-code audit)
 
 - **Recent sessions box stopped flashing white on click** — `_render_recent_sessions`
