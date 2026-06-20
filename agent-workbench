@@ -7850,8 +7850,26 @@ class App:
         composer = tk.Frame(content, bg=BG)
         self.composer = composer
         composer.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        # Attachment bar — always visible above the text input.
+        # Layout: [Attach] [chip1 ×] [chip2 ×] … [Clear all →]
         self.attachment_bar = tk.Frame(composer, bg=PANEL)
-        tk.Button(
+        self.attachment_bar.pack(fill="x", padx=8, pady=(0, 4))
+        self.attach_btn = tk.Button(
+            self.attachment_bar,
+            text="Attach",
+            command=lambda: self.choose_artifacts(attach_to_prompt=True),
+            bg="#172131",
+            fg=TEXT,
+            activebackground="#243249",
+            activeforeground=TEXT,
+            relief="flat",
+            width=8,
+            pady=4,
+            cursor="hand2",
+            font=("Sans", 9, "bold"),
+        )
+        self.attach_btn.pack(side="left", padx=(0, 6), pady=2)
+        self.clear_all_btn = tk.Button(
             self.attachment_bar,
             text="Clear all",
             command=self.clear_attachments,
@@ -7863,10 +7881,11 @@ class App:
             padx=10,
             pady=4,
             cursor="hand2",
-        ).pack(side="right", padx=6, pady=4)
+        )
+        # Clear all is only shown when there are pending attachments (toggled in _update_attachment_bar).
         # Per-file chips (each with its own red ✕) are rebuilt in _update_attachment_bar.
         self.attachment_chips = tk.Frame(self.attachment_bar, bg=PANEL)
-        self.attachment_chips.pack(side="left", fill="x", expand=True, padx=8, pady=4)
+        self.attachment_chips.pack(side="left", fill="x", expand=True, pady=4)
         self.input = ScrolledText(
             composer,
             wrap="word",
@@ -7909,21 +7928,6 @@ class App:
         # (2) status + controls row (lower): Sub-agents, activity, warnings, Send…
         self.skills_bar = tk.Frame(composer, bg=PANEL)
         self.skills_bar.pack(fill="x", padx=8, pady=(4, 0))
-        self.attach_btn = tk.Button(
-            self.skills_bar,
-            text="Attach",
-            command=lambda: self.choose_artifacts(attach_to_prompt=True),
-            bg="#172131",
-            fg=TEXT,
-            activebackground="#243249",
-            activeforeground=TEXT,
-            relief="flat",
-            width=8,
-            pady=6,
-            cursor="hand2",
-            font=("Sans", 9, "bold"),
-        )
-        self.attach_btn.pack(side="left", padx=(0, 4))
         tk.Button(
             self.skills_bar,
             text="✦ Skills",
@@ -11311,7 +11315,8 @@ class App:
         for child in self.attachment_chips.winfo_children():
             child.destroy()
         if not self.pending_attachments:
-            self.attachment_bar.pack_forget()
+            if hasattr(self, "clear_all_btn") and self.clear_all_btn.winfo_exists():
+                self.clear_all_btn.pack_forget()
             return
         for path in self.pending_attachments:
             chip = tk.Frame(
@@ -11344,7 +11349,8 @@ class App:
                 cursor="hand2",
                 font=("Sans", 9, "bold"),
             ).pack(side="left")
-        self.attachment_bar.pack(fill="x", padx=8, pady=(0, 6), before=self.input)
+        if hasattr(self, "clear_all_btn") and self.clear_all_btn.winfo_exists():
+            self.clear_all_btn.pack(side="right", padx=6, pady=4)
 
     def _setup_drag_and_drop(self):
         try:
@@ -18008,14 +18014,16 @@ class App:
                 widget = self.chat
                 at_bottom = widget.yview()[1] >= 0.995
                 widget.configure(state="normal")
-                # Copy button for the just-finished streamed message — pull its full
-                # text from the turn's stored agentMessage so the button copies it all.
+                # Copy button for the just-finished streamed message — join ALL
+                # agentMessage chunks (a long reply may span several between tool calls).
                 streamed = ""
                 if self.current_turn:
-                    for it in reversed(self.current_turn.get("items") or []):
-                        if it.get("type") == "agentMessage":
-                            streamed = clean_text(it.get("text"))
-                            break
+                    parts = [
+                        clean_text(it.get("text"))
+                        for it in (self.current_turn.get("items") or [])
+                        if it.get("type") == "agentMessage" and clean_text(it.get("text"))
+                    ]
+                    streamed = "\n\n".join(parts)
                 if streamed:
                     self._insert_copy_button(streamed)
                     widget.insert("end", "\n")

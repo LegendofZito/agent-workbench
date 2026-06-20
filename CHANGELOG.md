@@ -6,6 +6,20 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-19 (Attach button to attachment bar; copy button copies full message)
+
+- **Attach button moved to attachment bar** — previously in the skills bar (below the text
+  input), now permanently anchored at the left edge of the attachment bar that sits above
+  the text input (where file/image chips appear). The bar is always visible so Attach is
+  always reachable, not just when a file is pending.
+- **Clear all** button only appears in the attachment bar when there are pending attachments;
+  hidden otherwise.
+- **Copy button now copies the entire response**, not just the last chunk. A long reply from
+  Claude can span multiple `agentMessage` items between tool calls; the previous code did
+  `break` on the first one found in reverse order, silently dropping all earlier content.
+  Fixed by joining all `agentMessage` parts with `"\n\n"`, matching how `_render_turn`
+  already merges them for display.
+
 ## 2026-06-19 (Organize: bulk-delete sessions older than 30 days / delete all)
 
 - **"Delete sessions older than 30 days…"** and **"Delete ALL sessions (keep current)…"**
