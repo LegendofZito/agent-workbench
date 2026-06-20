@@ -11855,7 +11855,16 @@ class App:
             step = -1 if (getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0) else 1
             self.recent_session_list.yview_scroll(step, "units")
             return "break"
-        self.recent_session_list.bind("<Enter>", lambda _e: self.recent_session_list.focus_set())
+        def _grab_recent_wheel(_e=None):
+            if self._modal_scroll_lock > 0:
+                return
+            for _s in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.recent_session_list.bind_all(_s, _recent_wheel)
+        def _release_recent_wheel(_e=None):
+            for _s in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.recent_session_list.unbind_all(_s)
+        self.recent_session_list.bind("<Enter>", _grab_recent_wheel)
+        self.recent_session_list.bind("<Leave>", _release_recent_wheel)
         self.recent_session_list.bind("<MouseWheel>", _recent_wheel)
         self.recent_session_list.bind("<Button-4>", _recent_wheel)
         self.recent_session_list.bind("<Button-5>", _recent_wheel)
@@ -11950,15 +11959,20 @@ class App:
             step = -1 if (getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0) else 1
             self.session_list.yview_scroll(step, "units")
             return "break"
-        def _session_enter(_e=None):
-            # On Wayland, scroll events only fire on the focused widget.
-            # Grab focus when the pointer enters the list so the wheel works
-            # without the user having to click first.
-            self.session_list.focus_set()
-        def _session_leave(_e=None):
+        def _grab_session_wheel(_e=None):
+            # Temporarily capture scroll events globally while the pointer is over
+            # the list — avoids stealing keyboard focus from the text input while
+            # still making the wheel work without clicking first.
+            if self._modal_scroll_lock > 0:
+                return
+            for _s in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.session_list.bind_all(_s, _session_wheel)
+        def _release_session_wheel(_e=None):
             self._hide_session_tooltip()
-        self.session_list.bind("<Enter>", _session_enter)
-        self.session_list.bind("<Leave>", _session_leave)
+            for _s in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.session_list.unbind_all(_s)
+        self.session_list.bind("<Enter>", _grab_session_wheel)
+        self.session_list.bind("<Leave>", _release_session_wheel)
         self.session_list.bind("<MouseWheel>", _session_wheel)
         self.session_list.bind("<Button-4>", _session_wheel)
         self.session_list.bind("<Button-5>", _session_wheel)
@@ -13015,12 +13029,6 @@ class App:
     def _render_session_list(self):
         self._hide_session_tooltip()
         selected_id = self.current_session.get("id") if self.current_session else None
-        # Preserve scroll position so re-renders don't jump the list.
-        try:
-            scroll_top = self.session_list.yview()[0]
-        except tk.TclError:
-            scroll_top = 0.0
-        self.session_list.delete(0, "end")
         query = clean_text(self.session_filter.get()).lower()
         # The picker shows focused Workbench sessions plus connected client
         # history. Worker/child sessions live in the per-session Spawned tab.
@@ -13037,9 +13045,27 @@ class App:
                 for session in self.visible_sessions
                 if query in session_search_blob(session, self._session_alias(session))
             ]
-        for session in self.visible_sessions:
-            title = self._session_list_label(session)
-            self.session_list.insert("end", title)
+        new_labels = [self._session_list_label(s) for s in self.visible_sessions]
+        # Only delete/re-insert when the list content actually changed.  The vast
+        # majority of _render_session_list calls are just selection updates — doing
+        # delete+insert every time caused a blank-list flash and a scroll-position
+        # jump on every call (called very frequently: turn start/end, tab switch, etc).
+        try:
+            current_labels = list(self.session_list.get(0, "end"))
+        except tk.TclError:
+            current_labels = []
+        if new_labels != current_labels:
+            try:
+                scroll_top = self.session_list.yview()[0]
+            except tk.TclError:
+                scroll_top = 0.0
+            self.session_list.delete(0, "end")
+            for label in new_labels:
+                self.session_list.insert("end", label)
+            need_scroll_restore = True
+        else:
+            scroll_top = 0.0
+            need_scroll_restore = False
         if self.visible_sessions:
             self.session_list.selection_clear(0, "end")
             selected_idx = next(
@@ -13051,9 +13077,8 @@ class App:
                 0,
             )
             self.session_list.selection_set(selected_idx)
-            # Restore scroll position — don't use see() here, it auto-scrolls to show
-            # the selection and jumps the list every re-render.
-            self.session_list.yview_moveto(scroll_top)
+            if need_scroll_restore:
+                self.session_list.yview_moveto(scroll_top)
         self._render_recent_sessions()
 
     def _session_order_key(self):
