@@ -13174,7 +13174,14 @@ class App:
         else:
             picker.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
             label = "date"
-        self.session_order[key] = [s.get("id") for s in picker if s.get("id")]
+        sorted_ids = [s.get("id") for s in picker if s.get("id")]
+        # Preserve held-slot ids: sessions in the durable order that just aren't
+        # loaded right now (e.g. cwd-scoped terminal history) must NOT be dropped,
+        # or they'd resurface as "new" and jump to the top later. Append them after
+        # the freshly-sorted loaded ids, keeping their existing relative order.
+        sorted_set = set(sorted_ids)
+        held = [sid for sid in self.session_order.get(key, []) if sid not in sorted_set]
+        self.session_order[key] = sorted_ids + held
         self.config["session_order"] = self.session_order
         save_json(CONFIG_FILE, self.config)
         self._render_session_list()
