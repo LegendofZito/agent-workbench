@@ -5708,6 +5708,15 @@ class App:
         self.session_order = self.config.get("session_order") or {}
         if not isinstance(self.session_order, dict):
             self.session_order = {}
+        # Migration: session order is now keyed by AGENT ONLY. Drop legacy
+        # "agent|cwd" buckets so the per-cwd re-sorting can never come back. The
+        # agent-only bucket (if any) is kept; otherwise the first render rebuilds it.
+        legacy_keys = [k for k in self.session_order if "|" in k]
+        if legacy_keys:
+            for k in legacy_keys:
+                self.session_order.pop(k, None)
+            self.config["session_order"] = self.session_order
+            save_json(CONFIG_FILE, self.config)
         self.handoff_preferences = self.config.get("handoff_preferences") or {}
         if not isinstance(self.handoff_preferences, dict):
             self.handoff_preferences = {}
@@ -6979,26 +6988,19 @@ class App:
         order = [wid for wid in self.workspace_order if wid in self.workspaces]
         n = len(order)
         pad_in = 10
-        maxlen = 40
+        # CONSTANT width for every tab — never derived from available space or tab
+        # count. A dynamic width meant tabs were different sizes during transitions
+        # (and the first couple stayed a stale size), so the × moved and you had to
+        # chase it with the cursor. With a fixed width, every tab is identical from
+        # the first paint, so closing one drops the next tab's × exactly under the
+        # cursor for spam-close. Overflow is handled by the existing horizontal scroll.
         tab_width = 160  # uniform px width for every tab (spam-close alignment)
         tab_height = 30  # fixed px height — pack_propagate(False) needs this or the
         #                  frame collapses and clips the label/× vertically.
-        if n:
-            try:
-                avail = self.workspace_tabs_frame.winfo_width()
-            except tk.TclError:
-                avail = 0
-            if avail <= 1:
-                avail = max(600, self.win.winfo_width() - 80)
-            self._last_win_width = self.win.winfo_width()
-            plus_px = 40
-            # Divide available space equally so all tabs are the same width.
-            # Clamp between 100 and 220 px so very few/many tabs still look ok.
-            tab_width = max(100, min(220, (avail - plus_px) // n))
-            avg_char_px = 7
-            close_px = 24
-            maxlen = max(4, int((tab_width - pad_in * 2 - close_px) / avg_char_px))
-        signature = tuple(
+        avg_char_px = 7
+        close_px = 24
+        maxlen = max(4, int((tab_width - pad_in * 2 - close_px) / avg_char_px))
+        signature = ((tab_width, tab_height),) + tuple(
             (
                 workspace_id,
                 workspace_id == self.active_workspace_id,
@@ -13120,7 +13122,12 @@ class App:
             self.session_list.selection_set(idx)
 
     def _session_order_key(self):
-        return f"{self.active_agent.get()}|{os.path.abspath(self.cwd.get())}"
+        # Keyed by AGENT ONLY — never cwd. The picker shows every local session for
+        # the active agent regardless of working directory, so a cwd in the key meant
+        # opening a session from a different project switched the order bucket and
+        # re-sorted the whole list by timestamp. That was the "sessions jump around on
+        # click" bug. One order per agent → the list is static; clicking never moves it.
+        return self.active_agent.get()
 
     def _apply_stable_session_order(self, sessions):
         """Return picker sessions in their remembered order. Sessions already known

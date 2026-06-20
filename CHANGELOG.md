@@ -6,6 +6,27 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-20 (ROOT CAUSE: session order keyed per-cwd; constant tab width)
+
+- **Sessions reordering on click — root cause found and fixed.** The session order was
+  keyed by `agent|cwd`. Each session can have a different working directory, so opening
+  one switched the order bucket to that cwd's bucket — and inspecting the live config
+  revealed **7 separate `claude|<cwd>` buckets, each ordered differently**. Switching
+  buckets re-sorted the whole list by timestamp, which is the "sessions jump around"
+  the videos showed. `_session_order_key()` now keys by **agent only**, so there is one
+  order for the agent's whole session list. Verified by simulation: opening/bumping any
+  session (any cwd) leaves the order identical. Sessions now move ONLY via the Organize
+  button or the ↑/↓ arrows, exactly as required.
+- **Migration**: legacy `agent|cwd` order buckets are pruned from config on startup so
+  the per-cwd behavior can never resurface.
+- **Tab width is now a constant (160 px), never derived from window size or tab count.**
+  The dynamic divide-by-count calculation made tabs different widths during transitions —
+  the first couple tabs kept a stale size while the rest resized, so the × moved and you
+  had to chase it. With a fixed width every tab is identical from the first paint, so
+  closing one drops the next tab's × exactly under the cursor. Width+height are now part
+  of the tab-render signature so any change forces a full resize. Overflow uses the
+  existing horizontal tab scroll.
+
 ## 2026-06-20 (Tab height fix; session list rows truly frozen on click)
 
 - **Tabs no longer clipped** — `pack_propagate(False)` froze the tab frame at its
