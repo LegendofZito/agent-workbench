@@ -6,7 +6,581 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-19 (AWBfixes1 remainder: scroll bleed + redundant working label)
+
+- **`recent_session_list` scroll bleed** — the "Open new agent" and "Add client" modal dialogs blocked
+  `session_list` scrolling via `_modal_scroll_lock`, but `recent_session_list` had no such guard. Added
+  the same `<MouseWheel>/<Button-4>/<Button-5>` → `return "break"` bindings so the recent-sessions pane
+  is also frozen while a modal is open. (AWBfixes1 #1 — fully complete now.)
+- **Removed model name from active-turn status badge** — the prompt-state label at bottom-right showed
+  `"Opus · 2m 15s"` right next to the "Working" activity badge, making it redundant (two things saying
+  "the agent is working"). It now shows only `"2m 15s · streamed ~N tokens"` while busy; the agent/model
+  is already visible in the tab + selector. (AWBfixes1 #2.)
+
+## 2026-06-19 (Add-agent-client dialog: scrollbar + black buffer)
+
+The earlier scroll fix landed on `open_new_agent_dialog`, but the user's actual dialog was the
+"+ Clients" → **`open_add_client_dialog`** ("Connect an agent client"), which still looked unchanged.
+Fixed it there too:
+- **Scrollbar thumb never moved** — the canvas had `command→yview` but was MISSING
+  `yscrollcommand=results_scrollbar.set` (the return path). Added it; the thumb now tracks position.
+- **Black buffer below the list** — `results_outer` was packed `fill="x"` (no vertical expand), so a
+  taller window dumped the extra height into black space. Changed to `fill="both", expand=True` so the
+  canvas grows with the window, and added the same `scrollregion=bbox("all")` + `dialog.maxsize`
+  content cap as the new-agent dialog: dragging the bottom reveals more models, then stops.
+
+(Deploy crash from the prior entry: user confirmed **Deploy now works**.)
+
+---
+
+## 2026-06-19 (Hand Off Deploy CRASH fixed + button sizing + new-agent scroll)
+
+### Hand Off "Deploy" crash — ROOT CAUSE found and fixed
+- Captured the real traceback (added a `handoff-error.log` writer to the deploy error handler):
+  `_validate_handoff_plan` → `ensure_project_registry(root='/home/zito')` → `save_json('')` →
+  `os.makedirs('')` → `FileNotFoundError: [Errno 2] ''`.
+- Cause: `ensure_project_registry` checked `os.path.isdir(root)` (home passes) but then called
+  `project_registry_path(root)`, which returns `''` for the home dir (home is guarded), and
+  proceeded to `save_json('')`. Any session whose cwd is the home directory (e.g. the mirrored
+  "Pig Farm 8") crashed Deploy here.
+- Fix: `ensure_project_registry` now returns `""` immediately when `project_registry_path` is empty,
+  BEFORE save_json. Validation only *warns* on a missing registry (not an error), so Deploy now
+  proceeds and succeeds for home-cwd sessions instead of crashing.
+
+### Footer buttons uniform size
+- Send / Attach / Stop / Hand Off / State were different widths (looked sloppy). All now use a fixed
+  `width=8` (chars) so they match.
+
+### New-agent dialog scroll
+- Scrollbar thumb didn't reflect the scroll position: after all rows are built, the scrollregion is
+  now set to span the full content (`bbox("all")`), so the thumb sizes and moves correctly.
+- Resizing the dialog taller showed a black buffer below the list: the window max-height is now
+  capped to the content height (`dialog.maxsize`), so dragging the bottom reveals more agent rows
+  and then stops — no empty black area.
+
+---
+
+## 2026-06-19 (footer reorder, usage %-hard-lock, modal scroll fixes)
+
+From the UIchange-footer1.webm / glitching2.webm batch:
+
+1. **Footer right-group reordered** to `[Context Limit] [Hand Off] [State]`. State is packed first
+   (far right, above Send), Context Limit packed last (leftmost of the group) so when its text widens
+   on compaction it grows LEFT into the chip area instead of shoving Hand Off / State leftward — the
+   thing the user disliked. (`skills_bar` build.)
+   - **State button** = `open_project_state` → opens AGENT_STATE.md (project shared state) in the
+     editor. Documented here for reference.
+2. **Removed the duplicate top compaction banner.** `update_context_indicator`: the
+   "This session has compacted N×…" banner (shown when compacted at low context) is suppressed
+   (`show_banner=False`) — the footer "Context Limit … compacted N×" badge already conveys it. The
+   genuinely-useful high-context (≥warning/critical) and rate-limit banners still show.
+3. **Usage badge HARD-LOCKED to percentages.** Removed the `local_stats` "N req/24h" fallback from
+   both `claude_usage_limits()` (no longer returns request counts at all) and `_display_usage()`
+   (deleted the local-stats branch). Source is the OAuth endpoint (5h/week utilization %, verified
+   reachable: 7%/4%). On a transient OAuth failure the badge keeps the last-good % or shows "--" —
+   it will NEVER show request counts again.
+4. **Connect-client dialog scroll fixed (Linux).** `_scroll_results` used `event.delta` + only bound
+   `<MouseWheel>` — dead on X11. Now handles `<Button-4>/<Button-5>` (event.num) too, bound via an
+   Enter/Leave-scoped `bind_all`. Dialog is now modal+topmost.
+5. **Background session list can't scroll under a modal dialog.** Added `self._modal_scroll_lock`
+   (incremented while the new-agent or connect-client dialog is open). The session Listbox's wheel
+   handler returns `"break"` at the widget level while the lock is held, so it can't scroll
+   underneath. Both dialogs are now grab+topmost+focus_force.
+
+---
+
+## 2026-06-19 (skills bar: stop blink + position jump on tab switch)
+
+- `_render_skill_chips` destroyed and recreated every chip on EVERY tab switch, so the skills bar
+  visibly blinked. Added a signature `(active_agent, tuple(favorites))`; the rebuild is skipped when
+  nothing changed, so switching between same-agent tabs no longer flashes. Toggling a favorite still
+  rebuilds (signature changes).
+- The chip frame was `anchor="center"`, so a different agent's favorites (different total width)
+  shifted the chips horizontally on switch. Changed to `anchor="w"` (left-aligned) for a stable
+  position. (From ~/Videos/Screencasts/Glitching.webm.)
+
+---
+
+## 2026-06-19 (AWBfixes1: new-agent modal, status text, Hand Off deploy + title)
+
+Batch from ~/AWBfixes1:
+1. **New-agent dialog is now properly modal.** Added `-topmost` + `focus_force` (can't be lost
+   behind other windows) on top of the existing `grab_set`. Fixed the scroll bleed: the mouse-wheel
+   handler used `bind_all` (global), so scrolling the session list behind the dialog also scrolled
+   the agent list. Now it only scrolls when the pointer is actually over the dialog
+   (`winfo_containing(...).winfo_toplevel() is dialog`).
+2. **Removed redundant "is working" text.** The activity line next to the status badge said
+   "{model} is working · {elapsed}"; the badge already shows Working/Ready, so it's now
+   "{model} · {elapsed}". The model name beside the badge identifies which agent is working.
+3. **Hand Off "Deploy" hang fixed.** The dialog holds a modal `grab_set`; `_deploy_handoff` can pop
+   its own modal (project-scope-conflict warning), which deadlocked against the dialog's grab — the
+   classic "nothing happens" hang. `deploy()` now releases the grab before deploying (re-grabs only
+   if aborted) and wraps the call in try/except that surfaces a real error dialog + traceback instead
+   of silently hanging.
+4. **Hand Off shows the title transition.** New "New tab title" row renders `old → [editable new]`
+   with a ✏ hint. The new title defaults to the computed next title (e.g. "OG Agent Workbench 4 →
+   OG Agent Workbench 5"), updates with the target agent's numbering, and is user-editable;
+   `_deploy_handoff` gained a `title_override` param so the edited title is used.
+
+---
+
+## 2026-06-19 (DISABLE runaway live-session auto-open + tab dedup)
+
+### Live-session auto-open hard-disabled (was spawning duplicate tabs every 5s)
+- `poll_live_sessions` auto-opened a tab for any session whose transcript changed in the last 90s.
+  Its dedup (`_known_source_ids`) didn't register an already-open session before the next 5s poll,
+  so it re-opened the same sessions over and over — the UI filled with duplicate "OG Agent Workbench"
+  tabs. Added `_AUTO_OPEN_LIVE_SESSIONS = False`: `_auto_open_live_session` and `poll_live_sessions`
+  both early-return, so no tabs spawn and the 5s scan loop stops. Re-enable only after the dedup is
+  reworked to reliably track auto-opened source ids.
+- Added a **load-time tab dedup** in workspace restore: workspace_tabs sharing a
+  `source_session_id` (or session id) collapse to the first, so any duplicates that got persisted
+  don't pile back up on restart. Blank tabs (no session) are always kept.
+
+---
+
+## 2026-06-19 (live-session auto-detect: Claude/Codex/Gemini)
+
+### Externally-started sessions now auto-open as mirror tabs
+- Added `poll_live_sessions()` — runs every 5 seconds, scans for Claude JSONL files, Codex
+  SQLite threads, and Gemini session files modified in the last 90 seconds that are NOT already
+  open in any AWB workspace tab.
+- When a live external session is detected, it's instantly opened as a read-only mirror tab
+  (same `open_session_in_new_tab` path used by the manual session picker).
+- If at the 10-tab limit, shows a status-bar alert instead of silently dropping it.
+- Covers all three clients: Claude Code (`~/.claude/projects/`), Codex (`~/.codex/state_5.sqlite`),
+  Gemini (`~/.gemini/tmp/*/chats/session-*.jsonl`).
+- Sessions started from Termius, plain terminal, or any other SSH connection appear in AWB
+  within 5 seconds without any manual action.
+- Opens in the **background** (`background=True`) — does NOT steal focus from the tab you're
+  working in. Status bar shows "Live session detected → new tab: …" as the only signal.
+- Added `_known_source_ids()` helper — checks all workspaces so AWB-managed sessions are
+  never double-opened.
+- `open_session_in_new_tab` gains `background=False` parameter; when True, restores the
+  previously-active workspace after building the new tab.
+
+---
+
+## 2026-06-18 (filter harness-injected turns from the mirror)
+
+### Machine-injected turns no longer render as "YOU" bubbles
+- Claude Code stores several machine messages as USER-role transcript turns (so the model sees
+  them). AWB's `claude_jsonl_turns` rendered every user-role text turn as a YOU bubble, so these
+  showed up as giant chunks "from the user" — not what was typed in the terminal. Culprits found on
+  the live transcript: `<task-notification>` background-agent completion notices (4×, 5–9 KB),
+  `<system-reminder>` blocks, the AWB attachment wrapper ("The user attached the following local
+  files…"), and — the big one the user kept seeing — the **post-compaction continuation summary**
+  ("This session is being continued from a previous conversation…", 3× at 13–17 KB each).
+- Added `HARNESS_INJECTION_BLOCK` regex + `strip_harness_injections(text)`: removes the tagged
+  blocks (`<task-notification>`, `<system-reminder>`, `<local-command-*>`, `<session_context>`),
+  drops the "This session is being continued…" compaction summary, and runs the existing
+  `_strip_attachment_injection` to keep only the real request after an attachment wrapper. In
+  `claude_jsonl_turns`, if nothing user-authored remains the turn flushes the prior assistant text
+  at the boundary but renders NO YOU bubble; the assistant's reply still renders as its own bubble.
+- Filter lives at the PARSER, so it cleans the rendered chat, the stored `turns`, AND the Hand Off
+  packet at once. Simulated on the real transcript: 7 machine turns skipped (4 task-notification +
+  3 compaction summary), all 62 real user turns preserved (attachment turns cleaned to just the
+  request). Existing tabs refresh on next open/switch (re-parse).
+
+---
+
+## 2026-06-18 (Hand Off freshness + sync audit)
+
+### Hand Off now captures the conversation to the last word
+- `handoff_session` built the packet from `session["turns"]` as of the last 2s external poll.
+  Turns typed in the terminal in the ~2s before clicking Hand Off could be missing from the packet.
+- Added `_sync_session_from_transcript(session)`: a SYNCHRONOUS re-read of the linked transcript
+  (`claude_jsonl_turns` + `claude_session_metadata` for Claude; codex/gemini equivalents) that
+  refreshes `session["turns"]` and `["context"]` (and the indicator) right before the packet stages.
+  `handoff_session` calls it before `_refresh_handoff_stage`. Hand Off is now lossless w.r.t. terminal turns.
+
+### Audit findings (no code change needed)
+- **Scrollbar vs context % is NOT a bug.** The chat scrollbar thumb is auto-sized by Tk =
+  viewport/total-rendered-height; `claude_jsonl_turns` renders the ENTIRE transcript (all
+  pre-compaction history + long messages), so a long session = tiny thumb. The context badge is the
+  LIVE window only (`used/limit` from the latest turn's usage). Independent measures; both correct.
+- **Context sharing for a terminal-driven mirrored session works** (verified to the token: transcript
+  247,714 = 24.8% → badge "25%/248K/1M"). AGENT_STATE.md is written fresh to disk before each handoff
+  (`request_project_state_update(force=True)`); the packet references its path (intentional, keeps the
+  packet small; continuation reads current state from disk).
+
+---
+
+## 2026-06-18 (New-agent dialog: scrollable model list)
+
+### "Open a new agent" dialog now scrolls
+- The dialog packed every agent + local-model row straight into `body` with no scroll
+  container and `resizable(False, False)`. With 8+ local Ollama models the list ran off the
+  bottom of the screen with no way to reach the lower entries (or the Escape/close affordance).
+- Wrapped the rows in a capped-height (`460px`) `Canvas` + `Scrollbar` (`scroll_content`),
+  with mouse-wheel support (`<MouseWheel>` / `<Button-4>` / `<Button-5>`, bound while the modal
+  is open and unbound on `<Destroy>`). Dialog is now `resizable(False, True)` so it can grow.
+- Deduped the second `_list_ollama_models()` probe (reuses the one from the install check).
+
+---
+
+## 2026-06-18 (mirrored session: context shared; live re-render REVERTED as freeze risk)
+
+### Shared context — confirmed accurate
+- A Claude session driven from the terminal is mirrored in AWB as `origin: "local"` with a
+  `source_path` to the Claude transcript. `poll_external_session` re-reads the transcript every 2s
+  and `update_context_indicator` shows the REAL shared context %. VERIFIED against the live
+  transcript: latest turn used 247,714 tokens = 24.8%, compacted 3× → AWB displayed "25% · 248K/1M ·
+  compacted 3×". Accurate to the token. `store.save` runs for any local sync so the record persists.
+- The mirror path never triggers a send — pure display (reads turns, queues
+  `external_session_loaded`, no turn creation).
+
+### REVERTED: live re-render of terminal turns
+- A prior attempt made idle `origin == "local"` sessions fall through to a FULL `_clear_views` +
+  `_render_session` on every 2s poll, so terminal-driven turns would appear live. On a large active
+  session that destroys+rebuilds 50+ chat bubbles (and their embedded Copy buttons) every 2 seconds —
+  a real freeze/stutter risk, the opposite of what the user needs. Reverted: local sessions skip the
+  re-render (early-return) as before. Context still updates every poll (it's computed before the
+  early-return); new terminal turns are in `current_session["turns"]` and paint on tab open/switch.
+  Showing them live would need an INCREMENTAL append (delta only), not a full re-render — deferred.
+- STILL OPEN: image attachments render as a 2nd raw `[Image: source: /path]` YOU bubble.
+
+---
+
+## 2026-06-18 (Ollama "Not installed" fix + work-log freeze fix)
+
+### New-agent dialog: Ollama no longer shows "Not installed"
+- `open_new_agent_dialog` checked every base agent for a CLI executable in PATH. Ollama is
+  HTTP-backed (no `ollama` binary needed), so it always failed the check and the "Open tab"
+  button was disabled. Now `agent_key == "ollama"` is "Ready" when the local server is reachable
+  (`_list_ollama_models() is not None`), reusing the same probe the Local-models list already does.
+
+### Work-log render freeze (O(n²)) — fixed
+- `_insert_work_entry` called `yview()` + `see("end")` after every line, forcing a full layout
+  recompute per entry. Loading a session with a huge work log (runaway agent turn) ground the UI
+  to a halt (main thread pegged for minutes). Added `_suspend_work_autoscroll`: `_render_session`
+  sets it for the whole bulk render so entries insert with no per-line scroll; one `see("end")` at
+  the end. The work log is persisted, so this had to land before restarting or the app re-freezes.
+
+---
+
+## 2026-06-18 (usage = real % again, per-client skills, interrupt REVERTED)
+
+### Claude usage badge shows real 5h / weekly PERCENTAGES again (not request counts)
+- **Root cause:** `claude -p /usage` on a Max subscription returns only local request
+  counts ("Last 24h · N requests"), NOT the 5h/weekly utilization percentages. An earlier
+  fix this day embraced the request-count format ("N req/24h · M req/7d"). The user wants
+  the percentages back — the same ones claude.ai and the interactive `/usage` gauge show.
+- **Fix:** New `_claude_oauth_usage()` calls the real source the TUI gauge uses —
+  `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token from
+  `~/.claude/.credentials.json` (`anthropic-beta: oauth-2025-04-20`). Parses
+  `five_hour.utilization` → "5h", `seven_day.utilization` → "week",
+  `seven_day_sonnet.utilization` → "sonnet". `claude_usage_limits()` now returns these as
+  normal `windows` (same shape as Codex), so the badge renders "Usage: 10% 5h · 45% week".
+- `claude -p /usage` local request-count parsing is kept as a **fallback** if the endpoint
+  is unreachable or the token is missing. Verified live against the account (matches claude.ai).
+
+### Skills bar is now PER-CLIENT
+- `discover_skills(cwd, agent_key)` is agent-aware: Claude → BUILTIN + `~/.claude/skills` + plugins;
+  Codex → `~/.codex/skills/**`; Gemini → `~/.gemini/commands/**`; local/Ollama → none.
+- `skill_favorites` are now per-agent (`skill_favorites_by_agent`), migrating the old flat list
+  into the Claude bucket. The bar + menu re-render for the active tab's client; empty state for
+  clients with no skills. (Verified: Claude 39, Codex 5, Gemini 0, Ollama 0.)
+
+### Interrupt & Send — REVERTED (user rejected it)
+- The "[ Queue ] [ ⚡ Interrupt & Send ]" banner added earlier today was fully removed.
+  Send-while-busy now silently QUEUES (terminal-style) and the running turn finishes;
+  **Stop is the only thing that interrupts a turn.** All banner UI, helpers, and dismiss
+  hooks removed; `send()`'s busy branch is back to `self._queue_prompt(...)`.
+
+---
+
+## 2026-06-18 (Ollama as a single agent + queue editor fix)
+
+### Ollama is now ONE agent in the menu with a model picker
+- Added a base `{"key": "ollama", "label": "Ollama"}` agent spec alongside Codex/Claude/Gemini.
+  Installed local models are now chosen in the **model picker** (`_model_options_for("ollama")` →
+  `"Default"` + live `/api/tags` list, cached 8s) instead of every model being its own menu entry.
+- `_create_backend_set` now always builds a base `"ollama"` OllamaBackend; per-model custom_clients
+  with an `ollama_chat` model are **no longer registered as separate agent entries** (they cluttered
+  the menu). Real CLI custom clients (those with a launch command) are unaffected.
+- `OllamaBackend` constructed with no fixed model; `start_turn` resolves the live model from the
+  session's backend settings each turn. `"Default"`/empty → `_resolve_ollama_model()` auto-picks an
+  installed model (prefers qwen3-coder:30b, then qwen3:14b, else first available).
+- Added `"ollama"` to EFFORT_OPTIONS / DEFAULT_AGENT_SETTINGS and the settings-validation loop.
+- NOTE: this is the single-agent + model-picker layer. Multi-model **sub-agent distribution**
+  (different Ollama models for different sub-tasks) is the next layer, not yet built.
+
+### Queue editor: white cursor, reliable copy/paste/cut, accurate Saved state
+- Insertion cursor changed to solid white (`insertbackground="#ffffff"`).
+- Dirty/Saved is now computed by comparing the editor content to the loaded baseline
+  (`_loaded_text`) on `<KeyRelease>` — arrow keys, Ctrl+C, and modifier presses no longer produce a
+  false "unsaved" state; undoing an edit back to the original flips the button back to **Saved**.
+- Explicit clipboard handlers (`_detail_copy/_cut/_paste/_select_all`) bound to Ctrl+C/X/V/A (upper
+  and lower case) and the `<<Copy/Cut/Paste>>` virtual events, driving CLIPBOARD directly so Linux
+  PRIMARY-vs-CLIPBOARD inconsistency is gone. Each returns `"break"` to stop double-handling.
+
+### Reverted: Queue-vs-Interrupt "Interrupt & Send" banner
+- Removed entirely. Sending while a session is busy **queues silently** again (previous behavior).
+  Only the **Stop** button interrupts a running turn — sending a message never does.
+  (The earlier "interrupt-and-send" entry below is superseded by this revert.)
+
+---
+
+## 2026-06-18 (per-client skills bar)
+
+### Client-aware Skills bar
+- `discover_skills(cwd)` is now `discover_skills(cwd, agent_key="claude")` and branches on the active agent:
+  - **Claude** — unchanged (BUILTIN_SKILLS + `~/.claude/skills` + project `.claude/skills` + plugins).
+  - **Codex** — recursive scan of `~/.codex/skills/**/SKILL.md`; parses the same YAML frontmatter (name/description). Includes `.system/` skills (imagegen, skill-creator, etc.).
+  - **Gemini** — recursive scan of `~/.gemini/commands/**/*.toml`; name = file stem (or `subdir:stem`), description from `description = "..."` line if present. Currently empty on this machine but wired.
+  - **Ollama/local/custom** — returns `[]` immediately (no skills concept).
+  - Shared frontmatter parsing extracted into `_parse_skill_md_frontmatter()` to eliminate duplication.
+- `skill_favorites` is now **per-agent**: stored in config under `skill_favorites_by_agent = {"claude": [...], "codex": [...], ...}`.
+  - **Migration:** if `skill_favorites_by_agent` is absent but old flat `skill_favorites` list exists, it is seeded into the `"claude"` bucket automatically.
+  - New `_agent_favorites(agent_key)` helper returns the mutable list for a given agent, creating an empty entry on first access.
+  - `_save_skill_favorites` now writes `skill_favorites_by_agent` to config.
+- `_render_skill_chips` reads `_agent_favorites(active_agent)` so chips update when switching tabs.
+- `open_skills_menu` passes the active agent key to `discover_skills`, shows a "Skills for: Claude/Codex/Gemini" header strip, and shows "No skills available for this client." when the list is empty (Ollama/local).
+- `_toggle_skill_favorite` resolves the active agent and mutates only that agent's favorites list.
+- `_restore_workspace` comment updated: favorites are now per-agent, not global.
+
+---
+
+## 2026-06-18 (interrupt-and-send)
+
+### Queue vs Interrupt & Send choice banner
+- When `send()` is called while the session is busy, instead of silently queueing,
+  an inline orange-bordered banner now appears above the controls bar with two buttons:
+  **Queue** (existing behavior) and **⚡ Interrupt & Send** (queues the message AND
+  calls `backend.interrupt()` so the queued message fires immediately after the interrupted turn ends).
+- Banner auto-dismisses on: choice made, workspace tab switch, or turn_done.
+- Composer text is cleared after the banner appears (same as before), so the draft is
+  not lost inside the banner's pending choice.
+- No modal dialog; fully inline between the Skills bar and the status/controls bar.
+
+---
+
+## 2026-06-18 (state injection rendering fix)
+
+### SB-010 — project_state_context: wrap output in session_context tags
+- **Root cause:** PROJECT SHARED STATE injection was prepended to user messages as raw text,
+  not wrapped in `<session_context>` tags. `visible_user_prompt_text` detected the prefix
+  (`has_hidden_prefix = True`) but the fallback branch only stripped single-line "Also read..."
+  patterns — leaving the entire multi-paragraph AGENT_STATE block visible as a YOU bubble.
+- **Fix:** `project_state_context()` now wraps its output in `<session_context>…</session_context>`.
+  The existing `strip_session_context` path in `visible_user_prompt_text` (line 572) already
+  handles this tag correctly and was already the right machinery — it just wasn't being reached
+  because the injection wasn't tagged. No changes to stripping logic needed.
+
+---
+
+## 2026-06-18 (Ollama write-guard)
+
+### SB-009 (v2) — request_project_state_update: require direct title match; removed scored fallback
+- **Root cause of v1 failure:** `session_candidate_root_scores` (the `scored` check) was truthy for the
+  "Next Agent Workbench" Codex session against OG AWB's root because that session's JSONL contained
+  OG AWB file paths — they were injected into context from the shared source file reference. This made
+  `alias_only = False` and bypassed the guard.
+- **Fix:** Removed `scored` entirely from the write guard. Auto-writes now require `_project_root_from_title`
+  to return the same root as `infer_project_root`. If the title doesn't directly name a known project
+  directory, no background AGENT_STATE write occurs, regardless of path-score evidence.
+
+### SB-009 (v1) — request_project_state_update: alias-only inference no longer auto-writes AGENT_STATE
+- **Root cause:** Ollama's `local_project_state_summary` was overwriting OG AWB's `AGENT_STATE.md`
+  with stale "Agent Workbench Next" Codex session content. A Codex tab titled "Next Agent Workbench"
+  resolved (correctly, for read/injection) to OG AWB via the registry alias lookup, but then
+  `request_project_state_update` auto-wrote that Codex session's content to OG AWB's state file.
+- **Fix:** Added an alias-only guard in `request_project_state_update`. If the root was resolved
+  only by alias (i.e. `_project_root_from_title` returns no direct match AND
+  `session_candidate_root_scores` returns no path-score evidence), the auto-write is skipped.
+  The project-state indicator is still updated (read is still valid); only the write is blocked.
+  Explicit user-triggered updates (`update_project_state()`, `force=True`) bypass the guard.
+
+---
+
+## 2026-06-18 (usage display + status bar)
+
+### Usage panel takes over half the screen — fixed
+- **Root cause:** `claude -p /usage` on Claude Code Max subscription returns a multi-paragraph
+  local-stats block ("What's contributing to your limits usage? Last 24h · 3330 requests…") instead
+  of the API-rate-limit format. The entire block was stored as `error` and then set via
+  `self.status.set(...)` which expanded the status bar label to fill vertical space.
+- **Fix 1 (source):** error path in `usage_updated` handler now only writes the first line of the
+  error to the status bar (`full_error.split("\n")[0]`).
+- **Fix 2 (systemic):** Added a `trace_add("write", …)` guard on `self.status` StringVar that
+  clamps any multi-line text to its first line immediately after any `.set()` call. This protects
+  the status bar against future multi-line content from any code path.
+- **Fix 3 (badge):** `claude_usage_limits` now parses the local-stats format
+  ("Last 24h · N requests · M sessions") and synthesises a `label_text` field. `_display_usage`
+  shows "Usage: N req/24h · M req/7d" in the badge instead of "--" for Max subscribers.
+
+## 2026-06-18 (lower-severity cleanup batch)
+
+### DEAD-001 — codex_history_prompts: deleted dead function
+- `codex_history_prompts()` had zero call sites. Removed entirely.
+
+### DEAD-005 — _stream_stderr: deduplicated from ClaudeBackend and GeminiBackend
+- Identical `_stream_stderr` methods in both backends moved to `StreamCliBackend` parent. Both call sites
+  resolve through MRO automatically.
+
+### DEAD-008 — migrate_legacy_config: removed permanently-dead migration
+- `migrate_legacy_config()` and its `App.__init__` call removed. The `CONFIG_DIR` exists on any machine
+  that has run the app; the early-return guard fired every startup. Migration window from
+  codex-conversation-viewer → agent-workbench has long closed.
+
+### DEAD-002 — _working_status_text: deleted unused method
+- `App._working_status_text()` had zero call sites. Removed.
+
+### DEAD-003 — ClaudeBackend: deleted unused visible_chunks/emitted_visible
+- `visible_chunks = []` and `emitted_visible = False` in `ClaudeBackend.start_turn` were never read;
+  copy-paste leftovers from GeminiBackend. Removed.
+
+### DEAD-004 — _restore_workspace: removed stale self-attribute assignments
+- `self.session_context_active` and `self.session_context_buffer` were set from workspace dict but never
+  read (all live code reads from the workspace dict directly). Removed.
+
+### DEAD-009 — _block_vertical_tab_wheel: deleted unused method
+- `App._block_vertical_tab_wheel()` was never bound or called. Removed.
+
+### SB-005 — new_handoff_session: removed home-dir cwd fallback
+- Changed `cwd=project_root or source.get('cwd') or os.path.expanduser('~')` to use `''` instead of
+  home as the floor. Home is not a meaningful project directory and misled scope-conflict checks.
+
+### SB-007 / HO-005 — structured_handoff_packet: removed dead home_state_path replacement
+- `home_state_path = project_state_path(os.path.expanduser('~'))` always returns `''` (home guard).
+  The `packet.replace(...)` call was permanently unreachable. Three lines removed.
+
+### AWB-003 — check_client_updates: destroy guard + TclError protection
+- Added `finalizing_close` guard before `self.win.after(0, ...)` and wrapped the call in
+  `try/except Exception` to silently discard TclError if the window is destroyed while the
+  background check runs (up to 25s per spec).
+
+### AWB-004 — animate_activity: added finalizing_close guard
+- Added `if self.finalizing_close: return` as first line of `animate_activity`, matching the pattern
+  used by `refresh_prompt_state` and `poll_usage`. Prevents StringVar mutation and timer reschedule
+  during teardown.
+
+### AWB-004 (Gemini) — GeminiBackend: turn_done now reflects actual result status
+- `turn_done` was always emitted with `status='completed'` regardless of Gemini result. Now emits
+  `status='error'` when the result event's status is not 'success'. Fixes suppressed error indicators
+  and blocked retry logic for failed Gemini turns.
+
+### AWB-006 (image label) — preview_selected_artifact: fixed layout split on text preview
+- `artifact_preview_image_label` was always packed from init and never hidden when text preview was
+  shown. Now pack_forget'd before branching and re-packed in image/unavailable branches.
+  `_clear_artifact_preview` also re-packs the label after clearing.
+
+### AWB-006 (PTY) — CustomCliBackend: kill zombie PTY processes after wait() timeout
+- After `running.wait(timeout=5)` in the `finally` block, if `poll()` is still None, now calls
+  `os.killpg(SIGKILL)` (falling back to `running.kill()`) to prevent orphaned PTY children.
+
+### AWB-007 — StringVar traces: explicit trace_remove on popup/dialog close
+- `search_var` trace in skill popup and `mode_var` trace in handoff dialog are now removed in their
+  respective close handlers via `trace_remove`, preventing Tcl-level callbacks firing against
+  destroyed widget trees.
+
+### AWB-008 (tab order) — _render_workspace_tabs_now: order_sig committed after loop
+- `self._workspace_tabs_order_sig` is now assigned after the tab-packing loop completes rather than
+  before it, so a TclError mid-loop doesn't permanently suppress re-renders.
+
+### AWB-008 (rollout) — codex_rollout_turns: apply visible_user_prompt_text at parse time
+- `userMessage` items are now stored with `visible_user_prompt_text(raw)` applied, so injected AWB
+  preambles don't appear as visible user messages when old rollout files are displayed.
+
+### HO-002 / HO-003 — handoff_summary_text: filter 'project registry:' and registry injection lines
+- Added `"project registry:"` and `"also read the project registry before acting"` to the per-line
+  skip filter. Added regex to strip `^Also read the project registry before acting:` from raw text.
+  Added `"also read the project registry before acting"` to `visible_user_prompt_text` has_hidden_prefix
+  tuple (belt-and-suspenders).
+
+---
+
+## 2026-06-18 (bug-fix batch)
+
+### SB-001 — infer_project_root: deleted dead/dangerous fallback lines
+- Removed lines that re-returned `/home/zito` as project root when `find_project_root(cwd)` resolved to
+  the home directory but `cwd` itself was not home. The preceding guard (`root != home → return root`)
+  already covers the valid case; the deleted lines were unreachable for valid roots and incorrectly
+  returned home for invalid ones.
+
+### SB-003 — project_registry_path, project_memory_dir: home-dir guard added
+- Both functions now return `""` when `cwd` resolves to the bare home directory, matching the existing
+  guard in `project_state_path`. Prevents structured handoff packets from emitting
+  `~/.agent-workbench/project.json` for unresolved sessions and stops the receiving agent being directed
+  to read a cross-project registry file.
+
+### SB-004 — alias/slug normaliser: two-pass suffix strip for "Session N" / "Day N" patterns
+- `_project_title_slugs` and `_project_root_from_registry_aliases` now strip counter-noun + digit suffixes
+  (`Session 7`, `Day 3`, `Round 14`, etc.) before the existing bare-digit strip. Both passes run in order
+  so "Pig Farm Session 7" → "Pig Farm" and "Pig Farm 7" → "Pig Farm" both resolve to the same alias.
+
+### SB-008 — project_scope_conflict / infer_project_root: shared expected-root helper
+- Extracted `_infer_expected_root(session, fallback_cwd)` (delegates to `infer_project_root`). Both
+  `project_scope_conflict` and `infer_project_root` now derive the expected root from the same code path,
+  eliminating the divergence where conflict detection used `self OR title OR alias` short-circuit while
+  inference used a more complex stored-root reconciliation.
+
+### AWB-002 — ClaudeBackend: session_id write guarded by self.lock
+- Background reader thread that writes `session["backend"]["session_id"]` on `system/init` events now
+  acquires `self.lock` (the same lock used to guard `self.running`) before the dict mutation, eliminating
+  the race with main-thread readers of `session["backend"]`.
+
+### AWB-003 — GeminiBackend: session_id write guarded by self.lock
+- Identical race to AWB-002; same fix applied. GeminiBackend inherits `self.lock` from StreamCliBackend.
+
+### AWB-005 — CodexBackend: thread_id / active_threads guarded by self.lock
+- `_handle_notification` thread/created write, `ensure_session` early-return read, post-wait writes, and
+  `restart` clear/reset are all now wrapped in `with self.lock`. `interrupt` snapshots `thread_id` and
+  `turn_id` under the lock before issuing the request, preventing a race with `restart`.
+
+### AWB-001 (tab render) — pack_forget TclError no longer skips pack
+- Changed `continue` to `pass` in the `pack_forget` except-TclError handler inside
+  `_render_workspace_tabs_now`. Previously a TclError on a brand-new (never-packed) frame would
+  `continue` past the `pack()` call, leaving the tab invisible until a full re-render was triggered.
+
+### AWB-002 (update dialog) — work thread guards against destroyed window/dialog
+- `work()` closure in `open_client_updates_dialog` now wraps `self.win.after(0, done)` in
+  `try/except TclError`, and `done()` returns early if `dialog.winfo_exists()` is False. Prevents
+  TclError crashes when the update dialog or main window is closed while a 600-second update runs in
+  the background.
+
+### AWB-001 (Ollama semaphore) — OllamaBackend.start_turn acquires _OLLAMA_INFERENCE_SEM
+- Interactive Ollama turns now acquire the module-level GPU semaphore (blocking) before the inference
+  loop and release it in a `finally` block. This serialises concurrent Ollama sessions and simultaneous
+  `local_project_state_summary` calls, preventing two HTTP inference requests from hitting the GPU at
+  the same time.
+
+### HO-001 — visible_user_prompt_text: fallback for payloads without </session_context>
+- Added a fallback branch (mirrors `handoff_summary_text`) that strips known AWB prefix lines and stray
+  `<session_context>` blocks when `has_hidden_prefix` is True but the `</session_context>` sentinel is
+  absent. Previously such payloads silently returned `""`, losing the user's actual prompt. Only
+  activates for old-format payloads that predate the time-context injection.
+
+---
+
 ## 2026-06-18
+
+### Session bleed fix — bidirectional cross-project state injection eliminated
+- **Root cause:** `infer_project_root` failed to match "Next Agent Workbench" (session title) to the
+  `Agent Workbench Next` directory because the title slug ("next-agent-workbench") didn't match the
+  directory name ("Agent Workbench Next"). The fallback `session_candidate_root_scores` then found
+  Pig Farm file paths in the stored Codex JSONL (from prior injected context) and returned the Pig
+  Farm root — causing all subsequent Codex turns in that tab to receive Pig Farm AGENT_STATE.
+- **Fix 1 — word-rotation slugs:** `_project_title_slugs` now also generates a first-word-rotated
+  variant (e.g. "Next Agent Workbench" → slug "agent-workbench-next") so `_project_root_from_title`
+  can directly find the correct directory without any additional lookup.
+- **Fix 2 — registry alias lookup:** new `_project_root_from_registry_aliases` function scans all
+  known project directories for `.agent-workbench/project.json` files and matches the session title
+  against registered `aliases`. Called from `infer_project_root` before falling through to path
+  scoring, so a registered alias always wins over content-derived paths. "Next Agent Workbench" is
+  already in the OG AWB `project.json` aliases, so it resolves correctly.
+- **Fix 3 — conflict detection:** `project_scope_conflict` now also uses the alias lookup when
+  `_project_root_from_title` fails, so the conflict-guard UI works for alias-matched sessions too.
+- **Root cause 2 (bidirectional bleed):** Every Codex session has `cwd = /home/zito` in the DB
+  (Codex always uses home). Sessions whose titles fail all lookups fell through to returning
+  `/home/zito` as the project root. A stale `/home/zito/AGENT_STATE.md` with AWB handoff content
+  was then injected into Pig Farm sessions (and vice versa) as "PROJECT SHARED STATE."
+- **Fix 4 — never treat home dir as project root:** `infer_project_root` final fallback now
+  returns `""` when the resolved root is the home directory. `project_state_path` also guards
+  against home dir so no state file is read/written there. This eliminates the AGENT_STATE
+  cross-contamination for all unresolvable sessions. Stale `/home/zito/AGENT_STATE.md`
+  archived to `AGENT_STATE.md.stale`.
 
 ### Attachment injection + AGENT_STATE no longer visible in conversation
 - **Root cause:** `visible_user_prompt_text` stripped `PROJECT SHARED STATE` headers and

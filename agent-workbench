@@ -138,11 +138,13 @@ EFFORT_OPTIONS = {
     "codex": ("low", "medium", "high", "xhigh"),
     "claude": ("low", "medium", "high", "xhigh", "max"),
     "gemini": ("Default",),
+    "ollama": ("Default",),
 }
 DEFAULT_AGENT_SETTINGS = {
     "codex": {"model": "gpt-5.3-spark", "effort": "high"},
     "claude": {"model": "Default", "effort": "medium"},
     "gemini": {"model": "Auto", "effort": "Default"},
+    "ollama": {"model": "Default", "effort": "Default"},
 }
 LEGACY_CODEX_MODEL = "gpt-5.5"
 LEGACY_CODEX_EFFORT = "medium"
@@ -207,6 +209,16 @@ SESSION_CONTEXT_BLOCK = re.compile(
 )
 SESSION_CONTEXT_OPEN = "<session_context>"
 SESSION_CONTEXT_CLOSE = "</session_context>"
+# Blocks the Claude Code harness injects as user-role transcript turns but which the
+# user never typed: background-agent completion notices and system reminders. They must
+# never render as YOU bubbles (or pollute a Hand Off packet) in the mirrored view.
+HARNESS_INJECTION_BLOCK = re.compile(
+    r"<task-notification>.*?</task-notification>"
+    r"|<system-reminder>.*?</system-reminder>"
+    r"|<local-command-stdout>.*?</local-command-stdout>"
+    r"|<local-command-stderr>.*?</local-command-stderr>",
+    re.IGNORECASE | re.DOTALL,
+)
 CONTEXT_WARNING_PERCENT = 70
 CONTEXT_CRITICAL_PERCENT = 85
 HANDOFF_MAX_CHARS = 24000
@@ -506,6 +518,46 @@ def strip_session_context(text):
     return raw, stripped
 
 
+def strip_harness_injections(text):
+    """Return only what the USER actually typed in a user-role transcript turn, after
+    removing every harness/system injection Claude Code stores as user turns to feed the
+    model: background-agent task notifications, system reminders, session context,
+    local-command output, the post-compaction continuation summary, and the AWB
+    attachment wrapper. Returns "" when the whole turn was injected machine content, so a
+    mirrored view never shows it as a YOU bubble."""
+    raw = clean_text(text)
+    if not raw:
+        return ""
+    # Block-form injections (open/close tagged).
+    cleaned = SESSION_CONTEXT_BLOCK.sub("", raw)
+    cleaned = HARNESS_INJECTION_BLOCK.sub("", cleaned)
+    cleaned = clean_text(cleaned)
+    if not cleaned:
+        return ""
+    # The harness injects a large "This session is being continued…" summary as a USER
+    # turn after each auto-compaction. It is machine content, not user input.
+    if cleaned.lstrip().lower().startswith(
+        "this session is being continued from a previous conversation"
+    ):
+        return ""
+    # AWB-generated bare attachment prompt (file attached with no typed message).
+    if cleaned.lstrip().lower().startswith(
+        "please inspect and respond to the attached file"
+    ):
+        return ""
+    # Strip AWB handoff / project-state / registry prefixes + the attachment wrapper
+    # (reuses the comprehensive helper). Leaves only what the user actually typed.
+    cleaned = clean_text(visible_user_prompt_text(cleaned))
+    if not cleaned:
+        return ""
+    # Bare image-attachment artifacts ("[Image: source: /path]", "[Image #N]"). If the
+    # turn is ONLY image references with no real words, it's an attachment echo — hide it.
+    # Mixed turns (image marker + real text) keep their text untouched.
+    if not clean_text(re.sub(r"\[Image[^\]]*\]", "", cleaned)):
+        return ""
+    return cleaned
+
+
 def _strip_attachment_injection(text):
     """Strip the AWB attachment injection wrapper, returning only the user request text.
 
@@ -548,6 +600,7 @@ def visible_user_prompt_text(text):
             "project shared state",
             "read the authoritative continuation handoff",
             "also read the shared project state",
+            "also read the project registry before acting",
         )
     )
     if has_hidden_prefix:
@@ -556,7 +609,17 @@ def visible_user_prompt_text(text):
             _, visible = strip_session_context(suffix)
             result = clean_text(visible or suffix)
         else:
-            return ""
+            # Fallback for payloads predating session_context injection:
+            # strip known AWB prefix lines and any stray session_context blocks.
+            fallback = SESSION_CONTEXT_BLOCK.sub("", raw)
+            for pattern in (
+                r"^Read the authoritative continuation handoff before acting:\s*\S+\s*",
+                r"^Also read the shared project state before acting:\s*\S+\s*",
+                r"^Also read the project registry before acting:\s*\S+\s*",
+                r"^This handoff is being injected into an existing session\..*",
+            ):
+                fallback = re.sub(pattern, "", fallback, flags=re.IGNORECASE | re.MULTILINE)
+            result = clean_text(fallback)
     else:
         _, visible = strip_session_context(raw)
         result = visible
@@ -714,15 +777,6 @@ def unique_destination(directory, name):
         candidate = os.path.join(directory, f"{base} {counter}{ext}")
         counter += 1
     return candidate
-
-
-def migrate_legacy_config():
-    if os.path.exists(CONFIG_DIR) or not os.path.isdir(LEGACY_CONFIG_DIR):
-        return
-    try:
-        shutil.copytree(LEGACY_CONFIG_DIR, CONFIG_DIR)
-    except OSError:
-        pass
 
 
 def set_window_icon(window):
@@ -1101,19 +1155,27 @@ def claude_jsonl_turns(path):
                         if isinstance(block, dict) and block.get("type") == "tool_result"
                     ]
                     if prompt:
+                        # Strip harness-injected blocks (task notifications, system
+                        # reminders) the user never typed. If nothing user-authored
+                        # remains, this is a machine turn: flush the prior assistant text
+                        # at the boundary but render NO "YOU" bubble for it.
+                        visible_prompt = strip_harness_injections(prompt)
                         flush_assistant_text(final=True)
-                        current = {
-                            "id": record_id or str(uuid.uuid4()),
-                            "created_at": clean_text(obj.get("timestamp")) or now_iso(),
-                            "status": "completed",
-                            "items": [
-                                {
-                                    "type": "userMessage",
-                                    "content": [{"type": "text", "text": prompt}],
-                                }
-                            ],
-                        }
-                        turns.append(current)
+                        if visible_prompt:
+                            current = {
+                                "id": record_id or str(uuid.uuid4()),
+                                "created_at": clean_text(obj.get("timestamp")) or now_iso(),
+                                "status": "completed",
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "content": [{"type": "text", "text": visible_prompt}],
+                                    }
+                                ],
+                            }
+                            turns.append(current)
+                        else:
+                            current = None
                     for result in tool_results:
                         output = result.get("content")
                         if isinstance(output, list):
@@ -1220,26 +1282,6 @@ def claude_jsonl_turns(path):
     return [turn for turn in turns if turn.get("items")]
 
 
-def codex_history_prompts():
-    path = os.path.expanduser("~/.codex/history.jsonl")
-    prompts = {}
-    try:
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                session_id = obj.get("session_id")
-                text = clean_text(obj.get("text"))
-                if not session_id or not text:
-                    continue
-                prompts.setdefault(session_id, []).append((obj.get("ts") or 0, text))
-    except OSError:
-        return {}
-    return prompts
-
-
 def codex_rollout_turns(path):
     if not path or not os.path.isfile(path):
         return []
@@ -1263,6 +1305,7 @@ def codex_rollout_turns(path):
                     text = clean_text(payload.get("message"))
                     if not text:
                         continue
+                    visible_text = visible_user_prompt_text(text) or text
                     current = {
                         "id": str(uuid.uuid4()),
                         "created_at": clean_text(obj.get("timestamp")) or now_iso(),
@@ -1272,7 +1315,7 @@ def codex_rollout_turns(path):
                     turns.append(current)
                     item = {
                         "type": "userMessage",
-                        "content": [{"type": "text", "text": text}],
+                        "content": [{"type": "text", "text": visible_text}],
                     }
                 elif record_type == "event_msg" and event_type == "agent_message":
                     text = clean_text(payload.get("message"))
@@ -2348,12 +2391,123 @@ def _humanize_skill_desc(raw):
     return text[:120]
 
 
-def discover_skills(cwd):
+def _parse_skill_md_frontmatter(path, fallback_name):
+    """Parse name/description from a SKILL.md YAML frontmatter block.
+
+    Returns (name, description) strings; falls back to fallback_name / "".
+    Never raises.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        name = None
+        desc = None
+        in_front = False
+        dash_count = 0
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            if stripped == "---":
+                dash_count += 1
+                if dash_count == 1:
+                    in_front = True
+                    continue
+                if dash_count == 2:
+                    break
+            if not in_front:
+                continue
+            if stripped.startswith("name:"):
+                name = stripped[5:].strip().strip('"').strip("'")
+            elif stripped.startswith("description:"):
+                desc = stripped[12:].strip().strip('"').strip("'")
+        if not name:
+            name = fallback_name
+        return name, (desc or "")[:140]
+    except Exception:
+        return fallback_name, ""
+
+
+def discover_skills(cwd, agent_key="claude"):
     """Return a sorted, de-duped list of skill dicts {name, description, source}.
 
-    Scans SKILL.md files under personal, project, and plugin directories in
-    addition to the built-in list.  Never raises; returns what it can find.
+    agent_key controls which client's skills are scanned:
+      "claude"  — BUILTIN_SKILLS + ~/.claude/skills + project .claude/skills + plugins
+      "codex"   — ~/.codex/skills/** recursive SKILL.md scan
+      "gemini"  — ~/.gemini/commands/** recursive *.toml scan (may be empty)
+      anything else (ollama/local/custom) — returns []
+
+    Never raises; returns what it can find.
     """
+    home = os.path.expanduser("~")
+
+    # ------------------------------------------------------------------ Codex
+    if agent_key == "codex":
+        try:
+            seen = {}
+            codex_skills_root = os.path.join(home, ".codex", "skills")
+            if os.path.isdir(codex_skills_root):
+                for dirpath, _dirnames, filenames in os.walk(codex_skills_root):
+                    if "SKILL.md" in filenames:
+                        skill_md = os.path.join(dirpath, "SKILL.md")
+                        # Use the immediate directory name as the fallback skill name.
+                        fallback = os.path.basename(dirpath)
+                        try:
+                            name, desc = _parse_skill_md_frontmatter(skill_md, fallback)
+                            if name and name not in seen:
+                                seen[name] = {"name": name, "description": desc, "source": "codex"}
+                        except Exception:
+                            pass
+            return sorted(seen.values(), key=lambda s: s["name"])
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------ Gemini
+    if agent_key == "gemini":
+        try:
+            seen = {}
+            gemini_commands_root = os.path.join(home, ".gemini", "commands")
+            if os.path.isdir(gemini_commands_root):
+                for dirpath, _dirnames, filenames in os.walk(gemini_commands_root):
+                    for fname in filenames:
+                        if not fname.endswith(".toml"):
+                            continue
+                        stem = fname[:-5]  # strip .toml
+                        # If the file lives in a subdirectory of commands/, prefix with
+                        # the relative subdir path using ":" as separator (e.g. "ns:cmd").
+                        rel = os.path.relpath(dirpath, gemini_commands_root)
+                        if rel == ".":
+                            skill_name = stem
+                        else:
+                            skill_name = rel.replace(os.sep, ":") + ":" + stem
+                        if skill_name in seen:
+                            continue
+                        # Parse description from the TOML file without adding a dep.
+                        desc = ""
+                        try:
+                            toml_path = os.path.join(dirpath, fname)
+                            with open(toml_path, encoding="utf-8", errors="replace") as fh:
+                                for line in fh:
+                                    m = re.match(
+                                        r"""^\s*description\s*=\s*["'](.+?)["']\s*$""", line
+                                    )
+                                    if m:
+                                        desc = m.group(1)[:140]
+                                        break
+                        except Exception:
+                            pass
+                        seen[skill_name] = {
+                            "name": skill_name,
+                            "description": desc,
+                            "source": "gemini",
+                        }
+            return sorted(seen.values(), key=lambda s: s["name"])
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------ Claude (default)
+    if agent_key != "claude":
+        # Custom/local/unknown client — no skills concept.
+        return []
+
     try:
         seen = {}  # name -> dict; first-seen wins
         # Built-ins first (win over plugins on collision)
@@ -2361,7 +2515,6 @@ def discover_skills(cwd):
             seen[name] = {"name": name, "description": desc, "source": "built-in"}
 
         scan_dirs = []
-        home = os.path.expanduser("~")
         # personal skills
         scan_dirs.append((os.path.join(home, ".claude", "skills"), "personal"))
         # project skills
@@ -2388,32 +2541,7 @@ def discover_skills(cwd):
                     if not os.path.isfile(skill_md):
                         continue
                     try:
-                        name = None
-                        desc = None
-                        with open(skill_md, encoding="utf-8", errors="replace") as fh:
-                            lines = fh.readlines()
-                        in_front = False
-                        dash_count = 0
-                        for raw_line in lines:
-                            stripped = raw_line.strip()
-                            if stripped == "---":
-                                dash_count += 1
-                                if dash_count == 1:
-                                    in_front = True
-                                    continue
-                                if dash_count == 2:
-                                    break
-                            if not in_front:
-                                continue
-                            if stripped.startswith("name:"):
-                                name = stripped[5:].strip().strip('"').strip("'")
-                            elif stripped.startswith("description:"):
-                                desc = stripped[12:].strip().strip('"').strip("'")
-                        if not name:
-                            name = skill_dir
-                        if not desc:
-                            desc = ""
-                        desc = desc[:140]
+                        name, desc = _parse_skill_md_frontmatter(skill_md, skill_dir)
                         if name not in seen:
                             seen[name] = {"name": name, "description": desc, "source": source}
                     except Exception:
@@ -2680,6 +2808,12 @@ def _project_title_slugs(session):
         raw,
         flags=re.IGNORECASE,
     )
+    raw = re.sub(
+        r"\s+(?:session|day|week|part|chapter|round|run|iteration|episode)\s+\d+\s*$",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    ).strip()
     raw = re.sub(r"\b\d+$", "", raw).strip()
     if not raw:
         return []
@@ -2689,7 +2823,76 @@ def _project_title_slugs(session):
     candidates = [slug]
     if not slug.startswith("the-"):
         candidates.append("the-" + slug)
+    # Also try rotating the first word to the end:
+    # "Next Agent Workbench" → "agent-workbench-next" matches dir "Agent Workbench Next"
+    words = raw.lower().split()
+    if len(words) > 1:
+        rotated = " ".join(words[1:] + [words[0]])
+        rotated_slug = re.sub(r"[^a-z0-9]+", "-", rotated).strip("-")
+        if rotated_slug and rotated_slug not in candidates:
+            candidates.append(rotated_slug)
+            if not rotated_slug.startswith("the-"):
+                candidates.append("the-" + rotated_slug)
     return candidates
+
+
+def _project_root_from_registry_aliases(session):
+    """Find project root by matching session title against registered project aliases."""
+    raw = clean_text(
+        (session or {}).get("title")
+        or (session or {}).get("preview")
+        or (session or {}).get("handoff_base_title")
+    )
+    if not raw:
+        return ""
+    raw = re.sub(
+        r"^(?:codex|claude|gemini|ollama|openai|anthropic|google)\s*:\s*",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    ).strip()
+    raw = re.sub(
+        r"\s+(?:session|day|week|part|chapter|round|run|iteration|episode)\s+\d+\s*$",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    ).strip()
+    raw = re.sub(r"\b\d+$", "", raw).strip()
+    if not raw:
+        return ""
+    raw_lower = raw.lower()
+    home = os.path.abspath(os.path.expanduser("~"))
+    search_roots = [
+        home,
+        os.path.join(home, "Projects"),
+        os.path.join(home, "Projects", "Open Projects"),
+        os.path.join(home, "Projects", "Open Games"),
+    ]
+    seen = set()
+    for base in search_roots:
+        if not os.path.isdir(base) or base in seen:
+            continue
+        seen.add(base)
+        try:
+            for entry in os.scandir(base):
+                if not entry.is_dir():
+                    continue
+                registry_file = os.path.join(
+                    entry.path, PROJECT_REGISTRY_DIRNAME, PROJECT_REGISTRY_FILENAME
+                )
+                if not os.path.isfile(registry_file):
+                    continue
+                data = load_json(registry_file, {})
+                if not isinstance(data, dict):
+                    continue
+                for alias in data.get("aliases") or []:
+                    if clean_text(alias).lower() == raw_lower:
+                        root = clean_text(data.get("root")) or entry.path
+                        if root and os.path.isdir(root):
+                            return os.path.abspath(root)
+        except OSError:
+            continue
+    return ""
 
 
 def _project_root_from_title(session, cwd):
@@ -2817,14 +3020,16 @@ def session_candidate_root_scores(session, expected_root=""):
     return scores
 
 
+def _infer_expected_root(session, fallback_cwd=""):
+    """Shared helper: compute the single authoritative expected project root for
+    a session. Used by both project_scope_conflict and infer_project_root so both
+    agree on the expected root for the same session input."""
+    return infer_project_root(session, fallback_cwd)
+
+
 def project_scope_conflict(session=None, fallback_cwd=""):
     session = session or {}
-    cwd = os.path.abspath(
-        os.path.expanduser(
-            clean_text(session.get("cwd")) or clean_text(fallback_cwd) or os.path.expanduser("~")
-        )
-    )
-    expected = _self_maintenance_project_root(session) or _project_root_from_title(session, cwd)
+    expected = _infer_expected_root(session, fallback_cwd)
     if not expected:
         return {}
     scores = session_candidate_root_scores(session, expected)
@@ -2892,15 +3097,23 @@ def infer_project_root(session=None, fallback_cwd=""):
         return stored_root
     if title_root:
         return title_root
+    # Registry alias lookup: check all known project.json files for a matching alias.
+    # Catches cases where the session title matches a registered alias but the directory
+    # name differs (e.g. "Next Agent Workbench" title → "Agent Workbench Next" dir).
+    alias_root = _project_root_from_registry_aliases(session)
+    if alias_root:
+        return alias_root
     scored = session_candidate_root_scores(session)
     if scored:
-        return max(scored, key=lambda root: (scored[root], len(root)))
+        best = max(scored, key=lambda root: (scored[root], len(root)))
+        if os.path.abspath(best) != home:
+            return best
     root = find_project_root(cwd)
     if root and os.path.abspath(root) != home:
         return root
-    if root and os.path.abspath(cwd) != home:
-        return root
-    return cwd if os.path.isdir(cwd) else ""
+    # Never return bare home dir — it's not a real project root and reading
+    # AGENT_STATE.md from there would cross-contaminate unrelated sessions.
+    return ""
 
 
 def project_state_path_for_session(session=None, fallback_cwd=""):
@@ -2915,6 +3128,9 @@ def project_state_path(cwd):
     cwd = os.path.abspath(os.path.expanduser(clean_text(cwd) or os.path.expanduser("~")))
     if not os.path.isdir(cwd):
         return ""
+    # Never treat bare home dir as a project — AGENT_STATE.md there is spurious.
+    if cwd == os.path.abspath(os.path.expanduser("~")):
+        return ""
     return os.path.join(cwd, PROJECT_STATE_FILENAME)
 
 
@@ -2922,12 +3138,18 @@ def project_registry_path(cwd):
     cwd = os.path.abspath(os.path.expanduser(clean_text(cwd) or os.path.expanduser("~")))
     if not os.path.isdir(cwd):
         return ""
+    # Never treat bare home dir as a project registry location.
+    if cwd == os.path.abspath(os.path.expanduser("~")):
+        return ""
     return os.path.join(cwd, PROJECT_REGISTRY_DIRNAME, PROJECT_REGISTRY_FILENAME)
 
 
 def project_memory_dir(cwd):
     cwd = os.path.abspath(os.path.expanduser(clean_text(cwd) or os.path.expanduser("~")))
     if not os.path.isdir(cwd):
+        return ""
+    # Never treat bare home dir as a project memory location.
+    if cwd == os.path.abspath(os.path.expanduser("~")):
         return ""
     return os.path.join(cwd, PROJECT_REGISTRY_DIRNAME)
 
@@ -2957,6 +3179,11 @@ def ensure_project_registry(cwd, session=None, agent_key="", title="", state_pat
     if not os.path.isdir(root):
         return ""
     path = project_registry_path(root)
+    if not path:
+        # No registry location for this root (e.g. the bare home dir is guarded).
+        # Bail BEFORE save_json — saving to "" raises [Errno 2] '' and broke Hand Off
+        # Deploy for any session whose cwd is the home directory.
+        return ""
     existing = load_json(path, {}) if path else {}
     if not isinstance(existing, dict):
         existing = {}
@@ -3063,7 +3290,7 @@ def project_state_context(cwd):
             "\n\n[Excerpt truncated. Read the file directly before making "
             "decisions that depend on older project history.]"
         )
-    return (
+    body = (
         "PROJECT SHARED STATE — read before acting:\n"
         f"- Canonical file: {path}\n"
         f"- Project root: {root}\n"
@@ -3074,6 +3301,9 @@ def project_state_context(cwd):
         "- If this turn changes durable project facts, update this file before finishing.\n\n"
         f"{text.strip()}{truncated}"
     )
+    # Wrap in session_context so visible_user_prompt_text can reliably strip the
+    # entire block from the rendered conversation (it already handles this tag).
+    return f"{SESSION_CONTEXT_OPEN}\n{body}\n{SESSION_CONTEXT_CLOSE}"
 
 
 def strip_prior_state_snapshots(text):
@@ -3223,6 +3453,12 @@ def structured_handoff_packet(session, max_chars=HANDOFF_MAX_CHARS):
             raw,
             flags=re.IGNORECASE,
         )
+        raw = re.sub(
+            r"^Also read the project registry before acting:\s*\S+\s*",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        )
         if raw.lstrip().startswith("PROJECT SHARED STATE"):
             return ""
         if raw.lstrip().startswith("# Agent State"):
@@ -3238,10 +3474,12 @@ def structured_handoff_packet(session, max_chars=HANDOFF_MAX_CHARS):
                 (
                     "read the authoritative continuation handoff before acting",
                     "also read the shared project state before acting",
+                    "also read the project registry before acting",
                     "canonical file:",
                     "source title:",
                     "source client:",
                     "project directory:",
+                    "project registry:",
                     "shared project state:",
                     "source context usage:",
                     "generated:",
@@ -3480,9 +3718,6 @@ def structured_handoff_packet(session, max_chars=HANDOFF_MAX_CHARS):
         "- Continue the user's latest objective directly after a brief acknowledgment.",
     ] + (["- Before changing anything, orient yourself in the program — read its structure, run `git status`, and run the build/check command listed above — so you know the current state before acting."] if is_sw_project else [])
     packet = "\n".join(parts)
-    home_state_path = project_state_path(os.path.expanduser("~"))
-    if state_path and home_state_path and state_path != home_state_path:
-        packet = packet.replace(home_state_path, state_path)
     if len(packet) > max_chars:
         packet = packet[: max_chars - 160].rstrip() + (
             "\n\n[Handoff truncated at the configured safety limit. "
@@ -3566,7 +3801,62 @@ def codex_usage_limits(source_path=""):
     return {"provider": "Codex", "windows": [], "error": "No rate-limit telemetry yet."}
 
 
+def _claude_oauth_usage():
+    """Real 5h / weekly utilization % from the OAuth usage endpoint — the same
+    source as the interactive `/usage` gauge and claude.ai. Returns a list of
+    window dicts (or None), so the caller can fall back to the CLI local stats."""
+    try:
+        creds_path = os.path.expanduser("~/.claude/.credentials.json")
+        with open(creds_path, encoding="utf-8") as handle:
+            oauth = (json.load(handle) or {}).get("claudeAiOauth") or {}
+        token = clean_text(oauth.get("accessToken"))
+    except (OSError, ValueError):
+        return None
+    if not token:
+        return None
+    try:
+        request = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-beta": "oauth-2025-04-20",
+                "anthropic-version": "2023-06-01",
+                "Accept": "application/json",
+                "User-Agent": "claude-cli/2.1.183",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=12) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    windows = []
+    for label, key in (("5h", "five_hour"), ("week", "seven_day"), ("sonnet", "seven_day_sonnet")):
+        value = data.get(key)
+        if isinstance(value, dict) and value.get("utilization") is not None:
+            reset = ""
+            iso = value.get("resets_at")
+            if iso:
+                try:
+                    reset = format_reset_time(datetime.fromisoformat(iso).timestamp())
+                except (TypeError, ValueError):
+                    reset = ""
+            windows.append(
+                {
+                    "label": label,
+                    "used_percent": round(float(value.get("utilization") or 0)),
+                    "reset": reset,
+                }
+            )
+    return windows or None
+
+
 def claude_usage_limits():
+    # Primary source: real 5h / weekly utilization % from the OAuth usage
+    # endpoint (matches claude.ai and the interactive /usage gauge). Falls back
+    # to `claude -p /usage` local request-count stats if it is unreachable.
+    oauth_windows = _claude_oauth_usage()
+    if oauth_windows:
+        return {"provider": "Claude", "windows": oauth_windows}
     try:
         result = subprocess.run(
             [
@@ -3613,10 +3903,15 @@ def claude_usage_limits():
             )
     if windows:
         return {"provider": "Claude", "windows": windows}
+    # HARD LOCK: the usage badge shows PERCENTAGES only (5h / week utilization from the
+    # OAuth endpoint, the same source as claude.ai and the interactive /usage gauge).
+    # We deliberately do NOT fall back to "N req/24h" request counts — that regression
+    # has bitten us repeatedly. If no percentage is available, return empty windows and
+    # let the display keep the last-known good % (or show "--"), never request counts.
     return {
         "provider": "Claude",
         "windows": [],
-        "error": text or "Claude did not return usage details.",
+        "error": (text.split("\n")[0].strip() if text else "") or "Claude usage percentage unavailable.",
     }
 
 
@@ -3812,7 +4107,7 @@ class SessionStore:
         )
         session = self._make_session(
             agent_key=agent_key or source.get("agent", "codex"),
-            cwd=project_root or source.get("cwd") or os.path.expanduser("~"),
+            cwd=project_root or source.get("cwd") or "",
             title=title,
             backend=backend or {},
             turns=[],
@@ -4137,7 +4432,10 @@ class CodexBackend(BaseBackend):
                 )
         elif method == "thread/created" or method == "thread/resumed":
             thread = params.get("thread") or {}
-            self.thread_id = thread.get("id") or self.thread_id
+            new_id = thread.get("id")
+            if new_id:
+                with self.lock:
+                    self.thread_id = new_id
 
     def _extract_text(self, item):
         parts = []
@@ -4150,9 +4448,10 @@ class CodexBackend(BaseBackend):
         backend = session.setdefault("backend", {})
         backend.setdefault("kind", "codex")
         existing_thread_id = backend.get("thread_id")
-        if existing_thread_id and existing_thread_id in self.active_threads:
-            self.thread_id = existing_thread_id
-            return
+        with self.lock:
+            if existing_thread_id and existing_thread_id in self.active_threads:
+                self.thread_id = existing_thread_id
+                return
 
         result_holder = {}
         error_holder = {}
@@ -4189,8 +4488,9 @@ class CodexBackend(BaseBackend):
         if not thread_id:
             raise RuntimeError("Codex did not return a thread ID")
         backend["thread_id"] = thread_id
-        self.thread_id = thread_id
-        self.active_threads.add(thread_id)
+        with self.lock:
+            self.thread_id = thread_id
+            self.active_threads.add(thread_id)
         session["backend"] = backend
         sync_codex_session_title(session)
 
@@ -4246,10 +4546,13 @@ class CodexBackend(BaseBackend):
         self.respond(request_id, {"answers": answers})
 
     def interrupt(self):
-        if self.thread_id and self.turn_id:
+        with self.lock:
+            thread_id = self.thread_id
+            turn_id = self.turn_id
+        if thread_id and turn_id:
             self.request(
                 "turn/interrupt",
-                {"threadId": self.thread_id, "turnId": self.turn_id},
+                {"threadId": thread_id, "turnId": turn_id},
             )
 
     def restart(self, cwd):
@@ -4259,9 +4562,10 @@ class CodexBackend(BaseBackend):
         self.stop_flag.clear()
         self.ready.clear()
         self.pending.clear()
-        self.active_threads.clear()
-        self.thread_id = None
-        self.turn_id = None
+        with self.lock:
+            self.active_threads.clear()
+            self.thread_id = None
+            self.turn_id = None
         self.start(cwd)
 
     def close(self):
@@ -4285,6 +4589,17 @@ class StreamCliBackend(BaseBackend):
     def close(self):
         self.stop_flag.set()
         self.interrupt()
+
+    def _stream_stderr(self):
+        proc = self.running
+        if not proc or not proc.stderr:
+            return
+        for raw in proc.stderr:
+            if self.stop_flag.is_set():
+                break
+            line = raw.strip()
+            if line:
+                self.emit("work", text=line, tag="system")
 
 
 class OllamaBackend(StreamCliBackend):
@@ -4379,10 +4694,31 @@ class OllamaBackend(StreamCliBackend):
         super().__init__(events, spec.get("key", "ollama"), workspace_id)
         self.spec = spec
         self.base_url = "http://localhost:11434"
-        raw_model = spec.get("model") or spec.get("label") or "qwen3-coder:30b"
+        # The single "Ollama" agent is constructed with no fixed model — start_turn
+        # resolves the live model from the model picker each turn. Legacy per-model
+        # clients still pass a concrete model here.
+        raw_model = spec.get("model") or ""
         # /api/chat needs the bare model id, not the aider-style "ollama_chat/" prefix.
         self.model = re.sub(r"^ollama(_chat)?/", "", clean_text(raw_model))
         self.messages = []  # Multi-turn conversation history (incl. tool turns)
+
+    def _resolve_ollama_model(self):
+        """Pick a concrete installed model when none is set or 'Default' is chosen."""
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen(
+                f"{self.base_url}/api/tags", timeout=1.5
+            ) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            names = [m["name"] for m in data.get("models", []) if m.get("name")]
+        except Exception:
+            names = []
+        # Prefer a capable coder model if installed, else first available.
+        for preferred in ("qwen3-coder:30b", "qwen3:14b"):
+            if preferred in names:
+                return preferred
+        return names[0] if names else "qwen3-coder:30b"
 
     def _ollama_chat(self, messages):
         import urllib.request
@@ -4544,6 +4880,17 @@ class OllamaBackend(StreamCliBackend):
     def start_turn(self, session, turn, prompt, context_text=""):
         import urllib.error
 
+        # Resolve which Ollama model to run from the model picker (stored on the
+        # session's backend settings). "Default"/empty → auto-pick an installed model.
+        launch_model = re.sub(
+            r"^ollama(_chat)?/", "",
+            clean_text((session.get("backend") or {}).get("model")),
+        )
+        if launch_model and launch_model.lower() != "default":
+            self.model = launch_model
+        if not self.model or self.model.lower() in ("", "default", "ollama"):
+            self.model = self._resolve_ollama_model()
+
         def run():
             cwd = session.get("cwd") or os.path.expanduser("~")
             if not os.path.isdir(cwd):
@@ -4573,6 +4920,7 @@ class OllamaBackend(StreamCliBackend):
                 payload = context_text.strip() + "\n\n" + prompt.strip()
             self.messages.append({"role": "user", "content": payload})
 
+            _OLLAMA_INFERENCE_SEM.acquire()  # block until GPU is free
             final_text = ""
             status = "completed"
             try:
@@ -4632,6 +4980,8 @@ class OllamaBackend(StreamCliBackend):
             except Exception as exc:
                 self.emit("error", text=f"Local agent error: {exc}")
                 status = "error"
+            finally:
+                _OLLAMA_INFERENCE_SEM.release()
 
             if status == "completed" and not final_text:
                 self.emit("assistant_message", text="(done — no summary returned)", speaker=speaker)
@@ -4752,6 +5102,14 @@ class CustomCliBackend(StreamCliBackend):
                         running.wait(timeout=5)
                     except Exception:
                         pass
+                    if running.poll() is None:
+                        try:
+                            os.killpg(os.getpgid(running.pid), signal.SIGKILL)
+                        except OSError:
+                            try:
+                                running.kill()
+                            except OSError:
+                                pass
                     rc = running.poll()
                     if rc is not None and rc != 0:
                         final_status = "error"
@@ -4980,8 +5338,6 @@ class ClaudeBackend(StreamCliBackend):
                 tag="command",
             )
             buffer = []
-            visible_chunks = []
-            emitted_visible = False
             final_status = "completed"
             final_error = ""
             with self.lock:
@@ -5012,7 +5368,8 @@ class ClaudeBackend(StreamCliBackend):
                         if subtype == "init":
                             sid = event.get("session_id")
                             if sid:
-                                session.setdefault("backend", {})["session_id"] = sid
+                                with self.lock:
+                                    session.setdefault("backend", {})["session_id"] = sid
                             self.emit(
                                 "work",
                                 text=f"claude session {sid or session_id}",
@@ -5152,17 +5509,6 @@ class ClaudeBackend(StreamCliBackend):
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _stream_stderr(self):
-        proc = self.running
-        if not proc or not proc.stderr:
-            return
-        for raw in proc.stderr:
-            if self.stop_flag.is_set():
-                break
-            line = raw.strip()
-            if line:
-                self.emit("work", text=line, tag="system")
-
 
 class GeminiBackend(StreamCliBackend):
     def __init__(self, events, workspace_id=None):
@@ -5197,6 +5543,7 @@ class GeminiBackend(StreamCliBackend):
             self.emit("work", text="$ " + shlex.join(cmd), tag="command")
             visible_chunks = []
             emitted_visible = False
+            gemini_status = "success"
             with self.lock:
                 self.running = subprocess.Popen(
                     cmd,
@@ -5223,7 +5570,8 @@ class GeminiBackend(StreamCliBackend):
                     if etype == "init":
                         sid = event.get("session_id")
                         if sid:
-                            session.setdefault("backend", {})["session_id"] = sid
+                            with self.lock:
+                                session.setdefault("backend", {})["session_id"] = sid
                         self.emit(
                             "work",
                             text=f"Gemini session {sid or session_id}",
@@ -5250,6 +5598,7 @@ class GeminiBackend(StreamCliBackend):
                             emitted_visible = True
                             self.emit("assistant_message", speaker="GEMINI", text=final_text)
                         status = event.get("status") or "success"
+                        gemini_status = status
                         stats = event.get("stats") or {}
                         if stats:
                             self.emit(
@@ -5275,7 +5624,7 @@ class GeminiBackend(StreamCliBackend):
                         self.emit("work", text=line, tag="system")
                 if emitted_visible:
                     self.emit("assistant_done", speaker="GEMINI")
-                self.emit("turn_done", status="completed")
+                self.emit("turn_done", status="completed" if gemini_status == "success" else "error")
             except Exception as exc:
                 self.emit("error", text=str(exc))
                 self.emit("turn_done", status="error")
@@ -5285,21 +5634,9 @@ class GeminiBackend(StreamCliBackend):
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _stream_stderr(self):
-        proc = self.running
-        if not proc or not proc.stderr:
-            return
-        for raw in proc.stderr:
-            if self.stop_flag.is_set():
-                break
-            line = raw.strip()
-            if line:
-                self.emit("work", text=line, tag="system")
-
 
 class App:
     def __init__(self):
-        migrate_legacy_config()
         self.config = load_json(CONFIG_FILE, {})
         self._needs_codex_workspace_migration = False
         self._load_secrets()
@@ -5448,18 +5785,23 @@ class App:
             {"key": "codex", "label": "Codex", "color": CODEX},
             {"key": "claude", "label": "Claude", "color": CLAUDE},
             {"key": "gemini", "label": "Gemini", "color": GEMINI},
+            # Ollama is a single agent; its installed models are chosen in the model
+            # picker (see _model_options_for) instead of each model being its own entry.
+            {"key": "ollama", "label": "Ollama", "color": "#10b981"},
         ]
         for client in self.custom_clients:
             key = clean_text(client.get("key"))
             label = clean_text(client.get("label"))
             command = clean_text(client.get("command"))
             model = clean_text(client.get("model"))
-            # Register both CLI clients (have a command) and local Ollama agents
-            # (have a model, no command) so connected local models survive restarts.
-            if key and label and (command or model):
-                color = "#10b981" if (model and not command) else "#67e8f9"
+            # Local Ollama models are now selectable under the single "Ollama" agent's
+            # model picker — don't clutter the agent menu with one entry per model.
+            if model and not command and "ollama_chat" in model:
+                continue
+            # Register only real CLI clients (those with a launch command).
+            if key and label and command:
                 self.agent_specs.append(
-                    {"key": key, "label": label, "color": color, "custom": True}
+                    {"key": key, "label": label, "color": "#67e8f9", "custom": True}
                 )
         self.agent_map = {spec["key"]: spec for spec in self.agent_specs}
         saved_agent_settings = self.config.get("agent_settings") or {}
@@ -5488,7 +5830,8 @@ class App:
             if self.agent_settings["claude"].get("model") == "sonnet":
                 self.agent_settings["claude"]["model"] = "Default"
             self.config["client_default_models_v1"] = True
-        for agent_key in ("codex", "claude", "gemini"):
+        self.agent_settings.setdefault("ollama", {"model": "Default", "effort": "Default"})
+        for agent_key in ("codex", "claude", "gemini", "ollama"):
             settings = self.agent_settings[agent_key]
             model_options = self._model_options_for(agent_key)
             effort_options = self._effort_options_for(agent_key)
@@ -5547,6 +5890,17 @@ class App:
         self.selected_model = tk.StringVar(master=self.win, value=initial_settings["model"])
         self.selected_effort = tk.StringVar(master=self.win, value=initial_settings["effort"])
         self.status = tk.StringVar(master=self.win, value="Starting…")
+        self._status_clamping = False
+        def _clamp_status_to_one_line(*_):
+            if self._status_clamping:
+                return
+            v = self.status.get()
+            if "\n" not in v:
+                return
+            self._status_clamping = True
+            self.status.set(v.split("\n")[0].strip())
+            self._status_clamping = False
+        self.status.trace_add("write", _clamp_status_to_one_line)
         self.activity_text = tk.StringVar(master=self.win, value="Starting")
         self.worker_text = tk.StringVar(master=self.win, value="Worker --")
         self.queue_text = tk.StringVar(master=self.win, value="")
@@ -5579,11 +5933,18 @@ class App:
         self.handoff_dialog = None
         self.worker_dialog = None
         self.queue_dialog = None
+        self._modal_scroll_lock = 0  # >0 while a modal list dialog is open (blocks bg scroll)
         self._subagents_popover = None
         self._skill_popover = None
-        self.skill_favorites = self.config.get("skill_favorites") or []
-        if not isinstance(self.skill_favorites, list):
-            self.skill_favorites = []
+        # Per-agent skill favorites — keyed by agent_key ("claude", "codex", "gemini").
+        # Migration: seed claude bucket from the legacy flat list if present.
+        _legacy_favs = self.config.get("skill_favorites")
+        _per_agent = self.config.get("skill_favorites_by_agent")
+        if not isinstance(_per_agent, dict):
+            _per_agent = {}
+        if not _per_agent and isinstance(_legacy_favs, list) and _legacy_favs:
+            _per_agent["claude"] = list(_legacy_favs)
+        self.skill_favorites_by_agent = _per_agent
         self.terminal_history = []
         self.terminal_history_index = 0
         self._draft_persist_after = None
@@ -5621,6 +5982,7 @@ class App:
         self._refresh_queue_dialog()
         self.win.after(50, self.drain_events)
         self.win.after(2000, self.poll_external_session)
+        self.win.after(3000, self.poll_live_sessions)
         self.win.after(700, self.warn_interrupted_turns)
         self.win.after(1000, self.poll_update_request)
         self.win.after(1500, self.watchdog)
@@ -5672,6 +6034,13 @@ class App:
             "codex": CodexBackend(self.events, workspace_id),
             "claude": ClaudeBackend(self.events, workspace_id),
             "gemini": GeminiBackend(self.events, workspace_id),
+            # Single Ollama agent — the actual model is set per-turn from the model
+            # picker (see OllamaBackend.start_turn reading session backend settings).
+            "ollama": OllamaBackend(
+                self.events,
+                {"key": "ollama", "label": "Ollama", "model": ""},
+                workspace_id,
+            ),
         }
         for client in self.custom_clients:
             key = clean_text(client.get("key"))
@@ -5753,6 +6122,22 @@ class App:
         saved = self.config.get("workspace_tabs")
         if not isinstance(saved, list) or not saved:
             return False
+        # Collapse duplicate tabs that point at the same underlying session. The (now
+        # disabled) live-session auto-open could spawn many tabs for one session; this
+        # makes sure they don't pile back up on restart. Blank tabs (no session) kept.
+        deduped = []
+        seen_sids = set()
+        for spec in saved:
+            if not isinstance(spec, dict):
+                continue
+            cs = spec.get("current_session") or {}
+            sid = clean_text(cs.get("source_session_id") or cs.get("id"))
+            if sid:
+                if sid in seen_sids:
+                    continue
+                seen_sids.add(sid)
+            deduped.append(spec)
+        saved = deduped
         for spec in saved[:8]:
             if not isinstance(spec, dict):
                 continue
@@ -5910,9 +6295,20 @@ class App:
         )
         save_json(CONFIG_FILE, self.config, durable=False)
 
+    def _agent_favorites(self, agent_key):
+        """Return the mutable favorites list for *agent_key*, creating it on first access."""
+        key = agent_key or "claude"
+        if key not in self.skill_favorites_by_agent:
+            self.skill_favorites_by_agent[key] = []
+        lst = self.skill_favorites_by_agent[key]
+        if not isinstance(lst, list):
+            lst = []
+            self.skill_favorites_by_agent[key] = lst
+        return lst
+
     def _save_skill_favorites(self):
-        """Persist skill_favorites list to config.json (non-durable write)."""
-        self.config["skill_favorites"] = self.skill_favorites
+        """Persist per-agent skill favorites to config.json (non-durable write)."""
+        self.config["skill_favorites_by_agent"] = self.skill_favorites_by_agent
         save_json(CONFIG_FILE, self.config, durable=False)
 
     def _schedule_workspace_config_save(self, immediate=False):
@@ -5947,10 +6343,18 @@ class App:
         self.selected_model.set(workspace["model"])
         self.selected_effort.set(workspace["effort"])
         self.status.set(workspace["status"])
-        self._display_usage(workspace.get("usage") or {})
+        # Show cached usage immediately; fall back to the global per-provider cache so
+        # switching tabs never shows "--" when another tab of the same provider already
+        # fetched up-to-date data.
+        agent_key = clean_text(workspace.get("agent"))
+        display_usage = (
+            workspace.get("usage")
+            or (self.agent_usage.get(agent_key) if agent_key else None)
+            or {}
+        )
+        self._display_usage(display_usage)
         self.usage_last_updated = clean_text(workspace.get("usage_last_updated")) or ""
-        # Auto-fetch usage whenever a tab becomes active (shows cached instantly,
-        # refreshes in the background) so the badge never sits blank until clicked.
+        # Auto-fetch usage whenever a tab becomes active so the badge stays current.
         self.refresh_usage(manual=False)
         if (
             workspace.get("busy")
@@ -5975,8 +6379,6 @@ class App:
         self.live_token_count = int(workspace.get("live_token_count") or 0)
         self.pending_attachments = list(workspace["pending_attachments"])
         self.queued_prompts = list(workspace.get("queued_prompts") or [])
-        self.session_context_active = bool(workspace.get("session_context_active"))
-        self.session_context_buffer = clean_text(workspace.get("session_context_buffer"))
         self.chat_updates_pending = bool(
             workspace.get("chat_updates_pending")
         )
@@ -6063,7 +6465,7 @@ class App:
         else:
             self.stop_btn.pack_forget()
             self.win.after(0, self._send_next_queued_prompt)
-        # Re-render the skills chips bar (favorites are global, not per-tab)
+        # Re-render the skills chips bar (favorites are PER-AGENT — update when switching tabs)
         if hasattr(self, "skill_chips"):
             self._render_skill_chips()
 
@@ -6084,8 +6486,18 @@ class App:
         dialog.title("New agent tab")
         dialog.configure(bg=BG)
         dialog.transient(self.win)
-        dialog.resizable(False, False)
-        dialog.grab_set()
+        dialog.resizable(False, True)  # vertical resize so the scroll list can grow
+        dialog.grab_set()  # modal: block the main window until closed / agent chosen
+        dialog.attributes("-topmost", True)  # always on top so it can't be lost behind
+        dialog.focus_force()
+        self._modal_scroll_lock += 1  # block the session list from scrolling underneath
+        dialog.bind(
+            "<Destroy>",
+            lambda e: e.widget is dialog and setattr(
+                self, "_modal_scroll_lock", max(0, self._modal_scroll_lock - 1)
+            ),
+            add="+",
+        )
 
         body = tk.Frame(dialog, bg=BG, padx=20, pady=18)
         body.pack(fill="both", expand=True)
@@ -6105,17 +6517,63 @@ class App:
             wraplength=460,
         ).pack(anchor="w", pady=(4, 14))
 
+        # Ollama is HTTP-backed (no CLI executable). It's "installed" when the local
+        # server is reachable — reuse this list for the Local-models section below too.
+        ollama_models = self._list_ollama_models()
+
+        # Scrollable body: the agent + local-model list can be taller than the screen
+        # (8+ local models ran off the bottom with no way to reach them). Host every
+        # row in a capped-height canvas with a working mouse wheel + scrollbar.
+        scroll_wrap = tk.Frame(body, bg=BG)
+        scroll_wrap.pack(fill="both", expand=True)
+        scroll_canvas = tk.Canvas(scroll_wrap, bg=BG, highlightthickness=0, height=460)
+        scroll_bar = tk.Scrollbar(scroll_wrap, orient="vertical", command=scroll_canvas.yview)
+        scroll_content = tk.Frame(scroll_canvas, bg=BG)
+        scroll_window = scroll_canvas.create_window((0, 0), window=scroll_content, anchor="nw")
+        scroll_canvas.configure(yscrollcommand=scroll_bar.set)
+        scroll_canvas.pack(side="left", fill="both", expand=True)
+        scroll_bar.pack(side="right", fill="y")
+        scroll_content.bind(
+            "<Configure>",
+            lambda _e: scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all")),
+        )
+        scroll_canvas.bind(
+            "<Configure>",
+            lambda e: scroll_canvas.itemconfigure(scroll_window, width=e.width),
+        )
+
+        def _new_agent_wheel(event):
+            # Only scroll when the pointer is actually over THIS dialog. bind_all
+            # otherwise captures wheel events from the whole app, so scrolling the
+            # session list behind the dialog double-scrolled this list too.
+            under = dialog.winfo_containing(event.x_root, event.y_root)
+            if under is None or under.winfo_toplevel() is not dialog:
+                return
+            step = -1 if (getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0) else 1
+            scroll_canvas.yview_scroll(step, "units")
+
+        for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            scroll_canvas.bind_all(_seq, _new_agent_wheel)
+        dialog.bind(
+            "<Destroy>",
+            lambda e: e.widget is dialog
+            and [scroll_canvas.unbind_all(s) for s in ("<MouseWheel>", "<Button-4>", "<Button-5>")],
+        )
+
         for spec in self.agent_specs:
             agent_key = spec["key"]
             if spec.get("custom"):
                 # Connected custom/local client (Ollama HTTP-backed or a validated
                 # custom CLI) — no system executable to probe; it's ready.
                 installed = True
+            elif agent_key == "ollama":
+                # Reachable Ollama server (models list is non-None) = ready.
+                installed = ollama_models is not None
             else:
                 exe = self._agent_executable(agent_key)
                 installed = bool(exe) and shutil.which(exe)
             row = tk.Frame(
-                body,
+                scroll_content,
                 bg=PANEL,
                 highlightbackground="#2d3b49",
                 highlightthickness=1,
@@ -6156,14 +6614,13 @@ class App:
 
         # Local models (Ollama): auto-list installed models that aren't connected
         # yet, so a pulled model is startable here directly. "Start" connects it and
-        # opens a new tab.
-        ollama_models = self._list_ollama_models()
+        # opens a new tab. (Reuses the ollama_models probed above.)
         if ollama_models:
             connected = {clean_text(c.get("model")) for c in self.custom_clients}
             available = [m for m in ollama_models if f"ollama_chat/{m}" not in connected]
             if available:
                 tk.Label(
-                    body,
+                    scroll_content,
                     text="Local models (Ollama) — free, runs on this machine",
                     bg=BG,
                     fg=MUTED,
@@ -6171,7 +6628,7 @@ class App:
                     anchor="w",
                 ).pack(fill="x", pady=(14, 2))
                 for model in available:
-                    row = tk.Frame(body, bg=PANEL, highlightbackground="#2d3b49", highlightthickness=1)
+                    row = tk.Frame(scroll_content, bg=PANEL, highlightbackground="#2d3b49", highlightthickness=1)
                     row.pack(fill="x", pady=4)
                     info = tk.Frame(row, bg=PANEL)
                     info.pack(side="left", fill="x", expand=True, padx=12, pady=10)
@@ -6190,6 +6647,23 @@ class App:
                         pady=5,
                         cursor="hand2",
                     ).pack(side="right", padx=10)
+
+        # Finalize scrolling now that every row exists:
+        #  - set scrollregion to span ALL rows so the scrollbar thumb sizes/moves right
+        #    (it wasn't reflecting position before), and
+        #  - cap the window's max height to the content height so dragging the bottom
+        #    reveals more agent rows and then STOPS — instead of opening a black buffer
+        #    below the list.
+        scroll_content.update_idletasks()
+        content_h = scroll_content.winfo_reqheight()
+        visible_h = min(content_h, 520)
+        scroll_canvas.configure(
+            scrollregion=scroll_canvas.bbox("all") or (0, 0, 0, content_h),
+            height=visible_h,
+        )
+        dialog.update_idletasks()
+        chrome = max(0, dialog.winfo_reqheight() - visible_h)
+        dialog.maxsize(dialog.winfo_reqwidth() + 400, content_h + chrome)
 
         dialog.bind("<Escape>", lambda _e: dialog.destroy())
         dialog.update_idletasks()
@@ -6380,9 +6854,6 @@ class App:
             return 1
         return 0
 
-    def _block_vertical_tab_wheel(self, _event=None):
-        return "break"
-
     def _on_tab_mousewheel(self, event, horizontal_handler):
         if getattr(event, "state", 0) & 0x0001:
             return horizontal_handler(event)
@@ -6524,7 +6995,6 @@ class App:
         tail_kind = "limit" if n >= MAX_WORKSPACE_TABS else "new"
         order_sig = tuple(order) + (tail_kind,)
         needs_reorder = order_sig != getattr(self, "_workspace_tabs_order_sig", None)
-        self._workspace_tabs_order_sig = order_sig
 
         for pos, workspace_id in enumerate(order):
             workspace = self.workspaces[workspace_id]
@@ -6587,7 +7057,7 @@ class App:
                 try:
                     tab["frame"].pack_forget()
                 except tk.TclError:
-                    continue
+                    pass  # new frames were never packed; ignore and fall through to pack()
                 tab["frame"].configure(
                     bg=tab_bg,
                     highlightbackground="#e2e8f0" if selected else tab_bg,
@@ -6625,6 +7095,8 @@ class App:
                     )
                 except tk.TclError:
                     pass
+
+        self._workspace_tabs_order_sig = order_sig
 
         tail = getattr(self, "_workspace_tabs_tail", None)
         if not tail or tail.get("kind") != tail_kind:
@@ -7421,34 +7893,10 @@ class App:
             cursor="hand2",
             font=("Sans", 9, "bold"),
         ).pack(side="left")
-        # Context Limit % at the far right of the Skills bar (above Send), with
-        # Hand Off directly to its left — they go hand in hand.
-        self.context_badge = tk.Label(
-            self.skills_bar,
-            textvariable=self.context_text,
-            bg="#1a2432",
-            fg="#dbeafe",
-            padx=10,
-            pady=4,
-            font=("Sans", 9, "bold"),
-        )
-        self.context_badge.pack(side="right")
-        self.topbar_handoff_btn = tk.Button(
-            self.skills_bar,
-            text="Hand Off",
-            command=self.handoff_session,
-            bg="#7c2d12",
-            fg="#fed7aa",
-            disabledforeground="#64748b",
-            activebackground="#ea580c",
-            activeforeground="white",
-            relief="flat",
-            padx=11,
-            pady=5,
-            cursor="arrow",
-            state="disabled",
-        )
-        self.topbar_handoff_btn.pack(side="right", padx=(0, 6))
+        # Right-aligned group, ordered left→right: [Context Limit] [Hand Off] [State].
+        # State is packed FIRST so it sits at the far right (above Send); Context Limit is
+        # packed LAST so when its text widens on compaction it grows LEFT into the chip
+        # area instead of shoving Hand Off / State leftward.
         self.project_state_btn = tk.Button(
             self.skills_bar,
             textvariable=self.project_state_text,
@@ -7459,17 +7907,45 @@ class App:
             activeforeground=TEXT,
             disabledforeground="#64748b",
             relief="flat",
-            padx=10,
+            width=8,
             pady=5,
             cursor="hand2",
             font=("Sans", 9, "bold"),
         )
-        self.project_state_btn.pack(side="right", padx=(0, 6))
+        self.project_state_btn.pack(side="right", padx=(6, 0))
+        self.topbar_handoff_btn = tk.Button(
+            self.skills_bar,
+            text="Hand Off",
+            command=self.handoff_session,
+            bg="#7c2d12",
+            fg="#fed7aa",
+            disabledforeground="#64748b",
+            activebackground="#ea580c",
+            activeforeground="white",
+            relief="flat",
+            width=8,
+            pady=5,
+            cursor="arrow",
+            state="disabled",
+        )
+        self.topbar_handoff_btn.pack(side="right", padx=(6, 0))
+        self.context_badge = tk.Label(
+            self.skills_bar,
+            textvariable=self.context_text,
+            bg="#1a2432",
+            fg="#dbeafe",
+            padx=10,
+            pady=4,
+            font=("Sans", 9, "bold"),
+        )
+        self.context_badge.pack(side="right", padx=(6, 0))
         # chips fill the middle (packed last so expand takes the leftover space).
         chips_wrap = tk.Frame(self.skills_bar, bg=PANEL)
         chips_wrap.pack(side="left", fill="x", expand=True)
         self.skill_chips = tk.Frame(chips_wrap, bg=PANEL)
-        self.skill_chips.pack(anchor="center")
+        # Left-align (not centered): a centered frame jumps horizontally when a different
+        # agent's favorites change the total chip width on tab switch.
+        self.skill_chips.pack(anchor="w")
         self._render_skill_chips()
 
         # (2) Status + controls bar (lower, single row): Sub-agents, warnings,
@@ -7518,6 +7994,9 @@ class App:
         # Active% at the far right (above Send), Hand Off at the far left.
         self.hint = tk.Label(bar, textvariable=self.status, bg=PANEL, fg=MUTED, anchor="w")
         self.hint.pack(side="left", fill="x", expand=True)
+        # Uniform button width (chars) so Send / Attach / Stop / Hand Off / State all
+        # match — they looked sloppy at different widths.
+        FOOTER_BTN_WIDTH = 8
         self.send_btn = tk.Button(
             bar,
             text="Send",
@@ -7527,7 +8006,7 @@ class App:
             activebackground="#6aa0ff",
             activeforeground="white",
             relief="flat",
-            padx=16,
+            width=FOOTER_BTN_WIDTH,
             pady=6,
             cursor="hand2",
         )
@@ -7541,13 +8020,14 @@ class App:
             activebackground="#243249",
             activeforeground=TEXT,
             relief="flat",
-            padx=12,
+            width=FOOTER_BTN_WIDTH,
             pady=6,
             cursor="hand2",
         )
         self.attach_btn.pack(side="right", padx=(0, 6))
         self.stop_btn = tk.Button(
-            bar, text="Stop", command=self.stop, bg="#9f2d2d", fg="white", relief="flat", padx=12, pady=6
+            bar, text="Stop", command=self.stop, bg="#9f2d2d", fg="white", relief="flat",
+            width=FOOTER_BTN_WIDTH, pady=6
         )
         self.queue_badge = tk.Button(
             bar,
@@ -7611,11 +8091,20 @@ class App:
     # ------------------------------------------------------------------
 
     def _render_skill_chips(self):
-        """Rebuild the chip buttons inside self.skill_chips from self.skill_favorites."""
+        """Rebuild the chip buttons inside self.skill_chips from the active agent's favorites."""
+        active_agent = self.active_agent.get() if hasattr(self, "active_agent") else "claude"
+        favorites = list(self._agent_favorites(active_agent))
+        # Skip the destroy/recreate when nothing actually changed — rebuilding on every
+        # tab switch made the skills bar BLINK (and reflow). Only rebuild when the agent
+        # or its favorite set differs from what's already rendered.
+        signature = (active_agent, tuple(favorites))
+        if getattr(self, "_skill_chips_signature", None) == signature:
+            return
+        self._skill_chips_signature = signature
         for child in self.skill_chips.winfo_children():
             child.destroy()
         self._skill_chip_widgets = {}
-        for name in self.skill_favorites:
+        for name in favorites:
             # highlightthickness gives each chip a top/edge border we can recolor to
             # "connect" it to its prompt popover when open.
             chip = tk.Frame(
@@ -7659,7 +8148,13 @@ class App:
             self._skills_menu = None
             return
 
-        all_skills = discover_skills(self.cwd.get())
+        active_agent = self.active_agent.get() if hasattr(self, "active_agent") else "claude"
+        all_skills = discover_skills(self.cwd.get(), active_agent)
+        agent_label = {
+            "claude": "Claude",
+            "codex": "Codex",
+            "gemini": "Gemini",
+        }.get(active_agent, active_agent.title())
 
         pop = tk.Toplevel(self.win)
         pop.title("Skills")
@@ -7674,6 +8169,20 @@ class App:
             by = self.skills_bar.winfo_rooty()
         except tk.TclError:
             bx, by = 100, 100
+
+        # Agent-context header strip
+        header_frame = tk.Frame(pop, bg=PANEL_ALT)
+        header_frame.pack(fill="x", padx=0, pady=0)
+        tk.Label(
+            header_frame,
+            text=f"Skills for: {agent_label}",
+            bg=PANEL_ALT,
+            fg=TEXT,
+            font=("Sans", 9, "bold"),
+            padx=10,
+            pady=5,
+            anchor="w",
+        ).pack(side="left")
 
         # Search entry
         search_var = tk.StringVar()
@@ -7751,6 +8260,18 @@ class App:
             for w in rows_frame.winfo_children():
                 w.destroy()
             row_widgets.clear()
+            if not all_skills:
+                tk.Label(
+                    rows_frame,
+                    text="No skills available for this client.",
+                    bg=PANEL,
+                    fg=MUTED,
+                    font=("Sans", 9),
+                    padx=12,
+                    pady=18,
+                    anchor="w",
+                ).pack(fill="x")
+                return
             query = filter_text.lower()
             idx = 0
             for skill in all_skills:
@@ -7758,7 +8279,7 @@ class App:
                 sdesc = skill["description"]
                 if query and query not in sname.lower() and query not in sdesc.lower():
                     continue
-                is_fav = sname in self.skill_favorites
+                is_fav = sname in self._agent_favorites(active_agent)
                 display_name = sname.replace("-", " ").replace("_", " ").title()
                 box_bg = ROW_REG if idx % 2 == 0 else ROW_FADED
                 idx += 1
@@ -7818,7 +8339,7 @@ class App:
         def _on_search(*_args):
             _build_rows(search_var.get())
 
-        search_var.trace_add("write", _on_search)
+        _search_trace_id = search_var.trace_add("write", _on_search)
         _build_rows()
 
         sep2 = tk.Frame(pop, bg=BORDER, height=1)
@@ -7846,6 +8367,10 @@ class App:
 
         def _on_close():
             self._hide_skill_name_overlay()
+            try:
+                search_var.trace_remove("write", _search_trace_id)
+            except Exception:
+                pass
             if pop.winfo_exists():
                 pop.destroy()
             self._skills_menu = None
@@ -7853,11 +8378,13 @@ class App:
         pop.protocol("WM_DELETE_WINDOW", _on_close)
 
     def _toggle_skill_favorite(self, name):
-        """Add or remove a skill from favorites, persist, and re-render chips."""
-        if name in self.skill_favorites:
-            self.skill_favorites.remove(name)
+        """Add or remove a skill from the active agent's favorites, persist, and re-render chips."""
+        active_agent = self.active_agent.get() if hasattr(self, "active_agent") else "claude"
+        favs = self._agent_favorites(active_agent)
+        if name in favs:
+            favs.remove(name)
         else:
-            self.skill_favorites.append(name)
+            favs.append(name)
         self._save_skill_favorites()
         self._render_skill_chips()
 
@@ -8080,6 +8607,19 @@ class App:
         else:
             self.activity_word.set("Starting")
 
+    def _ollama_model_options(self):
+        """Installed Ollama models for the picker, cached for a few seconds so the
+        agent/model UI never blocks on the network. 'Default' = let the backend pick."""
+        now = time.monotonic()
+        cached = getattr(self, "_ollama_models_cache", None)
+        cached_at = getattr(self, "_ollama_models_cache_at", 0.0)
+        if cached is None or (now - cached_at) > 8.0:
+            models = self._list_ollama_models()  # None = unreachable, [] = none installed
+            cached = models or []
+            self._ollama_models_cache = cached
+            self._ollama_models_cache_at = now
+        return ["Default"] + list(cached)
+
     def _model_options_for(self, agent_key):
         if agent_key == "codex":
             options = [
@@ -8089,6 +8629,8 @@ class App:
                 "gpt-5.4-mini",
                 "gpt-5.5",
             ]
+        elif agent_key == "ollama":
+            options = self._ollama_model_options()
         else:
             options = list(MODEL_OPTIONS.get(agent_key, ("Default",)))
         deduped = []
@@ -8881,6 +9423,8 @@ class App:
             pady=12,
             font=("Sans", 10),
             height=12,
+            insertbackground="#ffffff",
+            insertwidth=2,
         )
         detail_text.configure(state="disabled")
         detail_text.pack(fill="both", expand=True, padx=16, pady=(10, 14))
@@ -8910,6 +9454,84 @@ class App:
                 detail_text.insert("1.0", "There are no queued prompts.")
                 detail_text.configure(state="disabled")
 
+        _edit_saved = [True]   # True = clean, False = unsaved edits
+        _loaded_text = [""]     # the prompt text as last loaded/saved
+
+        def _mark_dirty():
+            if _edit_saved[0]:
+                _edit_saved[0] = False
+                save_btn.configure(
+                    text="Save edit",
+                    state="normal",
+                    bg=ACCENT,
+                    fg="white",
+                    cursor="hand2",
+                )
+
+        def _mark_saved():
+            _edit_saved[0] = True
+            save_btn.configure(
+                text="Saved",
+                state="disabled",
+                bg=PANEL,
+                fg="#64748b",
+                cursor="arrow",
+            )
+
+        def _refresh_dirty(_event=None):
+            # Compare actual content to the loaded text so navigation keys, Ctrl+C,
+            # and modifier presses never produce a false "unsaved" state. An edit that
+            # is undone back to the original correctly flips the button back to "Saved".
+            current = detail_text.get("1.0", "end-1c")
+            if current == _loaded_text[0]:
+                if not _edit_saved[0]:
+                    _mark_saved()
+            else:
+                if _edit_saved[0]:
+                    _mark_dirty()
+
+        # Explicit clipboard handlers — Tkinter's defaults are inconsistent on Linux
+        # (PRIMARY vs CLIPBOARD), so we drive copy/cut/paste/select-all ourselves and
+        # return "break" to stop the class binding from double-handling the event.
+        def _detail_copy(_e=None):
+            try:
+                sel = detail_text.get("sel.first", "sel.last")
+            except tk.TclError:
+                return "break"
+            detail_text.clipboard_clear()
+            detail_text.clipboard_append(sel)
+            return "break"
+
+        def _detail_cut(_e=None):
+            try:
+                sel = detail_text.get("sel.first", "sel.last")
+            except tk.TclError:
+                return "break"
+            detail_text.clipboard_clear()
+            detail_text.clipboard_append(sel)
+            detail_text.delete("sel.first", "sel.last")
+            _refresh_dirty()
+            return "break"
+
+        def _detail_paste(_e=None):
+            try:
+                clip = detail_text.clipboard_get()
+            except tk.TclError:
+                return "break"
+            try:
+                detail_text.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass
+            detail_text.insert("insert", clip)
+            detail_text.see("insert")
+            _refresh_dirty()
+            return "break"
+
+        def _detail_select_all(_e=None):
+            detail_text.tag_add("sel", "1.0", "end-1c")
+            detail_text.mark_set("insert", "1.0")
+            return "break"
+
         def show_selected(_event=None):
             selection = queue_list.curselection()
             queued = list(workspace.get("queued_prompts") or [])
@@ -8924,16 +9546,17 @@ class App:
             detail_title.configure(text=f"Queued item {index + 1} — editable")
             meta = (
                 f"{len(prompt)} characters · {len(attachments)} attachment"
-                f"{'s' if len(attachments) != 1 else ''} · edit below, then Save edit"
+                f"{'s' if len(attachments) != 1 else ''} · edit below, then Save"
             )
             if attachments:
                 meta += "\nAttachments: " + ", ".join(os.path.basename(p) for p in attachments)
             detail_meta.configure(text=meta)
-            # It hasn't been sent yet, so let the user fix it in place rather than
-            # delete + re-queue. Stays editable (state normal).
             detail_text.configure(state="normal")
             detail_text.delete("1.0", "end")
             detail_text.insert("1.0", prompt)
+            detail_text.focus_set()
+            _loaded_text[0] = prompt  # baseline for dirty comparison
+            _mark_saved()  # freshly loaded = clean state
 
         def save_edit():
             selection = queue_list.curselection()
@@ -8953,11 +9576,12 @@ class App:
             self._save_active_workspace()
             self._schedule_workspace_config_save(immediate=True)
             self._update_queue_indicator()
-            render_queue()
-            if 0 <= index < queue_list.size():
-                queue_list.selection_clear(0, "end")
-                queue_list.selection_set(index)
-                show_selected()
+            # Update the list label without re-rendering the whole dialog (keeps focus)
+            queue_list.delete(index)
+            queue_list.insert(index, f"{index + 1}. {shorten(new_prompt, 54)}")
+            queue_list.selection_set(index)
+            _loaded_text[0] = detail_text.get("1.0", "end-1c")  # new saved baseline
+            _mark_saved()
             self.status.set(f"Queued item {index + 1} updated.")
 
         def delete_selected():
@@ -8989,21 +9613,39 @@ class App:
 
         queue_list.bind("<<ListboxSelect>>", show_selected)
 
+        # Dirty state is recomputed by comparing content to the loaded baseline, so
+        # arrow keys / Ctrl+C never produce a false "unsaved" — only real edits do.
+        detail_text.bind("<KeyRelease>", _refresh_dirty)
+        # Explicit, reliable clipboard shortcuts (lower- and upper-case for caps/shift).
+        for seq in ("<Control-c>", "<Control-C>"):
+            detail_text.bind(seq, _detail_copy)
+        for seq in ("<Control-x>", "<Control-X>"):
+            detail_text.bind(seq, _detail_cut)
+        for seq in ("<Control-v>", "<Control-V>"):
+            detail_text.bind(seq, _detail_paste)
+        for seq in ("<Control-a>", "<Control-A>"):
+            detail_text.bind(seq, _detail_select_all)
+        detail_text.bind("<<Paste>>", _detail_paste)
+        detail_text.bind("<<Cut>>", _detail_cut)
+        detail_text.bind("<<Copy>>", _detail_copy)
+
         button_row = tk.Frame(body, bg=BG)
         button_row.pack(fill="x", pady=(12, 0))
-        tk.Button(
+        save_btn = tk.Button(
             button_row,
-            text="Save edit",
+            text="Saved",
             command=save_edit,
-            bg=ACCENT,
-            fg="white",
+            bg=PANEL,
+            fg="#64748b",
             activebackground=SIDEBAR_SEL,
             activeforeground="white",
             relief="flat",
             padx=12,
             pady=6,
-            cursor="hand2",
-        ).pack(side="left")
+            cursor="arrow",
+            state="disabled",
+        )
+        save_btn.pack(side="left")
         tk.Button(
             button_row,
             text="Delete selected",
@@ -9145,9 +9787,6 @@ class App:
             return f"{model} - {effort}"
         return model
 
-    def _working_status_text(self, workspace=None):
-        return f"{self._working_model_effort_label(workspace)} is working..."
-
     def _set_routine_working_status(self, workspace=None):
         # The right-side prompt-state badge already shows model/effort, elapsed
         # time, and tokens while working. Keep the left hint free for warnings.
@@ -9181,10 +9820,10 @@ class App:
             )
             model = self._working_model_effort_label(workspace)
             if silence >= TURN_STALLED_SECONDS:
-                text = f"{model} is working · {elapsed}{token_suffix}{queue_text}"
+                text = f"{elapsed}{token_suffix}{queue_text}"
                 bg, fg = "#4a2b0b", "#fed7aa"
             else:
-                text = f"{model} is working · {elapsed}{token_suffix}{queue_text}"
+                text = f"{elapsed}{token_suffix}{queue_text}"
                 bg, fg = "#3b2c0b", "#facc15"
         else:
             # The green activity badge already shows "Ready"; don't duplicate the
@@ -9204,6 +9843,8 @@ class App:
         self.win.after(1000, self.refresh_prompt_state)
 
     def animate_activity(self):
+        if self.finalizing_close:
+            return
         if self.activity_state == "working":
             dots = "." * ((self.activity_frame % 3) + 1)
             self.activity_dots.set(dots)
@@ -9284,14 +9925,19 @@ class App:
             or compact_count > 0
             or usage_active
         )
+        # "Urgent" = context is high OR rate-limit is active.
+        # "Calm" = available only because the session has been compacted at low context —
+        # the user may want a lossless handoff but it's not urgent.
+        handoff_urgent = percent >= CONTEXT_WARNING_PERCENT or usage_active
         self.topbar_handoff_btn.configure(
             state="normal" if handoff_available else "disabled",
             cursor="hand2" if handoff_available else "arrow",
-            bg="#c2410c" if handoff_available else "#24303c",
-            fg="white" if handoff_available else "#64748b",
+            bg="#c2410c" if handoff_urgent else ("#1a3a5c" if handoff_available else "#24303c"),
+            fg="white" if handoff_urgent else ("#93c5fd" if handoff_available else "#64748b"),
             activebackground="#ea580c",
         )
         if handoff_available:
+            show_banner = True
             if percent >= CONTEXT_CRITICAL_PERCENT:
                 self.context_warning.configure(bg="#4a1d1d")
                 self.context_warning_text.set(
@@ -9321,15 +9967,9 @@ class App:
                     if isinstance(child, tk.Label):
                         child.configure(bg="#4a1d1d", fg="#fecaca")
             elif compact_count > 0 and percent < CONTEXT_WARNING_PERCENT:
-                self.context_warning.configure(bg="#3b2c0b")
-                self.context_warning_text.set(
-                    f"This session has compacted {compact_count}×. The active window is "
-                    f"{percent}% full, but older detail now depends on a summary. Hand Off "
-                    "is available if you want a lossless continuation packet."
-                )
-                for child in self.context_warning.winfo_children():
-                    if isinstance(child, tk.Label):
-                        child.configure(bg="#3b2c0b", fg="#fef3c7")
+                # Compaction-at-low-context: the footer "Context Limit … compacted N×"
+                # badge already conveys this. Don't duplicate it as a top banner.
+                show_banner = False
             else:
                 self.context_warning.configure(bg="#4a2b0b")
                 self.context_warning_text.set(
@@ -9339,14 +9979,20 @@ class App:
                 for child in self.context_warning.winfo_children():
                     if isinstance(child, tk.Label):
                         child.configure(bg="#4a2b0b", fg="#ffedd5")
-            self.context_warning.grid(row=0, column=0, sticky="ew", pady=(0, 3))
+            if show_banner:
+                self.context_warning.grid(row=0, column=0, sticky="ew", pady=(0, 3))
+            else:
+                self.context_warning.grid_remove()
         else:
             self.context_warning.grid_remove()
 
     def _display_usage(self, usage):
+        # HARD LOCK: percentages only. Never render request-count ("N req/24h") text.
         windows = usage.get("windows") or []
         if not windows:
-            self.usage_text.set("Usage: --")
+            # No percentage available — keep the last good % if we have one, else "--".
+            if not clean_text(self.usage_text.get()).replace("Usage:", "").strip(" -"):
+                self.usage_text.set("Usage: --")
             self.usage_badge.configure(bg="#1a2432", fg="#dbeafe")
             return
         shown = [
@@ -10305,6 +10951,25 @@ class App:
         if not root:
             self._update_project_state_indicator(session)
             return ""
+        # Guard: only auto-write state when the root was confirmed by a direct
+        # title-slug match OR by file-edit path scoring — not by alias lookup alone.
+        # Alias lookup is right for READING (state injection) but too permissive for
+        # WRITING: a "Next Agent Workbench" Codex session resolves to OG AWB via alias
+        # but its content is about AWB Next, so it would overwrite OG AWB's AGENT_STATE.
+        # Skip auto-write for alias-only inferences; only explicit user-triggered updates
+        # (update_project_state()) bypass this guard via force=True.
+        if not force:
+            cwd_fb = self.cwd.get()
+            direct_root = _project_root_from_title(session, cwd_fb)
+            has_direct = direct_root and os.path.abspath(direct_root) == os.path.abspath(root)
+            if not has_direct:
+                # Root resolved by alias or path-scoring only — too ambiguous for auto-write.
+                # Path-score evidence is unreliable: a "Next Agent Workbench" session can have
+                # OG AWB file paths in its JSONL (from injected context), making scored truthy
+                # even though the session belongs to a different project. Require a direct
+                # title→directory match for all background writes.
+                self._update_project_state_indicator(session)
+                return project_state_path(root)
         session["project_root"] = root
         key = root
         path = project_state_path(root)
@@ -10774,6 +11439,7 @@ class App:
         )
         self.artifact_preview_image_label.configure(image="", text="")
         self.artifact_preview_text.pack_forget()
+        self.artifact_preview_image_label.pack(fill="both", expand=True, padx=18, pady=14)
 
     def preview_selected_artifact(self):
         item = self._selected_artifact()
@@ -10783,6 +11449,7 @@ class App:
         path = item["path"]
         self.artifact_preview_image = None
         self.artifact_preview_text.pack_forget()
+        self.artifact_preview_image_label.pack_forget()
         self.artifact_preview_image_label.configure(image="", text="")
         size = os.path.getsize(path) if os.path.isfile(path) else 0
         mime = mimetypes.guess_type(path)[0] or "file"
@@ -10796,6 +11463,7 @@ class App:
                 image.thumbnail((760, 520))
                 self.artifact_preview_image = ImageTk.PhotoImage(image)
                 self.artifact_preview_image_label.configure(image=self.artifact_preview_image)
+                self.artifact_preview_image_label.pack(fill="both", expand=True, padx=18, pady=14)
                 return
             except (OSError, ValueError):
                 pass
@@ -10819,6 +11487,7 @@ class App:
             text="Preview unavailable\n\nOpen the artifact with its default desktop application.",
             justify="center",
         )
+        self.artifact_preview_image_label.pack(fill="both", expand=True, padx=18, pady=14)
 
     def copy_selected_artifact_path(self):
         item = self._selected_artifact()
@@ -11143,6 +11812,13 @@ class App:
         )
         self.recent_session_list.pack(side="left", fill="x", expand=True)
         self.recent_session_list.bind("<<ListboxSelect>>", lambda _e: self._select_recent_session())
+        def _recent_wheel(_event):
+            if self._modal_scroll_lock > 0:
+                return "break"
+            return None
+        self.recent_session_list.bind("<MouseWheel>", _recent_wheel)
+        self.recent_session_list.bind("<Button-4>", _recent_wheel)
+        self.recent_session_list.bind("<Button-5>", _recent_wheel)
         recent_scroll = tk.Scrollbar(recent_list_frame, command=self.recent_session_list.yview)
         recent_scroll.pack(side="right", fill="y")
         self.recent_session_list.configure(yscrollcommand=recent_scroll.set)
@@ -11228,9 +11904,17 @@ class App:
         self.session_list.bind("<Motion>", self._schedule_session_tooltip)
         self.session_list.bind("<Leave>", lambda _e: self._hide_session_tooltip())
         self.session_list.bind("<Button>", lambda _e: self._hide_session_tooltip())
-        self.session_list.bind("<MouseWheel>", lambda _e: self._hide_session_tooltip())
-        self.session_list.bind("<Button-4>", lambda _e: self._hide_session_tooltip())
-        self.session_list.bind("<Button-5>", lambda _e: self._hide_session_tooltip())
+        def _session_wheel(_event):
+            self._hide_session_tooltip()
+            # While a modal list dialog is open, block the session list from scrolling
+            # underneath it. "break" runs at the widget level, before the Listbox class
+            # binding, so it actually prevents the scroll.
+            if self._modal_scroll_lock > 0:
+                return "break"
+            return None
+        self.session_list.bind("<MouseWheel>", _session_wheel)
+        self.session_list.bind("<Button-4>", _session_wheel)
+        self.session_list.bind("<Button-5>", _session_wheel)
         sess_scroll = tk.Scrollbar(sess_frame, command=self.session_list.yview)
         sess_scroll.pack(side="right", fill="y")
         self.session_list.configure(yscrollcommand=sess_scroll.set)
@@ -11251,8 +11935,17 @@ class App:
         dialog.title("Add agent client")
         dialog.configure(bg=BG)
         dialog.transient(self.win)
-        dialog.resizable(False, False)
+        dialog.resizable(False, True)
         dialog.grab_set()
+        dialog.attributes("-topmost", True)
+        dialog.focus_force()
+        self._modal_scroll_lock += 1  # block the session list from scrolling underneath
+        dialog.bind(
+            "<Destroy>",
+            lambda e: e.widget is dialog and setattr(
+                self, "_modal_scroll_lock", max(0, self._modal_scroll_lock - 1)
+            ),
+        )
 
         body = tk.Frame(dialog, bg=BG, padx=20, pady=18)
         body.pack(fill="both", expand=True)
@@ -11354,12 +12047,55 @@ class App:
             font=("Sans", 9, "bold"),
         ).pack(anchor="w", pady=(14, 3))
 
-        results = tk.Frame(body, bg=BG)
+        results_outer = tk.Frame(body, bg=BG)
+        results_canvas = tk.Canvas(results_outer, bg=BG, highlightthickness=0, height=300)
+        results_scrollbar = tk.Scrollbar(results_outer, orient="vertical", command=results_canvas.yview)
+        results = tk.Frame(results_canvas, bg=BG)
+        results_window = results_canvas.create_window((0, 0), window=results, anchor="nw")
+        # Without this, the scrollbar thumb never reflects the canvas position (it only
+        # had command→yview, not the yview→set return path).
+        results_canvas.configure(yscrollcommand=results_scrollbar.set)
+
+        def _on_results_configure(event=None):
+            results_canvas.configure(scrollregion=results_canvas.bbox("all"))
+            results_canvas.itemconfigure(results_window, width=results_canvas.winfo_width())
+        results.bind("<Configure>", _on_results_configure)
+        results_canvas.bind("<Configure>", lambda e: results_canvas.itemconfigure(results_window, width=e.width))
+
+        def _scroll_results(event):
+            # Handle BOTH Windows/Mac (<MouseWheel>, event.delta) and Linux/X11
+            # (<Button-4>/<Button-5>, event.num). Binding only <MouseWheel> left this
+            # list unscrollable on Linux.
+            if getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0:
+                results_canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", 0) == 5 or getattr(event, "delta", 0) < 0:
+                results_canvas.yview_scroll(1, "units")
+            return "break"
+
+        def _bind_results_wheel(_e=None):
+            for _s in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                results_canvas.bind_all(_s, _scroll_results)
+
+        def _unbind_results_wheel(_e=None):
+            for _s in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                results_canvas.unbind_all(_s)
+
+        # Scope the global wheel grab to when the pointer is over the list, so it scrolls
+        # reliably here without bleeding to widgets behind the dialog.
+        results_canvas.bind("<Enter>", _bind_results_wheel)
+        results_canvas.bind("<Leave>", _unbind_results_wheel)
+        dialog.bind(
+            "<Destroy>",
+            lambda e: e.widget is dialog and _unbind_results_wheel(),
+            add="+",
+        )
 
         def render_local_models():
             for child in results.winfo_children():
                 child.destroy()
-            results.pack(fill="x", pady=(6, 4))
+            results_outer.pack(fill="both", expand=True, pady=(6, 4))
+            results_canvas.pack(side="left", fill="both", expand=True)
+            results_scrollbar.pack(side="right", fill="y")
             models = self._list_ollama_models()
             if models is None:
                 tk.Label(
@@ -11438,14 +12174,29 @@ class App:
                             pady=6,
                             cursor="hand2",
                         ).pack(side="right", padx=10)
+            # Size the list to its content: scrollregion spans every row (so the thumb
+            # sizes/moves), the canvas viewport caps at 320px, and the window's max height
+            # is capped to the content so dragging the bottom reveals more models and then
+            # stops — no black buffer below the list.
+            results.update_idletasks()
+            content_h = results.winfo_reqheight()
+            visible_h = min(content_h, 320)
+            results_canvas.configure(
+                scrollregion=results_canvas.bbox("all") or (0, 0, 0, content_h),
+                height=visible_h,
+            )
             dialog.update_idletasks()
-            x = self.win.winfo_rootx() + (
-                self.win.winfo_width() - dialog.winfo_reqwidth()
-            ) // 2
-            y = self.win.winfo_rooty() + (
-                self.win.winfo_height() - dialog.winfo_reqheight()
-            ) // 2
-            dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+            chrome = max(0, dialog.winfo_reqheight() - visible_h)
+            dialog.maxsize(dialog.winfo_reqwidth() + 400, content_h + chrome)
+            # Only reposition if this is the first render (dialog has no position yet).
+            if "+0+0" in dialog.geometry() or dialog.winfo_y() < 5:
+                x = self.win.winfo_rootx() + (
+                    self.win.winfo_width() - dialog.winfo_reqwidth()
+                ) // 2
+                y = self.win.winfo_rooty() + (
+                    self.win.winfo_height() - dialog.winfo_reqheight()
+                ) // 2
+                dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
 
         tk.Button(
             body,
@@ -12614,17 +13365,22 @@ class App:
         # sessions that share a title each get a tab, but one session is never opened twice.
         self.open_session_in_new_tab(selected_id)
 
-    def open_session_in_new_tab(self, session_id):
+    def open_session_in_new_tab(self, session_id, background=False):
         """Open a session in its own workspace tab, leaving the current tab — and any
-        turn running there — untouched. If it's already open in a tab, focus that tab."""
+        turn running there — untouched. If it's already open in a tab, focus that tab.
+
+        background=True: load the tab without stealing focus from the current tab.
+        Used by poll_live_sessions so auto-detected sessions don't interrupt the user."""
         for wid in self.workspace_order:
             cur = (self.workspaces.get(wid) or {}).get("current_session") or {}
             if cur.get("id") == session_id:
-                self.switch_workspace(wid)
-                self.input.focus_set()
+                if not background:
+                    self.switch_workspace(wid)
+                    self.input.focus_set()
                 return
         if self._at_tab_limit():
-            self._notify_tab_limit()
+            if not background:
+                self._notify_tab_limit()
             return
         session = self.store.get(session_id)
         if not session:
@@ -12641,6 +13397,8 @@ class App:
         if agent_key not in self.agent_map:
             agent_key = self.active_agent.get()
         cwd = session.get("cwd") or self.cwd.get()
+        # Remember which workspace is active so background opens can restore it
+        prior_workspace_id = self.active_workspace_id
         self._save_active_workspace()
         self._schedule_workspace_config_save(immediate=True)
         previous_agent = self.active_agent.get()
@@ -12667,8 +13425,13 @@ class App:
         self._render_session_list()
         self.open_session(session_id, remember=False)
         self._save_active_workspace()
+        if background and prior_workspace_id in self.workspaces:
+            # Restore the previously-active tab — don't steal focus
+            self.active_workspace_id = prior_workspace_id
+            self._restore_workspace(self.workspaces[prior_workspace_id])
         self._render_workspace_tabs()
-        self.input.focus_set()
+        if not background:
+            self.input.focus_set()
 
     def _open_selected_session_new_tab(self):
         selection = self.session_list.curselection()
@@ -12882,6 +13645,190 @@ class App:
         finally:
             self.win.after(2000, self.poll_external_session)
 
+    # ------------------------------------------------------------------
+    # Live-session auto-detect: spots external Claude/Codex/Gemini sessions
+    # started outside AWB (Termius, plain terminal, etc.) and auto-opens
+    # them as read-only mirror tabs.  Runs every 5 seconds.
+    # ------------------------------------------------------------------
+    _LIVE_SESSION_WINDOW = 90  # seconds — JSONL must be this fresh to auto-open
+
+    def _known_source_ids(self):
+        """Return set of source_session_ids already tracked in any workspace."""
+        known = set()
+        for workspace in self.workspaces.values():
+            cur = workspace.get("current_session") or {}
+            sid = (
+                cur.get("source_session_id")
+                or (cur.get("backend") or {}).get("session_id")
+                or (cur.get("backend") or {}).get("thread_id")
+            )
+            if sid:
+                known.add(clean_text(sid))
+        return known
+
+    # DISABLED 2026-06-19: auto-opening live sessions as tabs was spawning duplicate
+    # tabs every 5s (the dedup via _known_source_ids didn't catch already-open sessions
+    # before the next poll fired), flooding the UI. Hard-off until the dedup is reworked
+    # to track auto-opened source ids reliably. Flip to True only after that fix lands.
+    _AUTO_OPEN_LIVE_SESSIONS = False
+
+    def _auto_open_live_session(self, session):
+        """Add session to external_sessions and open it in a new tab (silently if at limit)."""
+        if not self._AUTO_OPEN_LIVE_SESSIONS:
+            return
+        already = any(
+            s.get("id") == session.get("id") for s in self.external_sessions
+        )
+        if not already:
+            self.external_sessions.append(session)
+        if self._at_tab_limit():
+            self.status.set(
+                f"Live {session.get('agent','agent')} session detected: "
+                f"{session.get('title','')[:60]} (tab limit reached — close a tab)"
+            )
+            return
+        self.open_session_in_new_tab(session["id"], background=True)
+        self.status.set(
+            f"Live session detected → new tab: {session.get('title','')[:70]}"
+        )
+
+    def poll_live_sessions(self):
+        """Detect externally-started sessions written in the last LIVE_SESSION_WINDOW
+        seconds and auto-open them as mirror tabs."""
+        if not self._AUTO_OPEN_LIVE_SESSIONS:
+            return  # feature disabled (see _AUTO_OPEN_LIVE_SESSIONS) — stop the scan loop
+        try:
+            cutoff = time.time() - self._LIVE_SESSION_WINDOW
+            known = self._known_source_ids()
+
+            # ── Claude Code ──────────────────────────────────────────────
+            claude_root = Path(os.path.expanduser("~/.claude/projects"))
+            if claude_root.is_dir():
+                for project_dir in claude_root.iterdir():
+                    if not project_dir.is_dir():
+                        continue
+                    for jsonl_path in project_dir.glob("*.jsonl"):
+                        try:
+                            if jsonl_path.stat().st_mtime < cutoff:
+                                continue
+                        except OSError:
+                            continue
+                        sid = jsonl_path.stem
+                        if sid in known:
+                            continue
+                        if not claude_session_is_resumable(str(jsonl_path)):
+                            continue
+                        # Build a session object and open it
+                        preview = first_text_from_claude_jsonl(str(jsonl_path))
+                        metadata = claude_session_metadata(str(jsonl_path))
+                        session = {
+                            "id": f"claude-terminal:{sid}",
+                            "source_session_id": sid,
+                            "agent": "claude",
+                            "origin": "claude-terminal",
+                            "cwd": str(project_dir),
+                            "title": metadata.get("title") or preview or sid,
+                            "preview": preview or sid,
+                            "created_at": iso_from_unix(jsonl_path.stat().st_mtime),
+                            "updated_at": iso_from_unix(jsonl_path.stat().st_mtime),
+                            "source_path": str(jsonl_path),
+                            "backend": {
+                                "session_id": sid,
+                                "model": claude_model_alias(
+                                    (metadata.get("context") or {}).get("model")
+                                ),
+                            },
+                            "context": metadata.get("context") or {},
+                            "turns": [],
+                            "transcript_loaded": False,
+                        }
+                        self._auto_open_live_session(session)
+
+            # ── Codex ────────────────────────────────────────────────────
+            codex_db = os.path.expanduser("~/.codex/state_5.sqlite")
+            if os.path.isfile(codex_db):
+                try:
+                    import sqlite3 as _sqlite3
+                    con = _sqlite3.connect(codex_db)
+                    con.row_factory = _sqlite3.Row
+                    rows = con.execute(
+                        "SELECT id, rollout_path, cwd, title, preview, first_user_message, "
+                        "created_at, updated_at FROM threads "
+                        "WHERE archived=0 AND updated_at > ? ORDER BY updated_at DESC",
+                        (int(cutoff),),
+                    ).fetchall()
+                    con.close()
+                    for row in rows:
+                        sid = clean_text(row["id"])
+                        if not sid or sid in known:
+                            continue
+                        preview = clean_text(row["preview"] or row["title"] or row["first_user_message"] or "")
+                        _, visible_title = strip_session_context(clean_text(row["title"] or preview))
+                        title = visible_title or preview or "Codex session"
+                        rollout = clean_text(row["rollout_path"] or "")
+                        session = {
+                            "id": f"codex-terminal:{sid}",
+                            "source_session_id": sid,
+                            "agent": "codex",
+                            "origin": "codex-terminal",
+                            "cwd": clean_text(row["cwd"] or ""),
+                            "title": title,
+                            "preview": preview,
+                            "created_at": iso_from_unix(row["created_at"]),
+                            "updated_at": iso_from_unix(row["updated_at"]),
+                            "source_path": rollout,
+                            "backend": {"thread_id": sid},
+                            "context": {},
+                            "turns": [],
+                            "transcript_loaded": False,
+                        }
+                        self._auto_open_live_session(session)
+                except Exception:
+                    pass
+
+            # ── Gemini ───────────────────────────────────────────────────
+            gemini_home = Path(os.path.expanduser("~/.gemini"))
+            for sub in ("tmp", "history"):
+                gdir = gemini_home / sub
+                if not gdir.is_dir():
+                    continue
+                for candidate in gdir.glob("*/chats/session-*.jsonl"):
+                    try:
+                        if candidate.stat().st_mtime < cutoff:
+                            continue
+                    except OSError:
+                        continue
+                    try:
+                        with candidate.open(encoding="utf-8") as fh:
+                            header = json.loads(fh.readline())
+                        sid = clean_text(header.get("sessionId"))
+                    except Exception:
+                        continue
+                    if not sid or sid in known:
+                        continue
+                    session = {
+                        "id": f"gemini-terminal:{sid}",
+                        "source_session_id": sid,
+                        "agent": "gemini",
+                        "origin": "gemini-terminal",
+                        "cwd": "",
+                        "title": clean_text(header.get("title") or sid),
+                        "preview": sid,
+                        "created_at": iso_from_unix(candidate.stat().st_mtime),
+                        "updated_at": iso_from_unix(candidate.stat().st_mtime),
+                        "source_path": str(candidate),
+                        "backend": {},
+                        "context": {},
+                        "turns": [],
+                        "transcript_loaded": False,
+                    }
+                    self._auto_open_live_session(session)
+
+        except Exception as exc:
+            log(f"poll_live_sessions error: {exc}")
+        finally:
+            self.win.after(5000, self.poll_live_sessions)
+
     def _clear_views(self, clear_attachments=True):
         self.render_generation += 1
         if clear_attachments:
@@ -12906,8 +13853,21 @@ class App:
         self.rendering_chat = True
         batch_size = max(1, int(batch_size or 1))
 
+        # Suppress per-entry work-log autoscroll for the whole render (see
+        # _insert_work_entry) so a session with a huge work log doesn't freeze.
+        self._suspend_work_autoscroll = True
+
+        def _finish_render():
+            self._suspend_work_autoscroll = False
+            self.rendering_chat = False
+            try:
+                self.work.see("end")
+            except tk.TclError:
+                pass
+
         def render_batch(index=0):
             if generation != self.render_generation:
+                self._suspend_work_autoscroll = False
                 self.rendering_chat = False
                 return
             end = min(index + batch_size, len(turns))
@@ -12916,7 +13876,7 @@ class App:
             if end < len(turns):
                 self.win.after(1, lambda: render_batch(end))
             else:
-                self.rendering_chat = False
+                _finish_render()
                 if on_complete:
                     self.win.after_idle(on_complete)
 
@@ -13427,6 +14387,15 @@ class App:
 
     def _insert_work_entry(self, text, tag):
         widget = self.work
+        # During a bulk render (loading a whole session) the per-entry yview()/see()
+        # calls force a full layout recompute every line — O(n²) thrash that freezes
+        # the UI on a session with a runaway/huge work log. Suppress them while bulk
+        # rendering; the renderer does a single see("end") at the end instead.
+        if getattr(self, "_suspend_work_autoscroll", False):
+            widget.configure(state="normal")
+            widget.insert("end", text.rstrip() + "\n", tag)
+            widget.configure(state="disabled")
+            return
         at_bottom = widget.yview()[1] >= 0.995
         widget.configure(state="normal")
         widget.insert("end", text.rstrip() + "\n", tag)
@@ -13967,7 +14936,7 @@ class App:
             options = ["Default"]
         return options
 
-    def _deploy_handoff(self, source, target_agent, model, effort):
+    def _deploy_handoff(self, source, target_agent, model, effort, title_override=None):
         if self._block_project_scope_conflict(
             source,
             action="deploying handoff",
@@ -13982,6 +14951,10 @@ class App:
             force=True,
         )
         title, base_title, sequence = self._next_handoff_title(source, target_agent)
+        # Honor a user-edited title from the dialog (pencil field), keeping the computed
+        # base/sequence for project numbering continuity.
+        if clean_text(title_override):
+            title = clean_text(title_override)
         blocked, validation = self._block_invalid_handoff_plan(
             source,
             target_agent,
@@ -14395,6 +15368,37 @@ class App:
         packet = self._staged_handoff_packet(source) or structured_handoff_packet(source)
         self.copy_text(packet)
 
+    def _sync_session_from_transcript(self, session):
+        """Synchronously pull the latest turns + context from a session's linked
+        client transcript so a point-in-time snapshot (Hand Off) reflects the
+        conversation to the LAST word — not just the last 2-second poll. Without this,
+        anything typed in the terminal in the ~2s before Hand Off can be missing from
+        the packet. Safe no-op when there is no linked transcript on disk."""
+        if not session:
+            return
+        path = linked_client_session_path(session)
+        if not path or not os.path.exists(path):
+            return
+        agent = session.get("agent")
+        try:
+            if agent == "claude":
+                turns = claude_jsonl_turns(path)
+                context = (claude_session_metadata(path) or {}).get("context") or {}
+            elif agent == "gemini":
+                turns = gemini_jsonl_turns(path)
+                context = {}
+            else:
+                turns = codex_rollout_turns(path)
+                context = codex_context_from_rollout(path)
+        except Exception:
+            return
+        if turns:
+            session["turns"] = turns
+        if context:
+            session["context"] = context
+            if session is self.current_session:
+                self.update_context_indicator(context)
+
     def handoff_session(self):
         if self.busy:
             messagebox.showinfo(
@@ -14416,6 +15420,9 @@ class App:
             modal=True,
         ):
             return
+        # Force a fresh read of the transcript so turns typed in the terminal in the
+        # last poll window are captured in the packet — Hand Off must be lossless.
+        self._sync_session_from_transcript(self.current_session)
         self._refresh_handoff_stage(self.current_session, force=True)
         self.open_handoff_dialog()
 
@@ -14548,7 +15555,13 @@ class App:
                     elif not ok2:
                         entry["error"] = "version check failed"
                 results[key] = entry
-            self.win.after(0, lambda: self._apply_client_updates(results))
+            # Guard: skip scheduling if the window is gone or the app is closing
+            if getattr(self, "finalizing_close", False):
+                return
+            try:
+                self.win.after(0, lambda: self._apply_client_updates(results))
+            except Exception:
+                pass  # Window was destroyed while background check was running
         threading.Thread(target=work, daemon=True).start()
 
     def _apply_client_updates(self, results):
@@ -14597,11 +15610,20 @@ class App:
             def work():
                 ok, out = _run_capture(spec["update_cmd"], timeout=600)
                 def done():
+                    if not dialog.winfo_exists():
+                        return
                     log(out.strip()[-4000:] or "(no output)")
                     log(f"{'✓' if ok else '✗'} {spec['label']} update {'finished' if ok else 'failed'}.")
                     status_var.set("")
-                    self.check_client_updates()  # re-check so the row/marker refresh
-                self.win.after(0, done)
+                    try:
+                        if self.win.winfo_exists():
+                            self.check_client_updates()  # re-check so the row/marker refresh
+                    except tk.TclError:
+                        pass
+                try:
+                    self.win.after(0, done)
+                except tk.TclError:
+                    pass
             threading.Thread(target=work, daemon=True).start()
 
         def render():
@@ -15452,6 +16474,8 @@ class App:
         target_mode_var = tk.StringVar(master=dialog, value="new")
         target_session_var = tk.StringVar(master=dialog, value="")
         target_lookup = {}
+        new_title_var = tk.StringVar(master=dialog, value="")
+        title_edited = {"manual": False}
 
         agent_box = tk.Frame(body, bg=BG)
         agent_box.pack(fill="x", pady=(0, 8))
@@ -15524,6 +16548,35 @@ class App:
         )
         target_hint.pack(anchor="w", pady=(4, 0))
 
+        # New-tab title transition (old → editable new), shown only for a new continuation.
+        title_row = tk.Frame(body, bg=BG)
+        title_row.pack(fill="x", pady=(2, 8))
+        tk.Label(title_row, text="New tab title", bg=BG, fg=MUTED).pack(anchor="w")
+        title_line = tk.Frame(title_row, bg=BG)
+        title_line.pack(fill="x", pady=(4, 0))
+        tk.Label(
+            title_line,
+            text=shorten(self._display_session_title(source), 26),
+            bg=BG,
+            fg=MUTED,
+        ).pack(side="left")
+        tk.Label(title_line, text="  →  ", bg=BG, fg="#93c5fd", font=("Sans", 11, "bold")).pack(side="left")
+        title_entry = tk.Entry(
+            title_line,
+            textvariable=new_title_var,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground="#ffffff",
+            relief="flat",
+        )
+        title_entry.pack(side="left", fill="x", expand=True, ipady=2)
+        tk.Label(title_line, text=" ✏", bg=BG, fg=MUTED).pack(side="left")
+
+        def _mark_title_edited(_event=None):
+            title_edited["manual"] = True
+
+        title_entry.bind("<Key>", _mark_title_edited)
+
         def refresh_target_sessions():
             target_lookup.clear()
             labels = []
@@ -15573,6 +16626,11 @@ class App:
             custom = bool(self._agent_spec(agent_key).get("custom"))
             model_picker.configure(state="disabled" if custom else "readonly")
             effort_picker.configure(state="disabled" if custom else "readonly")
+            # Keep the new-title field in sync with the target agent's numbering, unless
+            # the user has manually edited it.
+            if not title_edited["manual"]:
+                computed_title, _b, _s = self._next_handoff_title(source, agent_key)
+                new_title_var.set(computed_title)
             refresh_target_sessions()
 
         agent_picker.bind("<<ComboboxSelected>>", sync_agent_options)
@@ -15592,24 +16650,55 @@ class App:
         button_row.pack(fill="x")
 
         def deploy():
-            if target_mode_var.get() == "existing":
-                target_id = target_lookup.get(target_session_var.get())
-                result = self._deploy_handoff_to_existing(
-                    source,
-                    target_id,
-                    agent_var.get(),
-                    model_var.get(),
-                    effort_var.get(),
+            # Release the modal grab BEFORE deploying: _deploy_handoff can pop its own
+            # modal (e.g. a project-scope-conflict warning), which would deadlock against
+            # this dialog's grab and look like a hang. Re-grab only if deploy is aborted.
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            try:
+                if target_mode_var.get() == "existing":
+                    target_id = target_lookup.get(target_session_var.get())
+                    result = self._deploy_handoff_to_existing(
+                        source,
+                        target_id,
+                        agent_var.get(),
+                        model_var.get(),
+                        effort_var.get(),
+                    )
+                else:
+                    result = self._deploy_handoff(
+                        source,
+                        agent_var.get(),
+                        model_var.get(),
+                        effort_var.get(),
+                        title_override=new_title_var.get(),
+                    )
+            except Exception as exc:
+                import traceback
+                tb = traceback.format_exc()
+                traceback.print_exc()
+                try:
+                    with open(
+                        os.path.join(CONFIG_DIR, "handoff-error.log"), "w", encoding="utf-8"
+                    ) as _fh:
+                        _fh.write(tb)
+                except OSError:
+                    pass
+                messagebox.showerror(
+                    "Hand off", f"Deploy failed:\n{exc}", parent=self.win
                 )
-            else:
-                result = self._deploy_handoff(
-                    source,
-                    agent_var.get(),
-                    model_var.get(),
-                    effort_var.get(),
-                )
+                result = None
             if result is not None:
                 dialog.destroy()
+            else:
+                # Deploy was blocked/failed — restore the modal grab so the dialog
+                # stays usable and on top.
+                try:
+                    dialog.grab_set()
+                except tk.TclError:
+                    pass
 
         tk.Button(
             button_row,
@@ -15795,8 +16884,15 @@ class App:
             for picker in sequence_pickers:
                 picker.configure(state="readonly" if enabled else "disabled")
 
-        mode_var.trace_add("write", sync_controls)
+        _mode_trace_id = mode_var.trace_add("write", sync_controls)
         sync_controls()
+
+        def _close_dialog():
+            try:
+                mode_var.trace_remove("write", _mode_trace_id)
+            except Exception:
+                pass
+            dialog.destroy()
 
         def save():
             sequence = []
@@ -15813,7 +16909,7 @@ class App:
             }
             self.config["handoff_preferences"] = self.handoff_preferences
             save_json(CONFIG_FILE, self.config)
-            dialog.destroy()
+            _close_dialog()
 
         button_row = tk.Frame(body, bg=BG)
         button_row.pack(fill="x")
@@ -15830,7 +16926,7 @@ class App:
         tk.Button(
             button_row,
             text="Cancel",
-            command=dialog.destroy,
+            command=_close_dialog,
             bg=PANEL,
             fg=TEXT,
             relief="flat",
@@ -15838,7 +16934,7 @@ class App:
             pady=6,
         ).pack(side="right", padx=(0, 8))
 
-        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+        dialog.bind("<Escape>", lambda _e: _close_dialog())
         dialog.update_idletasks()
         x = self.win.winfo_rootx() + (self.win.winfo_width() - dialog.winfo_reqwidth()) // 2
         y = self.win.winfo_rooty() + (self.win.winfo_height() - dialog.winfo_reqheight()) // 3
@@ -15894,6 +16990,8 @@ class App:
         if not self.current_session.get("title") or self.current_session.get("title", "").startswith("New "):
             self.store.set_title_from_prompt(self.current_session, prompt)
         return turn
+
+    # ── Queue-vs-Interrupt inline choice helpers ────────────────────────────
 
     def _queue_prompt(self, prompt, attachments):
         self.queued_prompts.append(
@@ -16185,6 +17283,10 @@ class App:
         )
         workspace = self.workspaces.get(self.active_workspace_id)
         if workspace:
+            # Keep workspace["busy"] in sync with self.busy so that tab-switching
+            # (which reads workspace["busy"] back into self.busy) never resets the
+            # busy flag mid-turn and lets a second message bypass the queue.
+            workspace["busy"] = True
             workspace["model"] = launch_model
             workspace["effort"] = launch_effort
             workspace["current_session"] = self.current_session
@@ -16356,6 +17458,14 @@ class App:
             if agent:
                 self.agent_usage[agent] = workspace["usage"]
                 self.agent_usage_refreshing.discard(agent)
+                # Propagate to every other tab using the same provider so all tabs
+                # always show identical usage numbers (usage is per-account, not per-tab).
+                shared_ts = workspace["usage_last_updated"]
+                for wid, ws in self.workspaces.items():
+                    if wid != workspace.get("id") and clean_text(ws.get("agent")) == agent:
+                        ws["usage"] = workspace["usage"]
+                        ws["usage_refreshing"] = False
+                        ws["usage_last_updated"] = shared_ts
         elif kind == "token_usage":
             usage = event.get("usage") or {}
             if usage:
@@ -16631,9 +17741,11 @@ class App:
                         + "; ".join(details)
                     )
                 else:
+                    full_error = clean_text(usage.get("error", "no telemetry returned"))
+                    # Status bar gets ONE line only — full text goes in the limits popover.
+                    first_line = full_error.split("\n")[0].strip()
                     self.status.set(
-                        f"{usage.get('provider', 'Client')} limits unavailable: "
-                        f"{usage.get('error', 'no telemetry returned')}"
+                        f"{usage.get('provider', 'Client')} limits unavailable: {first_line}"
                     )
         elif kind == "token_usage":
             usage = event.get("usage") or {}
@@ -16884,6 +17996,7 @@ class App:
             self.refresh_usage(manual=False)  # refresh 5h/weekly usage right after a turn
             active_workspace = self.workspaces.get(self.active_workspace_id)
             if active_workspace:
+                active_workspace["busy"] = False
                 active_workspace["turn_started_at"] = 0.0
                 active_workspace["tab_done"] = True  # finished → green (clears on next view)
                 active_workspace["session_context_active"] = False
@@ -16935,6 +18048,7 @@ class App:
             self.busy = False
             active_workspace = self.workspaces.get(self.active_workspace_id)
             if active_workspace:
+                active_workspace["busy"] = False
                 active_workspace["turn_started_at"] = 0.0
                 active_workspace["session_context_active"] = False
                 active_workspace["session_context_buffer"] = ""
@@ -17016,8 +18130,16 @@ class App:
                     self.update_context_indicator(context)
                 self.current_session["updated_at"] = now_iso()
                 self.live_source_signature = event.get("signature")
-                if self.current_session.get("origin", "local") == "local":
+                is_local = self.current_session.get("origin", "local") == "local"
+                if is_local:
                     self.store.save(self.current_session)
+                # Context is already updated above on every poll (cheap). For a "local"
+                # session we deliberately SKIP the full chat re-render here: re-rendering
+                # a large session every 2s (destroy+rebuild every bubble) is exactly what
+                # froze the app. The new turns are already in self.current_session["turns"]
+                # and paint the moment the user opens/switches to this tab. Only externally-
+                # mirrored (non-local) sessions fall through to the live re-render below.
+                if is_local:
                     self.request_project_state_update(
                         self.current_session,
                         reason="sync",
@@ -17028,8 +18150,6 @@ class App:
                         self.chat_updates_pending = True
                         self._update_chat_update_indicator()
                     self.status.set(f"{agent_label} session synchronized.")
-                    if not self.busy:
-                        self.set_activity("idle", "Ready")
                     return
                 chat_anchor = self.chat.index("@0,0")
                 work_anchor = self.work.index("@0,0")
