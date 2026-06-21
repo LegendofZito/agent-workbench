@@ -1919,7 +1919,6 @@ def gemini_sessions_for_cwd(cwd):
     return sessions
 
 
-@lru_cache(maxsize=1)
 def gemini_session_index():
     home = Path(os.path.expanduser("~/.gemini"))
     index = {}
@@ -1949,7 +1948,6 @@ def gemini_session_index():
     return index
 
 
-@lru_cache(maxsize=256)
 def gemini_session_path(session_id):
     sid = clean_text(session_id)
     if not sid:
@@ -3744,10 +3742,16 @@ def turn_failure_text(status, error, session):
 
 
 def format_reset_time(timestamp):
-    try:
-        moment = datetime.fromtimestamp(float(timestamp), tz=timezone.utc).astimezone()
+    def _fmt(moment):
         return moment.strftime("%b %-d, %-I:%M%p").replace("AM", "am").replace("PM", "pm")
+    # Accept either an epoch number (Claude) or an ISO-8601 string (Codex resets_at).
+    try:
+        return _fmt(datetime.fromtimestamp(float(timestamp), tz=timezone.utc).astimezone())
     except (TypeError, ValueError, OSError):
+        pass
+    try:
+        return _fmt(datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).astimezone())
+    except (TypeError, ValueError):
         return ""
 
 
@@ -4296,7 +4300,8 @@ class CodexBackend(BaseBackend):
                 self._handle_server_request(message)
                 continue
             if req_id is not None:
-                callbacks = self.pending.pop(req_id, (None, None))
+                with self.lock:
+                    callbacks = self.pending.pop(req_id, (None, None))
                 callback, error_callback = callbacks
                 if "error" in message:
                     err = message["error"]
@@ -4566,8 +4571,8 @@ class CodexBackend(BaseBackend):
             self.proc.terminate()
         self.stop_flag.clear()
         self.ready.clear()
-        self.pending.clear()
         with self.lock:
+            self.pending.clear()
             self.active_threads.clear()
             self.thread_id = None
             self.turn_id = None
@@ -4988,9 +4993,11 @@ class OllamaBackend(StreamCliBackend):
             finally:
                 _OLLAMA_INFERENCE_SEM.release()
 
-            if status == "completed" and not final_text:
-                self.emit("assistant_message", text="(done — no summary returned)", speaker=speaker)
-            self.emit("turn_done", status=status)
+            try:
+                if status == "completed" and not final_text:
+                    self.emit("assistant_message", text="(done — no summary returned)", speaker=speaker)
+            finally:
+                self.emit("turn_done", status=status)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -5627,6 +5634,8 @@ class GeminiBackend(StreamCliBackend):
                         break
                     else:
                         self.emit("work", text=line, tag="system")
+                if self.stop_flag.is_set():
+                    gemini_status = "error"
                 if emitted_visible:
                     self.emit("assistant_done", speaker="GEMINI")
                 self.emit("turn_done", status="completed" if gemini_status == "success" else "error")
@@ -12473,8 +12482,6 @@ class App:
             title = visible_title
         elif title.lower().startswith(SESSION_CONTEXT_OPEN):
             title = clean_text(session.get("preview") or "Untitled")
-        if session.get("origin") == "claude-terminal":
-            return title
         alias = self._session_alias(session)
         if alias:
             return alias
@@ -14802,6 +14809,8 @@ class App:
             agent_key = spec["key"]
             if spec.get("custom"):
                 installed = True  # user-added clients (Ollama/CLI) are always available
+            elif agent_key == "ollama":
+                installed = self._list_ollama_models() is not None
             else:
                 installed = bool(self._agent_executable(agent_key)) and shutil.which(
                     self._agent_executable(agent_key)
@@ -15442,6 +15451,8 @@ class App:
         session["worker_parent_session_id"] = source.get("id")
         session["worker_kind"] = reason
         session["worker_auto"] = bool(auto)
+        session["handoff_base_title"] = base_title
+        session["handoff_sequence"] = sequence
         self.store.save(session)
         self.local_sessions.insert(0, session)
         self.sessions = self._combined_sessions()
@@ -16245,11 +16256,15 @@ class App:
             if name in existing_names:
                 mcp_status.configure(text=f"MCP server '{name}' already exists.", fg="#e57373")
                 return
+            try:
+                parts = shlex.split(command)
+            except ValueError as exc:
+                mcp_status.configure(text=f"Invalid command syntax: {exc}", fg="#e57373")
+                return
             self.secrets["mcp"].append({"name": name, "command": command, "scope": "user"})
             self._save_secrets()
             # Register with Claude Code
             try:
-                parts = shlex.split(command)
                 result = subprocess.run(
                     ["claude", "mcp", "add", "-s", "user", name, "--"] + parts,
                     capture_output=True,
