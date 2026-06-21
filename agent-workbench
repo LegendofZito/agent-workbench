@@ -2889,6 +2889,7 @@ def _project_root_from_registry_aliases(session):
         os.path.join(home, "Projects"),
         os.path.join(home, "Projects", "Open Projects"),
         os.path.join(home, "Projects", "Open Games"),
+        os.path.join(home, "Projects", "Scratch"),
     ]
     seen = set()
     for base in search_roots:
@@ -2909,9 +2910,17 @@ def _project_root_from_registry_aliases(session):
                     continue
                 for alias in data.get("aliases") or []:
                     if clean_text(alias).lower() == raw_lower:
-                        root = clean_text(data.get("root")) or entry.path
+                        # Prefer the registry's ACTUAL on-disk location (entry.path —
+                        # the dir holding .agent-workbench/) over the stored "root",
+                        # which is stale after the project is moved. Falling back to the
+                        # stale path silently failed to re-link a moved project; using
+                        # entry.path lets AWB re-route, and ensure_project_registry then
+                        # heals the stored path on the next touch.
+                        stored = clean_text(data.get("root"))
+                        root = stored if (stored and os.path.isdir(stored)) else entry.path
                         if root and os.path.isdir(root):
                             return os.path.abspath(root)
+                        break
         except OSError:
             continue
     return ""
@@ -2928,6 +2937,7 @@ def _project_root_from_title(session, cwd):
         os.path.join(home, "Projects"),
         os.path.join(home, "Projects", "Open Projects"),
         os.path.join(home, "Projects", "Open Games"),
+        os.path.join(home, "Projects", "Scratch"),
     ]
     seen = set()
     for base in search_roots:

@@ -1,3 +1,13 @@
+## 2026-06-21 (Project link re-routes when a project moves)
+
+- **Moved projects now re-link.** `_project_root_from_registry_aliases` trusted the `root`
+  stored in `.agent-workbench/project.json` over the file's actual on-disk location, so after
+  a project directory moved, alias recovery hit the stale (now-missing) path and silently gave
+  up. It now prefers `entry.path` (where the registry file actually is) when the stored root
+  no longer exists; `ensure_project_registry` then heals the stored path on the next touch.
+- **Reorg destinations covered.** Added `~/Projects/Scratch` to both recovery scanners
+  (alias + title), alongside home / Projects / Open Projects / Open Games.
+
 # Agent Workbench — Changelog
 
 Running log of every change, newest first. Source: `agent-workbench` (single Python/Tkinter file).
