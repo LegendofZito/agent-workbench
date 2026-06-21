@@ -93,13 +93,12 @@ def ensure_local_delegate_mcp_config():
     if not os.path.isfile(LOCAL_DELEGATE_SERVER):
         return None
     try:
-        model = LOCAL_DELEGATE_DEFAULT_MODEL
         config = {
             "mcpServers": {
                 "local-delegate": {
                     "command": "python3",
                     "args": [LOCAL_DELEGATE_SERVER],
-                    "env": {"DELEGATE_MODEL": model},
+                    "env": {"DELEGATE_MODEL": LOCAL_DELEGATE_DEFAULT_MODEL},
                 }
             }
         }
@@ -3045,7 +3044,7 @@ def project_scope_conflict(session=None, fallback_cwd=""):
     )
     # Handoff chains can mention older tool/project paths. Do not block recovery when
     # the current session is overwhelmingly anchored in the titled project.
-    if expected_hits and expected_hits >= max(3, conflict_count * 3):
+    if expected_hits >= max(3, conflict_count * 3):
         return {}
     return {
         "expected_root": expected,
@@ -3178,7 +3177,7 @@ def ensure_project_registry(cwd, session=None, agent_key="", title="", state_pat
         # Bail BEFORE save_json — saving to "" raises [Errno 2] '' and broke Hand Off
         # Deploy for any session whose cwd is the home directory.
         return ""
-    existing = load_json(path, {}) if path else {}
+    existing = load_json(path, {})
     if not isinstance(existing, dict):
         existing = {}
     now = now_iso()
@@ -7873,7 +7872,6 @@ class App:
             font=("Sans", 10),
         )
         self.spawned_list.pack(side="left", fill="both", expand=True)
-        self.spawned_list.bind("<Double-Button-1>", lambda _e: self._open_selected_spawned())
         self.spawned_list.bind("<<ListboxSelect>>", lambda _e: self._open_selected_spawned())
         spawned_scroll = tk.Scrollbar(spawned_list_frame, command=self.spawned_list.yview)
         spawned_scroll.pack(side="right", fill="y")
@@ -12085,11 +12083,10 @@ class App:
                     pady=6,
                 ).pack(side="right", padx=10)
             else:
-                action_text = "Connect"
                 action = lambda url=client["docs"]: subprocess.Popen(["xdg-open", url])
                 tk.Button(
                     row,
-                    text=action_text,
+                    text="Connect",
                     command=action,
                     bg=ACCENT,
                     fg="white",
