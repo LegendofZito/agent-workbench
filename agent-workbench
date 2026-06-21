@@ -652,10 +652,6 @@ def sanitize_session_context_stream(workspace, text):
     buffer = clean_text(workspace.get("session_context_buffer"))
     active = bool(workspace.get("session_context_active"))
     chunk = buffer + raw
-    if not chunk:
-        workspace["session_context_buffer"] = ""
-        workspace["session_context_active"] = False
-        return "", ""
     open_marker = SESSION_CONTEXT_OPEN.lower()
     close_marker = SESSION_CONTEXT_CLOSE.lower()
     lower_chunk = chunk.lower()
@@ -5959,6 +5955,7 @@ class App:
         self._modal_scroll_lock = 0  # >0 while a modal list dialog is open (blocks bg scroll)
         self._subagents_popover = None
         self._skill_popover = None
+        self._skill_popover_name = None
         # Per-agent skill favorites — keyed by agent_key ("claude", "codex", "gemini").
         # Migration: seed claude bucket from the legacy flat list if present.
         _legacy_favs = self.config.get("skill_favorites")
@@ -8463,17 +8460,23 @@ class App:
         accent = "#1a56db"
         chip = getattr(self, "_skill_chip_widgets", {}).get(name)
 
-        # Toggle: if a popover is open, close it and un-highlight its chip.
+        # Toggle: clicking the SAME chip closes its popover; clicking a DIFFERENT
+        # chip closes the open one and falls through to open the new chip's popover
+        # (previously it always closed and returned, so you had to click twice).
         if getattr(self, "_skill_popover", None) and self._skill_popover.winfo_exists():
+            old_name = getattr(self, "_skill_popover_name", None)
             self._skill_popover.destroy()
             self._skill_popover = None
+            self._skill_popover_name = None
             self._unhighlight_skill_chip()
-            return
+            if old_name == name:
+                return
 
         pop = tk.Toplevel(self.win)
         pop.overrideredirect(True)
         pop.configure(bg=accent, highlightbackground=accent, highlightthickness=2)
         self._skill_popover = pop
+        self._skill_popover_name = name
 
         # Colored header bearing the skill name — ties the box to its chip.
         tk.Label(
@@ -8519,6 +8522,7 @@ class App:
             if pop.winfo_exists():
                 pop.destroy()
             self._skill_popover = None
+            self._skill_popover_name = None
             self._unhighlight_skill_chip()
 
         def _run():
@@ -9648,7 +9652,7 @@ class App:
             queue_list.delete(index)
             queue_list.insert(index, f"{index + 1}. {shorten(new_prompt, 54)}")
             queue_list.selection_set(index)
-            _loaded_text[0] = detail_text.get("1.0", "end-1c")  # new saved baseline
+            _loaded_text[0] = new_prompt  # new saved baseline (matches what was stored)
             _mark_saved()
             self.status.set(f"Queued item {index + 1} updated.")
 
@@ -10193,6 +10197,8 @@ class App:
         if hasattr(self, "_limits_popover") and self._limits_popover and self._limits_popover.winfo_exists():
             self._limits_popover.destroy()
             self._limits_popover = None
+            self._limits_popover_populate = None
+            self._limits_popover_body = None
             return
         pop = tk.Toplevel(self.win)
         pop.overrideredirect(True)
