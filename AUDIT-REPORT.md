@@ -1,10 +1,12 @@
 # Agent Workbench — Audit Report (2026-06-20)
 
-Chunked multi-agent audit (24 readers + per-finding adversarial verifiers, 102 agents). 74 verified findings. Each was independently re-checked against the source before any change.
+Chunked multi-agent audit (24 readers + per-finding adversarial verifiers, 102 agents), then every finding independently re-checked against source before any change.
 
-**Applied: 31** (commits a2341e8, bd0e0c5, 8b6a4a8, 5270a6b, 1034063). **Rejected as wrong/no-op: 4.** **Remaining for your review: the rest below.**
+**Applied: 40** (7 batches, commits a2341e8 → fa5f381, all deployed + launch-tested). **Rejected as wrong/no-op: 6.** **Remaining for review: below.**
 
-## ✅ Applied (31)
+> Restore point: tag `pre-audit-cleanup` (76ebe3a). `git reset --hard pre-audit-cleanup && bash install.sh` undoes everything; each batch is its own commit for granular revert.
+
+## ✅ Applied (40)
 
 - **_handle_notification** (L4347, high/bug): When item['content'] is a non-empty list, it is assigned directly to 'text', bypassing the fallback loop that extracts text from structured content blocks.
 - **update_project_state** (L10959, high/bug): _project_state_update_running is never reset when win.after() raises TclError, permanently blocking future calls.
@@ -20,6 +22,7 @@ Chunked multi-agent audit (24 readers + per-finding adversarial verifiers, 102 a
 - **GeminiBackend.start_turn** (L5627, medium/bug): GeminiBackend emits turn_done status='completed' even when the turn was stopped early via stop_flag, incorrectly marking aborted turns as successful.
 - **_working_workspace_labels** (L6807, medium/bug): Busy marker ' •' is silently dropped from window-title labels when the session title is long, because shorten() truncates it before endswith(' •') can match.
 - **_build_ui** (L7579, medium/bug): work_pages_scroll scrollbar is created and wired but never packed, so the work-log page-button list has no visible scrollbar even when pages overflow.
+- **_open_skill_prompt** (L8452, medium/bug): Clicking any skill chip while a popover is open always closes and returns, so clicking a different chip never opens its popover.
 - **refresh_prompt_state** (L9864, medium/bug): model variable is computed but never used in the text string, wasting a call to _working_model_effort_label on every 1-second tick.
 - **show_edit_menu** (L10591, medium/bug): Select-all in the edit context menu selects the trailing implicit newline ("end") unlike every other select-all in the file ("end-1c").
 - **_display_session_title** (L12470, medium/bug): Alias set for claude-terminal sessions is never displayed because the function returns before the alias check.
@@ -30,39 +33,39 @@ Chunked multi-agent audit (24 readers + per-finding adversarial verifiers, 102 a
 - **_do_add_mcp** (L16230, medium/bug): MCP entry is appended to secrets and saved before subprocess registration succeeds, so a `shlex.split` ValueError (malformed command with unclosed quote) persists a broken entry and shows a confusing 'Saved; register error' message instead of blocking the save.
 - **open_handoff_options_dialog** (L17126, medium/bug): Missing WM_DELETE_WINDOW protocol binding leaves an orphaned StringVar trace when the dialog is closed with the title-bar X button.
 - **request_close** (L18416, medium/bug): request_close uses close_when_idle without excluding restart_after_close, so pressing close while a restart is queued shows a misleading 'will close automatically' info dialog instead of letting the user override or cancel the restart.
+- **sanitize_session_context_stream** (L655, low/bug): Dead branch 'if not chunk' is unreachable because 'raw' is already guaranteed non-empty before 'chunk = buffer + raw' is computed.
+- **ensure_local_delegate_mcp_config** (L96, low/simplify): Intermediate variable 'model' is assigned the module-level constant LOCAL_DELEGATE_DEFAULT_MODEL and used exactly once, adding no clarity.
 - **format_token_usage** (L894, low/dead_code): The branch `if not parts and limit and total_tokens` at line 894 is unreachable dead code.
 - **infer_project_root** (L3098, low/dead_code): The `if title_root: return title_root` branch at line 3098 is unreachable dead code.
+- **project_scope_conflict** (L3052, low/simplify): The `expected_hits and` guard before `expected_hits >= max(3, ...)` is redundant.
 - **codex_usage_limits** (L3791, low/bug): Falsy-zero bug: when window_minutes is absent or null, `minutes` is 0 and the condition `minutes and minutes <= 360` is False, so a missing-minutes primary 5h window is mislabeled 'week'.
+- **ensure_project_registry** (L3187, low/redundant): The `if path else {}` ternary has a dead else-branch: path is guaranteed truthy by the early-return guard three lines above.
+- **_build_ui** (L7864, low/redundant): spawned_list binds both <<ListboxSelect>> and <Double-Button-1> to the same _open_selected_spawned() method, causing it to fire twice on every double-click.
 - **row_bg** (L8883, low/dead_code): `row_bg` is assigned but never read inside `_open_subagents_popover`.
+- **save_edit** (L9637, low/bug): After saving, _loaded_text[0] is set to the raw widget content (possibly with leading/trailing whitespace) while the persisted prompt was clean_text-stripped, so the displayed text and the stored value silently diverge.
+- **_open_limits_popover** (L10181, low/bug): Toggle-close path clears _limits_popover but leaves _limits_popover_populate and _limits_popover_body pointing at stale closures from the destroyed popover.
+- **open_add_client_dialog** (L12067, low/redundant): action_text variable is assigned the constant string 'Connect' and used only once, making it needless.
 - **refresh_sessions** (L12777, low/dead_code): The else branch in refresh_sessions is unreachable because self.sessions is always non-empty at that point.
 - **_deploy_handoff_to_existing** (L15317, low/bug): Bare source.get('id') at line 15317 will raise AttributeError if source is None, despite the method's own earlier defensive `(source or {}).get(...)` pattern at lines 15244-15245.
 - **handle_event** (L18058, low/bug): subagent_stop marks an agent complete only if its status is exactly 'running', missing 'in_progress' and 'pending' states that the rest of the codebase treats as active.
 
-## ⛔ Rejected — verifier said 'safe' but my re-check disagreed (NOT applied)
+## ⛔ Rejected — verifier said 'safe' but re-check disagreed (NOT applied)
 
 - **codex_thread_metadata** (L1441): The `finally` block references `con` which may be unbound if `sqlite3.connect()` raises before assignment, causing a silent `NameError` swallowed by the inner `except Exception: pass`.
-  - **Kept because:** the existing finally already wraps con.close() in try/except Exception, which catches the unbound-con NameError. Redundant.
+  - **Kept because:** existing finally already wraps con.close() in try/except (catches unbound-con NameError). Redundant.
 - **_paths_from_command** (L2741): When a command starts with `cd`, the target path is appended to `paths` twice.
-  - **Kept because:** loop only catches paths with '/'; removing the cd-append loses relative targets like 'cd myproject'. Duplicate is harmless.
+  - **Kept because:** loop only catches paths with '/'; removing cd-append loses relative 'cd name' targets. Duplicate is harmless.
+- **_ollama_model_options** (L8672): `models or []` collapses `None` (Ollama unreachable) and `[]` (no models installed) into the same cached value, masking the error state for 8 seconds.
+  - **Kept because:** None and [] both already return ['Default']; no observable bug. Fix would re-probe network every call when Ollama down.
+- **_terminal_send** (L11625): Second send() after restart_terminal() silently swallows failure if the new shell also fails to start.
+  - **Kept because:** App has no .emit() method (only backends do) — the suggested fix would AttributeError.
 - **_handoff_context_text** (L14999): The else-branch of _handoff_context_text ('Continue from the attached handoff context.') is unreachable because every caller guards the call with `if handoff_artifact else packet`.
-  - **Kept because:** removing else -> UnboundLocalError if artifact falsy (defensive default).
+  - **Kept because:** removing else -> UnboundLocalError on falsy artifact (defensive default).
 - **drain_events** (L18393): processed=True is set unconditionally after a handle_event exception, so a corrupted/unhandled event still triggers a workspace config save and tab re-render on the same tick.
-  - **Kept because:** moving processed=True into the try changes event-loop re-render semantics for no clear gain.
+  - **Kept because:** moving processed=True into the try changes event-loop re-render semantics for no gain.
 
-## 🐛 Bugs not yet applied — need your call (9)
+## 🐛 Bugs not applied — your call (3)
 
-- **sanitize_session_context_stream** (L655, low): Dead branch 'if not chunk' is unreachable because 'raw' is already guaranteed non-empty before 'chunk = buffer + raw' is computed.
-  - fix: 
-- **_open_skill_prompt** (L8452, medium): Clicking any skill chip while a popover is open always closes and returns, so clicking a different chip never opens its popover.
-  - fix: 
-- **_ollama_model_options** (L8672, low): `models or []` collapses `None` (Ollama unreachable) and `[]` (no models installed) into the same cached value, masking the error state for 8 seconds.
-  - fix: 
-- **save_edit** (L9637, low): After saving, _loaded_text[0] is set to the raw widget content (possibly with leading/trailing whitespace) while the persisted prompt was clean_text-stripped, so the displayed text and the stored value silently diverge.
-  - fix: 
-- **_open_limits_popover** (L10181, low): Toggle-close path clears _limits_popover but leaves _limits_popover_populate and _limits_popover_body pointing at stale closures from the destroyed popover.
-  - fix: 
-- **_terminal_send** (L11625, low): Second send() after restart_terminal() silently swallows failure if the new shell also fails to start.
-  - fix: 
 - **submit_terminal_command** (L11682, low): Calling clear_terminal() before sending 'clear'/'reset' to the shell causes a visible double-clear because the shell's ANSI response also triggers clear_terminal().
   - fix: 
 - **open_handoff_dialog** (L16742, low): The 'New tab title' row is always visible even when 'Existing session' mode is selected, where the title field is meaningless.
@@ -70,16 +73,13 @@ Chunked multi-agent audit (24 readers + per-finding adversarial verifiers, 102 a
 - **handle_event** (L18186, medium): Active-workspace turn_done handler does not reset live_subagents or live_token_count on the workspace dict, leaving stale values visible after a turn ends.
   - fix: 
 
-## ♻️ Redundant — refactors, review before applying (14)
+## ♻️ Redundant — refactors, review before applying (11)
 
 - **_infer_expected_root** (L3023): `_infer_expected_root` is a one-line wrapper for `infer_project_root` with a false docstring, called only once.
-- **ensure_project_registry** (L3187): The `if path else {}` ternary has a dead else-branch: path is guaranteed truthy by the early-return guard three lines above.
 - **OllamaBackend.TOOL_NAMES** (L4691): TOOL_NAMES manually duplicates the five tool names already declared in the TOOLS class attribute, creating a synchronization hazard.
 - **CustomCliBackend.start_turn** (L5032): The cwd variable is computed inside the aider hint block (line 5032) and then unconditionally recomputed with the identical expression three lines later (line 5051).
 - **_apply_secrets_env** (L6025): `_apply_secrets_env` redundantly guards `_injected_env` initialization that `_load_secrets` already guarantees.
 - **_evict_subagent_workspace_tabs** (L6223): `keep` is computed at line 6223 but never used; `self.workspace_order` is reassigned by recomputing the equivalent filter at line 6234.
-- **_build_ui** (L7864): spawned_list binds both <<ListboxSelect>> and <Double-Button-1> to the same _open_selected_spawned() method, causing it to fire twice on every double-click.
-- **open_add_client_dialog** (L12067): action_text variable is assigned the constant string 'Connect' and used only once, making it needless.
 - **_artifact_items_for_session** (L12619): Manual fileChange path extraction (lines 12619-12623) is a strict subset of what _collect_artifact_paths already does on the same item at line 12624.
 - **rename_selected_session** (L13503): For local sessions where source_updated is True, session['title'] = alias and session_aliases.pop() are executed twice.
 - **open_session** (L13732): Empty `if loading_transcript: pass` branch immediately followed by a duplicate `if not loading_transcript:` block, producing two separate checks for the same condition where the first does nothing.
@@ -87,10 +87,8 @@ Chunked multi-agent audit (24 readers + per-finding adversarial verifiers, 102 a
 - **_make_turn** (L17179): Double `.get("title")` call: the second `.get("title", "")` is redundant because its result is only evaluated when the first `.get("title")` already returned a truthy value.
 - **handle_event** (L18222): refresh_usage(manual=False) is called twice in the same turn_done handler path, separated by ~35 lines.
 
-## ♻️ Simplify — refactors, review before applying (5)
+## ♻️ Simplify — refactors, review before applying (3)
 
-- **ensure_local_delegate_mcp_config** (L96): Intermediate variable 'model' is assigned the module-level constant LOCAL_DELEGATE_DEFAULT_MODEL and used exactly once, adding no clarity.
-- **project_scope_conflict** (L3052): The `expected_hits and` guard before `expected_hits >= max(3, ...)` is redundant.
 - **_update_worker_indicator** (L8839): `_active_worker_jobs()` is called twice unnecessarily in the same function.
 - **_on_provider_change** (L16082): The 'Custom env var' row is always visible in the layout; hiding it by setting fg=PANEL (background color) is a color-hack that leaves the row occupying space and the label text invisible but still present in the layout.
 - **handle_event** (L18065): elif kind == 'assistant_begin': pass is an explicit no-op branch that adds noise without value.

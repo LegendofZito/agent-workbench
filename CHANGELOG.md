@@ -31,9 +31,18 @@ current turn). A change is only LIVE after a deploy + the app reloading.
   new-session staleness; `format_reset_time` now accepts ISO (Codex resets were blank);
   backend lock thread-safety; turn_done always emitted; MCP command validated before save;
   Ollama shown installed in New Session dialog; subagent-stop status match broadened.
-- **Rejected 4 verifier-"safe" items** my own re-check found wrong or no-op (`_paths_from_command`
-  cd-append, `drain_events` processed flag, `codex_thread_metadata` con-guard, `_handoff_context_text`
-  else). **28 items remain for review** (9 bugs + 19 refactors) + 11 report-only — see `AUDIT-REPORT.md`.
+- Continued through batches 6–7: applied 9 more (sanitize dead branch, save_edit baseline,
+  limits-popover ref cleanup, **skill-chip popover now opens a different chip instead of just
+  closing the open one**, + 5 safe refactors: dead ternary, inlined constants, redundant guard,
+  duplicate spawned-list bind, inlined action_text).
+- **Total applied: 40**, in 7 separately-revertable, parse + launch-tested commits, all deployed.
+- **Rejected 6 verifier-"safe" items** my re-check found wrong/no-op (`_paths_from_command` cd-append,
+  `drain_events` flag, `codex_thread_metadata` con-guard, `_handoff_context_text` else,
+  `_ollama_model_options` (no real bug + would re-probe network), `_terminal_send` (App has no `.emit`)).
+- **17 items remain for review** (3 bugs + 14 refactors, mostly multi-line/UI) + 11 report-only —
+  see `AUDIT-REPORT.md`.
+- Note: a transient blank-text render glitch during this work was a compositor/GPU issue
+  (no crash, fontconfig healthy), cleared by a process restart — not a code regression.
 
 ## 2026-06-20 (Recent box no longer blinks; dead-code audit)
 
