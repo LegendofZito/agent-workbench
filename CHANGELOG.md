@@ -6,6 +6,20 @@ current turn). A change is only LIVE after a deploy + the app reloading.
 
 ---
 
+## 2026-06-20 (Auto-launch sessions kept out of the picker + archived)
+
+- **Pig Farm's unattended autonomous-trading runs no longer flood the session picker.**
+  Each unattended `claude` launch wrote a transcript that AWB discovered and listed —
+  74 near-duplicate "Autonomous trading agent…" sessions (all `cwd=/home/zito`, so they
+  could NOT be told apart by directory from real sessions). They're now detected by their
+  stable first-prompt fingerprint (`AUTO_LAUNCH_PROMPT_MARKERS`, e.g. "you are the
+  autonomous trading agent") via `is_auto_launch_session()`, which `_is_picker_session`
+  excludes. This catches existing AND future runs automatically.
+- The 74 existing store files were moved to `sessions/archive/` (not deleted; restorable)
+  and their ids pruned from `session_order`. Reversible: move files back to `sessions/`.
+- Pig Farm itself is untouched (separate app) — only AWB's discovery/display changed. To
+  hide a different automated launcher later, add its prompt opener to `AUTO_LAUNCH_PROMPT_MARKERS`.
+
 ## 2026-06-20 (Full automated audit — 13 fixes applied; AUDIT-REPORT.md)
 
 - Ran a chunked multi-agent audit (24 readers + per-finding adversarial verifiers, 102

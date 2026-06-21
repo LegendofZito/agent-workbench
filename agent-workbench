@@ -54,6 +54,15 @@ MAX_WORKSPACE_TABS = 10
 WORK_LOG_PAGE_LINES = 300  # roll the work log into a new "Log N" page every ~300 lines
 GEMINI_TITLE_CACHE_FILE = os.path.join(CONFIG_DIR, "gemini-titles.json")
 SESSIONS_DIR = os.path.join(CONFIG_DIR, "sessions")
+# Sessions matching an auto-launch fingerprint (e.g. Pig Farm's unattended trading
+# runs) are kept OUT of the picker and filed here instead of cluttering the list.
+SESSIONS_ARCHIVE_DIR = os.path.join(SESSIONS_DIR, "archive")
+# First-prompt fingerprints of automated launches that should never appear in the
+# session picker. These are unattended agent runs, not sessions the user opened.
+# Matched against the session's first user message / preview (case-insensitive).
+AUTO_LAUNCH_PROMPT_MARKERS = (
+    "you are the autonomous trading agent",  # Pig Farm live/paper trading agent
+)
 ARTIFACTS_DIR = os.path.join(CONFIG_DIR, "artifacts")
 SECRETS_FILE = os.path.join(CONFIG_DIR, "secrets.json")
 # Local-LLM delegation MCP bridge: lets the driving Claude offload cheap subtasks
@@ -903,6 +912,24 @@ def project_label(cwd):
 
 def project_key(cwd):
     return clean_text(cwd).replace("/", "-") or "-home"
+
+
+def is_auto_launch_session(session):
+    """True if a session was started by an automated/unattended launcher (matched by
+    its first-prompt fingerprint), not opened by the user. Such runs — e.g. Pig Farm's
+    autonomous trading agent — flood the picker with near-duplicates, so they're kept
+    out of it and filed under SESSIONS_ARCHIVE_DIR. Only terminal-discovered sessions
+    can match; the user's own Workbench ("local") sessions are always treated as real."""
+    if not isinstance(session, dict):
+        return False
+    origin = str(session.get("origin") or "local")
+    if not origin.endswith("-terminal"):
+        return False
+    blob = " ".join(
+        str(session.get(key) or "")
+        for key in ("preview", "first_user_message", "title")
+    ).lower()
+    return any(marker in blob for marker in AUTO_LAUNCH_PROMPT_MARKERS)
 
 
 def session_alias_key(session):
@@ -13017,6 +13044,11 @@ class App:
         if session.get("worker_job_id") or session.get("worker_parent_session_id"):
             return False
         if self._session_is_deleted(session):
+            return False
+        if is_auto_launch_session(session):
+            # Unattended agent runs (e.g. Pig Farm's autonomous trading agent) flood
+            # the picker with near-duplicate sessions. Keep them out — they're filed
+            # under SESSIONS_ARCHIVE_DIR, not deleted.
             return False
         return True
 
