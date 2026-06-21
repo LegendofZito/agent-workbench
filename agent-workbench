@@ -4440,6 +4440,7 @@ class CodexBackend(BaseBackend):
             if new_id:
                 with self.lock:
                     self.thread_id = new_id
+                    self.active_threads.add(new_id)
 
     def _extract_text(self, item):
         parts = []
@@ -6800,7 +6801,7 @@ class App:
         marker = " •" if workspace.get("busy") else ""
         queued = len(workspace.get("queued_prompts") or [])
         queue_marker = f" · {queued} queued" if queued else ""
-        return shorten(f"{agent}{queue_marker}: {title}{marker}", 42)
+        return shorten(f"{agent}{queue_marker}: {title}", 40) + marker
 
     def _working_workspace_labels(self):
         labels = []
@@ -7585,6 +7586,7 @@ class App:
             orient="vertical",
             command=self.work_pages_canvas.yview,
         )
+        self.work_pages_scroll.pack(side="right", fill="y")
         self.work_pages_canvas.pack(side="left", fill="both", expand=True)
         self.work_pages_canvas.configure(yscrollcommand=self.work_pages_scroll.set)
         self.work_pages_buttons = tk.Frame(self.work_pages_canvas, bg=BG)
@@ -14041,6 +14043,12 @@ class App:
         self.latest_agent_text = ""
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
+        # Drop accumulated link_N tags + their tag_bind callbacks so they don't leak
+        # across session switches, and reset the counter so names restart at link_0.
+        for tag in self.chat.tag_names():
+            if tag.startswith("link_"):
+                self.chat.tag_delete(tag)
+        self.link_counter = 0
         self.chat.configure(state="disabled")
         self._reset_work_pages()
 
@@ -17134,6 +17142,7 @@ class App:
         ).pack(side="right", padx=(0, 8))
 
         dialog.bind("<Escape>", lambda _e: _close_dialog())
+        dialog.protocol("WM_DELETE_WINDOW", _close_dialog)
         dialog.update_idletasks()
         x = self.win.winfo_rootx() + (self.win.winfo_width() - dialog.winfo_reqwidth()) // 2
         y = self.win.winfo_rooty() + (self.win.winfo_height() - dialog.winfo_reqheight()) // 3
@@ -18427,7 +18436,7 @@ class App:
         if not working:
             self.finalize_close()
             return
-        if self.close_when_idle:
+        if self.close_when_idle and not self.restart_after_close:
             messagebox.showinfo(
                 "Waiting for active tasks",
                 (
