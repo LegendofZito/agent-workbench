@@ -24,8 +24,16 @@ current turn). A change is only LIVE after a deploy + the app reloading.
     `refresh_sessions`, unused `row_bg`.
   - **Rejected 1** verifier-"safe" deletion (`_handoff_context_text` else) — removing it
     would cause UnboundLocalError on a falsy artifact. Kept.
-- Remaining 49 verified-safe items (30 behavioral bug-fixes + 19 refactors) and 11
-  report-only items are catalogued in `AUDIT-REPORT.md` for review rather than blind-applied.
+- Continued in tested batches (3–5): applied **31 fixes total**, each re-verified against
+  source, parse + launch-tested, in 5 separately-revertable commits. Notable batch 3–5:
+  work-pages scrollbar never packed; handoff dialog StringVar-trace leak; Codex thread
+  not registered (dup-thread risk); link-tag/bind leak across session switches; Gemini
+  new-session staleness; `format_reset_time` now accepts ISO (Codex resets were blank);
+  backend lock thread-safety; turn_done always emitted; MCP command validated before save;
+  Ollama shown installed in New Session dialog; subagent-stop status match broadened.
+- **Rejected 4 verifier-"safe" items** my own re-check found wrong or no-op (`_paths_from_command`
+  cd-append, `drain_events` processed flag, `codex_thread_metadata` con-guard, `_handoff_context_text`
+  else). **28 items remain for review** (9 bugs + 19 refactors) + 11 report-only — see `AUDIT-REPORT.md`.
 
 ## 2026-06-20 (Recent box no longer blinks; dead-code audit)
 
