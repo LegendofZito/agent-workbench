@@ -3796,7 +3796,7 @@ def codex_usage_limits(source_path=""):
             if not isinstance(value, dict) or value.get("used_percent") is None:
                 continue
             minutes = int(value.get("window_minutes") or 0)
-            label = "5h" if minutes and minutes <= 360 else "week"
+            label = "week" if minutes > 360 else "5h"
             windows.append(
                 {
                     "label": label,
@@ -15341,7 +15341,7 @@ class App:
             registry_path=registry_path,
             existing=True,
         ) if handoff_artifact else packet
-        target["handoff_from"] = clean_text(source.get("id"))
+        target["handoff_from"] = clean_text((source or {}).get("id"))
         target["handoff_received_at"] = now_iso()
         target["handoff_stage_ready"] = True
         target["handoff_stage_signature"] = self._handoff_packet_signature(source)
@@ -18093,7 +18093,7 @@ class App:
                 target_id = event.get("agent_id") or ""
                 if target_id:
                     for s in live:
-                        if s.get("id") == target_id and s.get("status", "running") == "running":
+                        if s.get("id") == target_id and s.get("status", "running") in ("running", "in_progress", "pending"):
                             s["status"] = "completed"
                             s["ended_at"] = now_iso()
                             self.append_work(f"✓ Sub-agent finished: {clean_text(s.get('name')) or 'sub-agent'}", "done")
