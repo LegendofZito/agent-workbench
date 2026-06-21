@@ -1,3 +1,14 @@
+## 2026-06-21 (Queued prompts survive close/restart/crash)
+
+- **The message queue is now written to disk the instant it changes.** `_queue_prompt`
+  (add) and `_send_next_queued_prompt` (drain) only called `_save_active_workspace()`,
+  which updates the in-memory workspace but does NOT write `config.json` — so the queue
+  reached disk only on a debounced save or a graceful window-close. An external kill, a
+  crash, or an app self-restart in between dropped queued messages. Both paths now call
+  `_schedule_workspace_config_save(immediate=True)`, matching the queue dialog's
+  edit/delete/clear handlers. The queue is restored from `workspace_tabs[].queued_prompts`
+  on startup, so it now persists across any close/restart/crash.
+
 ## 2026-06-21 (Project link re-routes when a project moves)
 
 - **Moved projects now re-link.** `_project_root_from_registry_aliases` trusted the `root`

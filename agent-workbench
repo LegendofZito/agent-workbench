@@ -17286,7 +17286,9 @@ class App:
             "system",
         )
         self._log_event("queue_add", depth=count, session=(self.current_session or {}).get("id"))
-        self._save_active_workspace()
+        # Persist to disk immediately (not just the in-memory workspace) so a close,
+        # restart, kill, or crash before the next debounced save can't lose the queue.
+        self._schedule_workspace_config_save(immediate=True)
         self._render_workspace_tabs()
 
     def _send_next_queued_prompt(self):
@@ -17301,7 +17303,9 @@ class App:
         self._log_event("queue_drain", scope="active", remaining=len(self.queued_prompts))
         self._update_queue_indicator()
         self._refresh_queue_dialog()
-        self._save_active_workspace()
+        # Persist the reduced queue to disk immediately so a close/restart/crash mid-drain
+        # can't resurrect an already-sent prompt or lose the rest of the queue.
+        self._schedule_workspace_config_save(immediate=True)
         self._render_workspace_tabs()
         # Send the queued message DIRECTLY — never load it into the composer, so a
         # draft the user is typing right now is preserved instead of overwritten.
