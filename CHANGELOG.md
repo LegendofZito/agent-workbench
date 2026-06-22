@@ -1,3 +1,11 @@
+## 2026-06-21 (Merge queued prompts into one turn)
+
+- Queue dialog: multi-select (Ctrl/Shift-click) + a **⛓ Merge** button that combines
+  several stacked queued messages into ONE so they run as a single turn instead of
+  one-at-a-time. Merges the selected items, or the whole queue when fewer than 2 are
+  selected; attachments are unioned and the merged message keeps the first item's slot.
+  "Delete selected" now removes all selected items too.
+
 ## 2026-06-21 (Per-code-block Copy button)
 
 - Fenced code blocks (```​```) in the conversation now get their own "⧉ Copy code"

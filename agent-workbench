@@ -9533,6 +9533,8 @@ class App:
             highlightthickness=0,
             activestyle="none",
             font=("Sans", 10),
+            selectmode="extended",  # Ctrl/Shift-click to pick several for Merge / Delete
+            exportselection=False,  # keep the selection when focus moves to the editor
         )
         queue_list.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
         queue_scroll = tk.Scrollbar(list_frame, command=queue_list.yview)
@@ -9574,7 +9576,9 @@ class App:
             queued = list(workspace.get("queued_prompts") or [])
             summary_var.set(
                 f"{len(queued)} message{'s' if len(queued) != 1 else ''} waiting. "
-                "You can inspect or remove items before they run."
+                "Inspect, edit, or remove items before they run. "
+                "Ctrl/Shift-click to select several, then Merge to run them as ONE "
+                "message (Merge with nothing selected combines the whole queue)."
             )
             for index, item in enumerate(queued, start=1):
                 prompt = clean_text(item.get("prompt"))
@@ -9725,20 +9729,57 @@ class App:
             self.status.set(f"Queued item {index + 1} updated.")
 
         def delete_selected():
-            selection = queue_list.curselection()
+            selection = {int(i) for i in queue_list.curselection()}
             queued = list(workspace.get("queued_prompts") or [])
             if not selection or not queued:
                 return
-            index = int(selection[0])
-            if index >= len(queued):
-                return
-            queued.pop(index)
+            queued = [item for j, item in enumerate(queued) if j not in selection]
             workspace["queued_prompts"] = queued
             self.queued_prompts = list(queued)
             self._save_active_workspace()
             self._schedule_workspace_config_save(immediate=True)
             self._update_queue_indicator()
             render_queue()
+
+        def merge_queue():
+            # Combine several stacked queued messages into ONE so they run as a single
+            # turn instead of one-at-a-time. Merge the SELECTED items (Ctrl/Shift-click),
+            # or the whole queue when fewer than 2 are selected. The merged message lands
+            # at the position of the first item it absorbed; its attachments are unioned.
+            queued = list(workspace.get("queued_prompts") or [])
+            if len(queued) < 2:
+                self.status.set("Need at least 2 queued messages to merge.")
+                return
+            selection = sorted(int(i) for i in queue_list.curselection())
+            if len(selection) >= 2:
+                indices, scope = selection, "selected"
+            else:
+                indices, scope = list(range(len(queued))), "all"
+            chosen = set(indices)
+            merged_prompt = "\n\n".join(
+                clean_text(queued[i].get("prompt"))
+                for i in indices
+                if clean_text(queued[i].get("prompt"))
+            )
+            merged_attachments = []
+            for i in indices:
+                for path in queued[i].get("attachments") or []:
+                    if path and path not in merged_attachments:
+                        merged_attachments.append(path)
+            merged_item = {"prompt": merged_prompt, "attachments": merged_attachments}
+            kept = [item for j, item in enumerate(queued) if j not in chosen]
+            # Insert the merged item where the first absorbed item used to be.
+            insert_at = sum(1 for j in range(indices[0]) if j not in chosen)
+            kept.insert(insert_at, merged_item)
+            workspace["queued_prompts"] = kept
+            self.queued_prompts = list(kept)
+            self._save_active_workspace()
+            self._schedule_workspace_config_save(immediate=True)
+            self._update_queue_indicator()
+            render_queue()
+            self.status.set(
+                f"Merged {len(indices)} queued messages ({scope}) into one."
+            )
 
         def clear_queue():
             queued = list(workspace.get("queued_prompts") or [])
@@ -9786,6 +9827,19 @@ class App:
             state="disabled",
         )
         save_btn.pack(side="left")
+        tk.Button(
+            button_row,
+            text="⛓ Merge",
+            command=merge_queue,
+            bg="#1d4ed8",
+            fg="white",
+            activebackground="#2563eb",
+            activeforeground="white",
+            relief="flat",
+            padx=12,
+            pady=6,
+            cursor="hand2",
+        ).pack(side="left", padx=(8, 0))
         tk.Button(
             button_row,
             text="Delete selected",
