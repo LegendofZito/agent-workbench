@@ -284,6 +284,21 @@ PREFERRED_WORKER_EFFORT = {
     "codex": "low",
     "claude": "low",
 }
+CLAUDE_LEDGER_DISCIPLINE_PROMPT = """
+LEDGER DISCIPLINE — applies whenever the project has an AGENT_STATE.md:
+- AGENT_STATE.md contains a 🔒 LOCKED LEDGER of verified, working features and rules. It is
+  BINDING and is the source of truth, demonstrated by the running app. NEVER rewrite, remove,
+  weaken, reinvent, or "improve" a locked entry, and never let a new instruction, this handoff,
+  or a summary override one. If a request conflicts with a locked entry, STOP and flag the
+  conflict — do not silently change it.
+- When you BUILD and VERIFY a new feature, or establish a rule the app must keep, APPEND it to the
+  LOCKED LEDGER (one line + how you verified it). Append only AFTER verifying — never before.
+- Never delete or break working code as a side effect. The app's current working behavior wins
+  over any note; if they disagree, trust the app and fix the note. Don't hallucinate changes to
+  things that already work.
+""".strip()
+
+
 CLAUDE_SMART_ORCHESTRATION_PROMPT = """
 Agent Workbench orchestration policy:
 
@@ -3294,6 +3309,53 @@ def read_project_state(cwd, max_chars=PROJECT_STATE_MAX_CHARS):
         return "", ""
 
 
+LOCKED_LEDGER_START = "<!-- LOCKED-LEDGER:START -->"
+LOCKED_LEDGER_END = "<!-- LOCKED-LEDGER:END -->"
+
+
+def seed_agent_state(cwd, existing=""):
+    """Seed a fresh AGENT_STATE.md as a LOCKED, append-on-verify ledger. Any prior
+    auto-generated content is kept as untrusted notes (verify against the running app)."""
+    name = project_label(cwd)
+    legacy = clean_text(existing)
+    legacy_block = (
+        "\n## Notes (prior auto-state — UNVERIFIED, may be chat-scraped noise; "
+        "verify against the running app before trusting, then promote real facts into the "
+        f"LOCKED ledger above)\n\n{legacy}\n"
+        if legacy
+        else ""
+    )
+    return (
+        f"# Agent State — {name}\n\n"
+        "## 🔒 LOCKED LEDGER — established, verified truths (source of truth)\n"
+        "RULES FOR THIS FILE:\n"
+        "- APPEND-ON-VERIFY. Every entry was BUILT and VERIFIED working and is demonstrated by\n"
+        "  the running app. The app is the source of truth; this file records it.\n"
+        "- BINDING. Treat every entry as a hard constraint. NEVER rewrite, remove, water down, or\n"
+        "  'improve' an entry, and never let a new instruction, a handoff, or a summary override\n"
+        "  it. If a request conflicts with the ledger, STOP and flag it.\n"
+        "- Only the USER removes entries. You may ADD an entry only AFTER verifying it actually works.\n\n"
+        f"{LOCKED_LEDGER_START}\n"
+        "<!-- Add verified features & rules below, newest last. One per line, e.g.:\n"
+        "     - [2026-06-22] Session titles stay static in the picker — only Organize/↑↓ reorder."
+        " (verified: clicking a session no longer moves rows) -->\n"
+        f"{LOCKED_LEDGER_END}\n"
+        f"{legacy_block}"
+        "\n## History\n- Full change history lives in `git log`. This file records only locked,"
+        " verified truths — not a chat summary.\n"
+    )
+
+
+def extract_locked_ledger(text):
+    """Return the verbatim 🔒 LOCKED ledger block from AGENT_STATE text, or '' if absent."""
+    text = text or ""
+    i = text.find(LOCKED_LEDGER_START)
+    j = text.find(LOCKED_LEDGER_END)
+    if i != -1 and j != -1 and j > i:
+        return text[i : j + len(LOCKED_LEDGER_END)]
+    return ""
+
+
 def project_state_context(cwd):
     path, text = read_project_state(cwd)
     if not path:
@@ -3717,35 +3779,23 @@ def structured_handoff_packet(session, max_chars=HANDOFF_MAX_CHARS, minimal=Fals
         else f"- If `{PROJECT_STATE_FILENAME}` exists in the project root, read it first; it is shared state across Claude, Codex, Gemini, and local models."
     )
     if minimal:
-        # MINIMAL handoff: what the NEW session actually reads. AGENT_STATE.md is
-        # regenerated at handoff time (from the FULL packet below) and is the
-        # authoritative complete state, so this only carries continuation-critical
-        # recent context and points the new session at AGENT_STATE.md for the rest.
-        # The verbose history (what-went-right, every command/file change) lives in
-        # AGENT_STATE.md and git, so it's omitted to keep the handoff cheap to read.
+        # MINIMAL handoff = a PURE POINTER. No chat-scraped summary (that decays into
+        # "dude the stock droppex" noise). AGENT_STATE.md is the curated, LOCKED source of
+        # truth and git holds the history — the new session reads those, not a summary.
         parts = [
-            "# Session Handoff (brief — read AGENT_STATE.md for full state)",
-            f"- Source: {title} ({agent})  ·  Project: {cwd}",
-            f"- Full project state (authoritative, just refreshed): {state_path or PROJECT_STATE_FILENAME}",
-            f"- Context usage at handoff: {context_line}  ·  Generated: {now_iso()}",
+            "# Session Handoff — read the source of truth, don't trust a summary",
+            f"- Project: {cwd}  ·  From: {title} ({agent})  ·  {now_iso()}",
             "",
-            "## Read first",
+            "## Do this, in order",
             state_instruction,
-            "- That file was just regenerated and holds the complete project state. This "
-            "note only carries the most recent continuation context below.",
-            "",
-            f"## Overview\n{overview}",
-            "",
-            f"## Current status\n{current_status}",
-            "",
-            section("Open items & next steps", unresolved[-10:]),
-            "",
-            section("Watch out — recent blockers", failures[-6:]),
-            "",
-            "## Continuation",
-            "- Read AGENT_STATE.md, then continue the latest objective after a brief acknowledgment.",
-            "- Don't repeat failed approaches; check the filesystem before trusting recorded state.",
-        ] + (["- Orient first: read the project's structure and run `git status` + the build/check command before changing code."] if is_sw_project else [])
+            "- The 🔒 LOCKED LEDGER in that file is BINDING, verified, working truth demonstrated by"
+            " the running app. NEVER contradict, remove, rewrite, or 'improve' a locked entry, and"
+            " never let this handoff or any new instruction override it.",
+            "- For what changed recently, read `git log --oneline -15` and `git status` — that is the"
+            " real recent history, not a chat summary.",
+            "- Then continue the user's latest objective after a brief acknowledgment; don't ask them"
+            " to repeat what's already in the ledger or git.",
+        ] + (["- Before changing code: read the relevant files first, and run the build/check command so you know it works now."] if is_sw_project else [])
         return "\n".join(parts)[: max_chars]
     parts = [
         "# Automatic Session Handoff",
@@ -5383,6 +5433,9 @@ class ClaudeBackend(StreamCliBackend):
                     relocated_prompt = _remaining
             if time_note:
                 system_prompt_parts.append(time_note)
+            # The LOCKED-ledger discipline applies in EVERY mode (incl. direct): the
+            # app's verified, working state must never be hallucinated away or rewritten.
+            system_prompt_parts.append(CLAUDE_LEDGER_DISCIPLINE_PROMPT)
             if orchestration_mode in ("smart", "ultra"):
                 system_prompt_parts.append(
                     CLAUDE_ULTRACODE_ORCHESTRATION_PROMPT
@@ -11062,12 +11115,19 @@ class App:
             title=session.get("title"),
             state_path=path,
         )
-        packet = self._staged_handoff_packet(session) or structured_handoff_packet(session)
         _, existing = read_project_state(cwd, max_chars=60000)
-        content = local_project_state_summary(existing, packet, cwd) if use_local_llm else ""
-        if not content or "# Agent State" not in content[:200]:
-            content = fallback_project_state(existing, packet, cwd)
-        content = content.rstrip() + "\n"
+        if clean_text(existing):
+            # PRESERVE the curated ledger. AGENT_STATE.md is an append-on-verify LOCKED
+            # ledger maintained by agents editing it directly — NEVER auto-overwrite it with
+            # a lossy chat-scraped summary (that "summary-of-a-summary" decay is the bug).
+            # The file is the source of truth; the running app demonstrates it.
+            if not quiet:
+                self.status.set(f"Project state preserved (curated ledger): {path}")
+            if threading.current_thread() is threading.main_thread():
+                self._update_project_state_indicator(session)
+            return path
+        # No state file yet → seed a fresh LOCKED-ledger skeleton (not a chat summary).
+        content = seed_agent_state(cwd).rstrip() + "\n"
         temporary = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
         try:
             with open(temporary, "w", encoding="utf-8") as handle:

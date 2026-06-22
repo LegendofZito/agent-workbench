@@ -1,68 +1,74 @@
-# Agent State
+# Agent State — Agent Workbench
 
-## Project
-- **Name:** Agent Workbench (OG — primary)
-- **Directory:** /home/zito/Projects/Open Projects/Agent Workbench
-- **State file (this file):** /home/zito/Projects/Open Projects/Agent Workbench/AGENT_STATE.md
-- **Source:** /home/zito/Projects/Open Projects/Agent Workbench/agent-workbench (single Python/Tkinter file)
-- **Installed binary:** ~/.local/bin/agent-workbench
-- **Deploy:** `cd "/home/zito/Projects/Open Projects/Agent Workbench" && bash install.sh` (app self-restarts gracefully when idle via update-request.json — don't hard-kill a responsive app)
-- **Related project (read-only reference):** /home/zito/Projects/Open Projects/Agent Workbench Next
+## 🔒 LOCKED LEDGER — established, verified truths (source of truth)
+RULES FOR THIS FILE:
+- APPEND-ON-VERIFY. Every entry was BUILT and VERIFIED working and is demonstrated by the
+  running app. The app is the source of truth; this file records it.
+- BINDING. Treat every entry as a hard constraint. NEVER rewrite, remove, water down, or
+  "improve" an entry, and never let a new instruction, a handoff, or a summary override it.
+  If a request conflicts with the ledger, STOP and flag it.
+- Only the USER removes entries. ADD an entry only AFTER verifying it actually works.
 
-## Current Objective
-- AWBfixes1 all 4 items complete as of 2026-06-19 (deployed 7a58a84). No critical in-flight work.
+<!-- LOCKED-LEDGER:START -->
+### Deploy / process (how AWB actually runs)
+- [2026-06-20] Deploy = `bash install.sh` (copies source → `~/.local/bin/agent-workbench`) AND the
+  running process MUST be restarted — Python loads code at startup; editing the file does nothing
+  until restart. The app's own auto-restart DEFERS behind active tasks and often never fires, so
+  always kill + relaunch and confirm a NEW pid. (verified: a stale process ran old code 20+ min)
+- [2026-06-20] Restart via `kill -TERM <pid>` then `systemd-run --user … /usr/bin/python3
+  ~/.local/bin/agent-workbench` (nohup/setsid get reaped). The Konsole/CLI session is NOT a child
+  of the AWB GUI, so killing AWB is safe. (verified: new pid confirmed alive each time)
 
-## Durable Facts
-- Single-file Python/Tkinter app. All edits go to the source file, then `bash install.sh`.
-- Do NOT hard-kill a responsive app to deploy — install.sh signals a graceful self-restart. Only hard-kill if wedged.
-- OG is the only writable project. Next is a Svelte/Tauri rewrite — read-only unless explicitly told otherwise.
-- GPU risk: AMD DATA FABRIC SYNC FLOOD on RX 6800M — `_OLLAMA_INFERENCE_SEM` caps concurrent Ollama inference to 1.
-- **OllamaBackend has full tool calling** (run_shell, read_file, write_file, list_dir, web_fetch) with text-format tool-call parsing (qwen3-coder XML + Hermes JSON).
-- **Ollama is now ONE agent** in the menu; installed models are chosen in the model picker (not one client per model). Default model resolver prefers qwen3-coder:30b → qwen3:14b → first installed.
-- **UI freeze = O(n²) work-log render** (per-line see()/yview()). Fixed via `_suspend_work_autoscroll` during bulk render. py-spy diagnoses; the persisted log re-freezes on restart unless the render fix is deployed first.
+### Session list / picker (must stay static)
+- [2026-06-20] Session rows in the picker NEVER move on click — only the highlight moves. They
+  reorder ONLY via the Organize menu or the ↑/↓ arrows. Order is keyed by AGENT ONLY (not cwd),
+  append-only, and opening a session does NOT bump it to the top. (verified: user confirmed
+  "halelujah it works"; simulation proved order stable across clicks)
+- [2026-06-20] Pig Farm's unattended autonomous-trading runs are kept OUT of the picker, matched by
+  the first-prompt marker "you are the autonomous trading agent" → is_auto_launch_session() →
+  _is_picker_session excludes them; the 74 existing were moved to sessions/archive/. (verified:
+  picker no longer floods)
+- [2026-06-21] The Recent box diffs in place (no blanket delete+reinsert) so it doesn't flash white
+  on click. (verified: user confirmed the blink is gone)
 
-## Recent Changes (2026-06-19 evening) — full detail in CHANGELOG.md
-- **`recent_session_list` modal scroll-lock** — missing wheel guard added; now respects `_modal_scroll_lock`
-  like `session_list` does. Scroll bleed fully plugged for both modal dialogs. (AWBfixes1 #1 complete.)
-- **Redundant model label removed from prompt_state** — busy bottom-bar showed "Opus · 2m 15s" right next
-  to the "Working" badge; now shows just "2m 15s · streamed ~N tokens". Agent identified by tab + selector.
-  (AWBfixes1 #2.)
+### Composer / queue (never lose user input)
+- [2026-06-18] NEVER lose the user's typed composer draft. Send-while-busy = silently QUEUE the
+  message; Stop is the ONLY interrupt. A programmatic send while busy must not wipe the draft.
+- [2026-06-21] The message queue persists to disk immediately on add/drain and is restored on
+  startup, so it survives any close/restart/crash. (verified: every mutation path persists)
+- [2026-06-21] Queue dialog is multi-select; the ⛓ Merge button combines stacked queued prompts
+  into ONE turn (selected, or all if <2 selected). (verified: deployed, app alive)
 
-## Recent Changes (2026-06-19 daytime) — full detail in CHANGELOG.md
-- **Live-session auto-detect DISABLED** (`_AUTO_OPEN_LIVE_SESSIONS = False`): the feature
-  (`poll_live_sessions`, built in the Pig Farm session) was spawning DUPLICATE tabs every 5s — its
-  dedup via `_known_source_ids` didn't catch an already-open session before the next poll fired, so
-  it re-opened the same sessions endlessly and flooded the UI. Hard-off until the dedup is reworked.
-  Also added a load-time tab dedup (collapse workspace_tabs sharing a source_session_id) so the
-  duplicates don't pile back up on restart.
-- **Transcript mirror — machine-injection filter** (`strip_harness_injections`): user-role turns
-  that are `<task-notification>`, `<system-reminder>`, post-compaction summaries, attachment
-  wrappers/prompts, handoff/project-state prefixes, or bare `[Image: source:]` artifacts no longer
-  render as "YOU" bubbles. Parser-level → also cleans stored turns + Hand Off packet.
-- **Hand Off freshness**: `_sync_session_from_transcript` force-reads the transcript synchronously
-  before staging the packet (no 2s blind spot).
+### UI stability
+- [2026-06-21] Modal dialogs (New agent / Add client) deiconify+lift+focus BEFORE grab_set so a
+  modal can never hide behind the main window and freeze the app; the _modal_scroll_lock decrement
+  compares Tcl path strings (not object identity) so it can't leak and kill session-list scroll.
+  (verified: this was the "frozen session list / dead scroll" cause; fix resolved it)
+- [2026-06-20] Workspace tabs are a uniform fixed width (160px) so the × never moves during
+  spam-close. (verified: deployed)
+- [2026-06-21] Each fenced code block in the conversation gets its own "⧉ Copy code" button.
+  (verified: deployed, app alive)
 
-## Recent Changes (2026-06-18 evening) — full detail in CHANGELOG.md
-- **Ollama as a single agent + model picker** (`_model_options_for("ollama")` → live `/api/tags`, cached 8s; `start_turn` resolves live model from session backend settings).
-- **Ollama "Not installed" fix** in the new-agent dialog (HTTP-backed → "Ready" when server reachable, not a CLI-exe check).
-- **Work-log render freeze fix** (`_suspend_work_autoscroll`).
-- **Mirrored session live-render**: a Claude session open in BOTH terminal + AWB now shows terminal turns LIVE (early-return for `origin=="local"` now gated on `self.busy`). Context % was ALREADY shared/accurate (reads transcript usage via `claude_session_metadata`); the gap was only display.
-- **Queue editor fix**: white cursor, working Ctrl+C/X/V/A, accurate Save→Saved state.
-- **Interrupt-on-send REVERTED** — send-while-busy queues silently; only Stop interrupts.
-- **Per-client skills bar** (built by a parallel session): Claude/Codex/Gemini/Ollama each show their own skills.
+### Projects / handoffs / state
+- [2026-06-21] A project that moves directories re-links via its .agent-workbench/project.json
+  aliases (falls back to the file's actual location when the stored root is stale). (verified by
+  the move-recovery code path)
+- [2026-06-21] Claude's authoritative-time block is injected into the SYSTEM prompt
+  (--append-system-prompt), NOT the user message, so Claude doesn't reply "No response requested."
+  to a real question wrapped after a <session_context> block. (verified: that was the exact cause)
+- [2026-06-21] Handoffs are a MINIMAL pointer to AGENT_STATE.md + git; AGENT_STATE.md is an
+  append-on-verify LOCKED ledger that is PRESERVED, never auto-overwritten by a chat-scraped
+  summary. (this file IS that ledger)
+<!-- LOCKED-LEDGER:END -->
 
-## Local Models (Ollama) — installed ~65 GB total
-- KEEP — qwen3:14b (best tool-calling, fits 12GB VRAM, 37 tok/s), qwen3-coder:30b (best coding, spills, 19 tok/s), gemma3:12b (Pig Farm Tell Extractor).
-- CANDIDATES TO REMOVE (experiments pulled 6/17, ~21 GB): granite4:micro, granite4:tiny-h, qwen3:8b, llama3.1:8b, qwen2.5-coder:7b. deepseek-r1:14b (9 GB, reasoning, can't tool-call) borderline.
+## Notes (prior auto-state — UNVERIFIED, may be stale; verify against the app before trusting)
+- Stack: single-file Python/Tkinter app at `Projects/Open Projects/Agent Workbench/agent-workbench`.
+  Maintain CHANGELOG.md on every change. GUI not viewable from the Claude shell (drive via deploy +
+  restart + the user's screenshots).
+- Ollama is one agent in the menu with installed models in the model picker. `delegate_local` MCP
+  bridge exists (free local-LLM delegation; default model selection was pending).
+- AWB Next (Svelte/Tauri rewrite) is READ-ONLY reference at `Projects/Open Projects/Agent Workbench Next/`.
 
-## Open Tasks
-- Ollama multi-model **sub-agent distribution** (different local models for different sub-tasks) — NOT built. This is the "fleet" vision.
-- Cosmetic: image attachment renders as a 2nd raw `[Image: source: /path]` YOU bubble — collapse into an inline chip.
-
-## Verification Commands
-- cd "/home/zito/Projects/Open Projects/Agent Workbench" && git log --oneline -10
-- ollama list   # installed local models
-- ~/.local/bin/py-spy dump --pid <gui-pid>   # diagnose a freeze
-
-## Last Updated
-- 2026-06-18T23:30:00-04:00
+## History
+- Full change history lives in `git log` / `CHANGELOG.md`. This file records only locked, verified
+  truths — not a chat summary.

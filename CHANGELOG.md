@@ -1,3 +1,18 @@
+## 2026-06-21 (AGENT_STATE.md = LOCKED append-on-verify ledger; no more chat-scrape)
+
+- **AGENT_STATE.md is no longer auto-overwritten by a chat-scraped summary.** That
+  "summary-of-a-summary" decay was filling handoffs with banter ("dude the stock droppex",
+  "take your breath") as "open items". Now `update_project_state_file` PRESERVES the curated
+  file verbatim (never overwrites an existing AGENT_STATE.md); new projects get a LOCKED-ledger
+  skeleton via `seed_agent_state`. The ledger is append-on-verify, maintained by agents editing
+  it directly, demonstrated by the running app.
+- **Handoff is now a pure pointer** — no chat-scrape. It tells the new session to read the
+  AGENT_STATE.md LOCKED ledger (binding) + `git log` for recent history, then continue.
+- **Every Claude turn gets LEDGER DISCIPLINE** in its system prompt: the LOCKED ledger is binding,
+  never rewrite/remove/reinvent a locked entry, append-on-verify, don't break working code.
+- Seeded AWB's own AGENT_STATE.md with the verified features/rules from recent sessions as the
+  reference example of the format.
+
 ## 2026-06-21 (Minimal handoffs + Wayfinder consolidation)
 
 - **Handoff is now a minimal pointer to AGENT_STATE.md.** At handoff, AGENT_STATE.md is
