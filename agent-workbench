@@ -5331,6 +5331,27 @@ class ClaudeBackend(StreamCliBackend):
             # + the per-session scope charter (if set). Either may be empty; the
             # charter applies in EVERY mode, including "direct".
             system_prompt_parts = []
+            # Relocate AWB's authoritative-time <session_context> block from the FRONT
+            # of the user prompt into the system prompt. Claude Code was treating a user
+            # turn that OPENS with that block as a context-only turn and replying
+            # "No response requested." even when a real question followed it. As a
+            # system note the time can't be mistaken for the user's request. Only
+            # relocate when real user text remains (a genuinely context-only turn,
+            # which shouldn't happen for Claude, is left untouched).
+            time_note = ""
+            relocated_prompt = prompt
+            _ctx_match = SESSION_CONTEXT_BLOCK.search(prompt or "")
+            if _ctx_match:
+                _remaining = clean_text(SESSION_CONTEXT_BLOCK.sub("", prompt))
+                if _remaining:
+                    time_note = clean_text(
+                        _ctx_match.group(0)
+                        .replace(SESSION_CONTEXT_OPEN, "")
+                        .replace(SESSION_CONTEXT_CLOSE, "")
+                    )
+                    relocated_prompt = _remaining
+            if time_note:
+                system_prompt_parts.append(time_note)
             if orchestration_mode in ("smart", "ultra"):
                 system_prompt_parts.append(
                     CLAUDE_ULTRACODE_ORCHESTRATION_PROMPT
@@ -5363,9 +5384,9 @@ class ClaudeBackend(StreamCliBackend):
             else:
                 cmd += ["--resume", session_id]
 
-            payload = prompt
+            payload = relocated_prompt
             if context_text and first_turn:
-                payload = context_text.strip() + "\n\n" + prompt.strip()
+                payload = context_text.strip() + "\n\n" + relocated_prompt.strip()
 
             logged_cmd = list(cmd)
             if "--append-system-prompt" in logged_cmd:
