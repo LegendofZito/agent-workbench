@@ -1,3 +1,19 @@
+## 2026-06-21 (Frozen session list: hidden modal grab + scroll-lock leak)
+
+- **Modal dialogs could freeze the whole app.** With `-topmost` removed (so dialogs
+  don't float over other apps), the New-agent / Add-client dialogs use `grab_set()`; if
+  one opened BEHIND the main window it grabbed all input invisibly — clicks didn't open
+  sessions and the scroll wheel was dead, while the app looked "blank/Ready." Now they
+  `deiconify()` + `lift()` + `focus_force()` BEFORE `grab_set()`, so a modal can never
+  hide behind the main window.
+- **Scroll-lock leak.** The `_modal_scroll_lock` decrement bound to `<Destroy>` compared
+  `e.widget is dialog`, but Tk delivers `e.widget` as a path string, so it never matched
+  and the lock stayed >0 — permanently disabling session-list scroll after a dialog closed.
+  Now compares Tcl path strings (same fix class as the earlier winfo_toplevel bug).
+- Also fixed (same session): "No response requested." — Claude treated a user turn opening
+  with AWB's `<session_context>` time block as context-only; the time block now goes into
+  Claude's `--append-system-prompt` instead of the user message.
+
 ## 2026-06-21 (Queued prompts survive close/restart/crash)
 
 - **The message queue is now written to disk the instant it changes.** `_queue_prompt`
