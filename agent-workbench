@@ -6592,12 +6592,24 @@ class App:
         dialog.configure(bg=BG)
         dialog.transient(self.win)
         dialog.resizable(False, True)  # vertical resize so the scroll list can grow
-        dialog.grab_set()  # modal: block the main window until closed / agent chosen
+        # Make the dialog VISIBLE and on top of the main window BEFORE grabbing input.
+        # With -topmost removed (so dialogs don't float over other apps), a modal
+        # grab_set() on a window still behind the main window froze the whole app —
+        # clicks and scroll were grabbed by an invisible dialog. lift()+focus_force
+        # after deiconify guarantees it's the visible, focused window when it grabs.
+        dialog.deiconify()
+        dialog.update_idletasks()
+        dialog.lift()
         dialog.focus_force()
+        dialog.grab_set()  # modal: block the main window until closed / agent chosen
         self._modal_scroll_lock += 1  # block the session list from scrolling underneath
         dialog.bind(
             "<Destroy>",
-            lambda e: e.widget is dialog and setattr(
+            # Compare by Tcl path string, NOT object identity: Tk delivers <Destroy>
+            # with e.widget as a path string, so `e.widget is dialog` was always False
+            # and the lock never decremented — leaving the session list permanently
+            # unscrollable after the dialog closed.
+            lambda e: str(getattr(e, "widget", "")) == str(dialog) and setattr(
                 self, "_modal_scroll_lock", max(0, self._modal_scroll_lock - 1)
             ),
             add="+",
@@ -12054,12 +12066,19 @@ class App:
         dialog.configure(bg=BG)
         dialog.transient(self.win)
         dialog.resizable(False, True)
-        dialog.grab_set()
+        # Visible + raised + focused BEFORE grabbing, or a modal grab on a window
+        # hidden behind the main window freezes the whole app (clicks + scroll dead).
+        dialog.deiconify()
+        dialog.update_idletasks()
+        dialog.lift()
         dialog.focus_force()
+        dialog.grab_set()
         self._modal_scroll_lock += 1  # block the session list from scrolling underneath
         dialog.bind(
             "<Destroy>",
-            lambda e: e.widget is dialog and setattr(
+            # Path-string compare, not object identity (e.widget arrives as a string),
+            # so the scroll lock always decrements when the dialog closes.
+            lambda e: str(getattr(e, "widget", "")) == str(dialog) and setattr(
                 self, "_modal_scroll_lock", max(0, self._modal_scroll_lock - 1)
             ),
         )
