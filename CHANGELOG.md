@@ -1,3 +1,10 @@
+## 2026-06-21 (Per-code-block Copy button)
+
+- Fenced code blocks (```​```) in the conversation now get their own "⧉ Copy code"
+  button right under each block, so you can grab just that snippet instead of the whole
+  message. Handled in `_insert_formatted_chat`; covers multiple blocks per message and a
+  block left unclosed at the end of a streamed message.
+
 ## 2026-06-21 (Frozen session list: hidden modal grab + scroll-lock leak)
 
 - **Modal dialogs could freeze the whole app.** With `-topmost` removed (so dialogs

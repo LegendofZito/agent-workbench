@@ -14316,13 +14316,38 @@ class App:
             moment = datetime.now()
         return moment.strftime("%-I:%M:%S %p")
 
-    def _copy_message(self, text):
+    def _copy_message(self, text, what="Message"):
         try:
             self.win.clipboard_clear()
             self.win.clipboard_append(text)
-            self.status.set("Message copied to clipboard.")
+            self.status.set(f"{what} copied to clipboard.")
         except tk.TclError:
             pass
+
+    def _insert_code_copy_button(self, code_text):
+        """Drop a small Copy button for a single fenced code block, so the user can
+        grab just that code (not the whole message). Inserted right under the block."""
+        code_text = code_text.strip("\n")
+        if not clean_text(code_text):
+            return
+        btn = tk.Button(
+            self.chat,
+            text="⧉ Copy code",
+            command=lambda t=code_text: self._copy_message(t, "Code"),
+            bg="#0b1118",
+            fg="#86efac",
+            activebackground=SIDEBAR_SEL,
+            activeforeground="white",
+            relief="flat",
+            font=("Sans", 8),
+            padx=6,
+            pady=0,
+            cursor="hand2",
+            borderwidth=0,
+            takefocus=0,
+        )
+        self.chat.window_create("end", window=btn)
+        self.chat.insert("end", "\n", "assistant")
 
     def _insert_copy_button(self, text):
         """Embed a small inline Copy button at the current end of the chat that
@@ -14515,12 +14540,18 @@ class App:
     def _insert_formatted_chat(self, text):
         lines = text.rstrip().splitlines()
         in_code_block = False
+        code_lines = []  # buffer the current fenced block so it gets its own Copy button
         for line in lines:
             stripped = line.strip()
             if stripped.startswith("```"):
+                if in_code_block:
+                    # Closing fence — give this code box its own Copy button.
+                    self._insert_code_copy_button("\n".join(code_lines))
+                    code_lines = []
                 in_code_block = not in_code_block
                 continue
             if in_code_block:
+                code_lines.append(line)
                 self.chat.insert("end", line + "\n", "chat_code")
                 continue
             if stripped.startswith("### "):
@@ -14552,6 +14583,9 @@ class App:
             else:
                 self._insert_inline_chat(line, "assistant")
                 self.chat.insert("end", "\n", "assistant")
+        if in_code_block and code_lines:
+            # Message ended mid-block (no closing fence) — still offer a Copy button.
+            self._insert_code_copy_button("\n".join(code_lines))
         self.chat.insert("end", "\n", "assistant")
 
     def append_work(self, text, tag="system"):
