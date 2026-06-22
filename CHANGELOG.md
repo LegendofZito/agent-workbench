@@ -1,3 +1,17 @@
+## 2026-06-21 (Minimal handoffs + Wayfinder consolidation)
+
+- **Handoff is now a minimal pointer to AGENT_STATE.md.** At handoff, AGENT_STATE.md is
+  regenerated FIRST from the comprehensive session summary (authoritative full state), then
+  the NEW session reads only a brief packet (overview, current status, open items, recent
+  blockers) that points at AGENT_STATE.md — instead of the old ~2.3k-token full dump.
+  `structured_handoff_packet(..., minimal=True)` drives the 3 user-facing deploy paths;
+  AGENT_STATE generation and worker spawns keep using the comprehensive packet.
+- **Wayfinder consolidated + un-confused from zito-files.** The folder `Open Projects/zito-files`
+  was actually the Wayfinder app (package name "wayfinder") under its old name. Renamed to
+  `Open Projects/wayfinder`, relabeled the AWB link (display_name "Wayfinder", new project_id,
+  dropped the zito-files alias), and updated config references. The Google Drive copy is kept
+  as a backup. This also fixes the handoffs that were scattering into the zito-files folder.
+
 ## 2026-06-21 (Merge queued prompts into one turn)
 
 - Queue dialog: multi-select (Ctrl/Shift-click) + a **⛓ Merge** button that combines

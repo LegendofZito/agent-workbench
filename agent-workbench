@@ -3429,7 +3429,7 @@ def fallback_project_state(existing_state, handoff_packet, cwd):
     )
 
 
-def structured_handoff_packet(session, max_chars=HANDOFF_MAX_CHARS):
+def structured_handoff_packet(session, max_chars=HANDOFF_MAX_CHARS, minimal=False):
     title = clean_text(session.get("title") or session.get("preview") or "Untitled")
     agent = clean_text(session.get("agent") or "agent").title()
     cwd = infer_project_root(session, session.get("cwd") or os.path.expanduser("~"))
@@ -3716,6 +3716,37 @@ def structured_handoff_packet(session, max_chars=HANDOFF_MAX_CHARS):
         if state_path
         else f"- If `{PROJECT_STATE_FILENAME}` exists in the project root, read it first; it is shared state across Claude, Codex, Gemini, and local models."
     )
+    if minimal:
+        # MINIMAL handoff: what the NEW session actually reads. AGENT_STATE.md is
+        # regenerated at handoff time (from the FULL packet below) and is the
+        # authoritative complete state, so this only carries continuation-critical
+        # recent context and points the new session at AGENT_STATE.md for the rest.
+        # The verbose history (what-went-right, every command/file change) lives in
+        # AGENT_STATE.md and git, so it's omitted to keep the handoff cheap to read.
+        parts = [
+            "# Session Handoff (brief — read AGENT_STATE.md for full state)",
+            f"- Source: {title} ({agent})  ·  Project: {cwd}",
+            f"- Full project state (authoritative, just refreshed): {state_path or PROJECT_STATE_FILENAME}",
+            f"- Context usage at handoff: {context_line}  ·  Generated: {now_iso()}",
+            "",
+            "## Read first",
+            state_instruction,
+            "- That file was just regenerated and holds the complete project state. This "
+            "note only carries the most recent continuation context below.",
+            "",
+            f"## Overview\n{overview}",
+            "",
+            f"## Current status\n{current_status}",
+            "",
+            section("Open items & next steps", unresolved[-10:]),
+            "",
+            section("Watch out — recent blockers", failures[-6:]),
+            "",
+            "## Continuation",
+            "- Read AGENT_STATE.md, then continue the latest objective after a brief acknowledgment.",
+            "- Don't repeat failed approaches; check the filesystem before trusting recorded state.",
+        ] + (["- Orient first: read the project's structure and run `git status` + the build/check command before changing code."] if is_sw_project else [])
+        return "\n".join(parts)[: max_chars]
     parts = [
         "# Automatic Session Handoff",
         f"- Source title: {title}",
@@ -15332,7 +15363,9 @@ class App:
             modal=True,
         ):
             return None
-        packet = self._staged_handoff_packet(source) or structured_handoff_packet(source)
+        # The new session reads a MINIMAL handoff that points at AGENT_STATE.md (the
+        # full state, regenerated at handoff time). Keeps the handoff cheap to read.
+        packet = structured_handoff_packet(source, minimal=True)
         state_path = self.request_project_state_update(
             source,
             reason="handoff",
@@ -15480,7 +15513,9 @@ class App:
                 parent=self.win,
             )
             return None
-        packet = self._staged_handoff_packet(source) or structured_handoff_packet(source)
+        # The new session reads a MINIMAL handoff that points at AGENT_STATE.md (the
+        # full state, regenerated at handoff time). Keeps the handoff cheap to read.
+        packet = structured_handoff_packet(source, minimal=True)
         state_path = self.request_project_state_update(
             source,
             reason="handoff",
@@ -15756,7 +15791,9 @@ class App:
             refine=True,
             force=True,
         )
-        packet = self._staged_handoff_packet(source) or structured_handoff_packet(source)
+        # The new session reads a MINIMAL handoff that points at AGENT_STATE.md (the
+        # full state, regenerated at handoff time). Keeps the handoff cheap to read.
+        packet = structured_handoff_packet(source, minimal=True)
         self.copy_text(packet)
 
     def _sync_session_from_transcript(self, session):
